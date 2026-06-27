@@ -38,3 +38,21 @@ SPT 설치 파일 / user / mods / GoLani-ItemTextureKoreanChange
 
 
 댓글과 출처만 남겨주시면 자유롭게 소스 코드 활용하셔도 됩니다.
+
+
+## 개발자용 — 자동화 파이프라인 (SPT 4.x)
+
+SPT 4.x(C# 서버)용 번들 모드입니다. 텍스처 추출·교체·설치를 스크립트로 자동화합니다.
+
+| 단계 | 명령 / 더블클릭 | 내용 |
+|------|----------------|------|
+| 0 | `0_설치.bat` | 파이썬 라이브러리 설치 (UnityPy 등) |
+| 1 | `1_추출.bat [필터]` | 게임 번들 → `work/1_raw/` PNG 추출 |
+| — | (사람) | GPT 등으로 한글화 → 같은 파일명으로 `work/2_edited/` 저장 |
+| 2 | `2_적용.bat [필터]` | `work/2_edited/` → `bundles/` 번들 생성 (원본 포맷 유지) |
+| 3 | `3_배포.bat` | C# DLL 빌드 + `bundles/` 전체를 `user/mods` 에 설치 |
+
+- 빌드 요구: .NET 9 SDK (`dotnet`), 파이썬 3 + UnityPy 1.25.0.
+- 게임 경로는 `D:\SPT` 기준. 다르면 환경변수 `SPT_DIR` 로 지정.
+- 적용 후 **런처에서 "임시 파일 삭제"** 필수.
+- 설계·주의사항: [docs/automation-design.md](docs/automation-design.md)
