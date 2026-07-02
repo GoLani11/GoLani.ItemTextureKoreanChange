@@ -224,7 +224,7 @@ def _run_bc7enc(src_png, dst_dds, lam):
     """WSL의 bc7enc_rdo로 PNG 한 장을 BC7 DDS로 인코딩."""
     cmd = [
         "wsl", _wsl_path(BC7ENC),
-        "-q", "-g", "-u4", "-e", f"-z{lam}",
+        "-q", "-g", "-u4", "-e", "-y", f"-z{lam}",  # -y: DDS(위→아래)를 Unity(아래→위) 순서로 플립
         _wsl_path(src_png), _wsl_path(dst_dds),
     ]
     try:
@@ -377,23 +377,26 @@ def deploy():
     for f in (f"{MOD_NAME.replace('-', '.')}.dll", f"{MOD_NAME.replace('-', '.')}.deps.json"):
         try:
             shutil.copy2(os.path.join(DLL_OUT, f), MODS_DIR)
-        except PermissionError:
+        except OSError:  # WinError 1224(사용 중) 등은 PermissionError가 아님
             print(f"  [건너뜀] {f} 잠김(서버 실행 중). 메타데이터 바꿨으면 서버 종료 후 재배포.")
 
     if os.path.exists(HIRES_DIR):
         dst = os.path.join(HIRES_PLUGIN_DIR, "hires")
-        if os.path.exists(dst):
-            shutil.rmtree(dst)
-        shutil.copytree(HIRES_DIR, dst)
-        print("하이레즈 텍스처 설치 완료")
+        try:
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+            shutil.copytree(HIRES_DIR, dst)
+            print("하이레즈 텍스처 설치 완료")
+        except OSError:
+            print("  [건너뜀] hires 잠김(게임 실행 중). 게임 종료 후 재배포.")
 
     if os.path.exists(HIRES_DLL):
         os.makedirs(HIRES_PLUGIN_DIR, exist_ok=True)
         try:
             shutil.copy2(HIRES_DLL, HIRES_PLUGIN_DIR)
             print("하이레즈 inspect 플러그인 설치 완료")
-        except PermissionError:
-            print("  [건너뜀] GoLani.HiResInspect.dll 잠김")
+        except OSError:
+            print("  [건너뜀] GoLani.HiResInspect.dll 잠김(게임 실행 중)")
 
     print(f"\n완료 → {MODS_DIR}")
     print("다음: SPT 런처에서 '임시 파일 삭제' 후 게임 실행")
