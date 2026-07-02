@@ -6,9 +6,9 @@ GUI 클릭 없이 명령 한 줄(또는 .bat 더블클릭)로 동작.
 
 사용법:
   python tools/auto.py extract [필터]   # 게임 번들 → work/1_raw/ 로 PNG 추출
-  python tools/auto.py hires   [필터] [size] [lambda]  # inspect용 BC7 RDO 생성
+  python tools/auto.py hires   [필터] [size(생략=원본크기)] [lambda]  # inspect용 BC7 RDO 생성
   python tools/auto.py build   [필터]   # _D 기준 _N/_G 생성 + 번들 리팩 (derive+repack)
-  python tools/auto.py all     [필터] [size] [lambda]  # derive+repack+hires+deploy
+  python tools/auto.py all     [필터] [size(생략=원본크기)] [lambda]  # derive+repack+hires+deploy
   python tools/auto.py index   [경로prefix]  # 게임 번들 텍스처명 인덱스 생성/갱신
   python tools/auto.py find    <부분문자열>  # 인덱스에서 텍스처명 검색
   python tools/auto.py deploy           # DLL 빌드 + SPT user/mods 에 모드 설치
@@ -221,7 +221,7 @@ def _replace(bundle_path, out_path, replacements, target_size):
         if img.mode != "RGBA":
             img = img.convert("RGBA")
         mip = _full_mip_count(width, height)
-        fmt = BC7 if data.m_Name.endswith("_D") else data.m_TextureFormat
+        fmt = BC7
         try:
             data.set_image(img, target_format=fmt, mipmap_count=mip)
             data.save()
@@ -280,12 +280,12 @@ def _run_bc7enc(src_png, dst_dds, lam):
         raise
 
 
-def hires(flt=None, size=4096, lam=1.0):
-    """원본 PNG를 업스케일한 뒤 BC7 RDO 밉 체인으로 저장."""
+def hires(flt=None, size=None, lam=1.0):
+    """소스 PNG의 실제 크기 또는 지정 크기로 BC7 RDO 밉 체인을 저장."""
     Image = _image()
     if not os.path.exists(MAP_PATH):
         sys.exit("map.json 없음. 먼저 extract 실행.")
-    if size < 1:
+    if size is not None and size < 1:
         sys.exit("size는 1 이상이어야 합니다.")
     if not os.path.exists(BC7ENC):
         sys.exit(f"bc7enc 없음: {BC7ENC}")
@@ -314,19 +314,22 @@ def hires(flt=None, size=4096, lam=1.0):
 
         tex_started = time.perf_counter()
         name = e["texture"]
-        print(f"[hires {idx}/{len(entries)}] {name}: {size} BC7 RDO 시작")
         scratch = tempfile.mkdtemp(prefix="golani_hires_")
         try:
             with Image.open(src) as src_img:
-                base = src_img.convert("RGBA").resize((size, size), Image.LANCZOS)
+                base = src_img.convert("RGBA")
+            if size is not None:
+                base = base.resize((size, size), Image.LANCZOS)
+            base_w, base_h = base.size
+            print(f"[hires {idx}/{len(entries)}] {name}: {base_w}x{base_h} BC7 RDO 시작")
             mips = []
             level = 0
             while True:
-                w = max(1, size >> level)
-                h = max(1, size >> level)
+                w = max(1, base_w >> level)
+                h = max(1, base_h >> level)
                 png = os.path.join(scratch, f"{name}_{level:02d}.png")
                 dds = os.path.join(scratch, f"{name}_{level:02d}.dds")
-                img = base if w == size and h == size else base.resize((w, h), Image.LANCZOS)
+                img = base if w == base_w and h == base_h else base.resize((w, h), Image.LANCZOS)
                 img.save(png)
                 print(f"   밉 {level + 1}: {w}x{h} 인코딩")
                 _run_bc7enc(png, dds, lam)
@@ -347,8 +350,8 @@ def hires(flt=None, size=4096, lam=1.0):
             manifest.append({
                 "name": name,
                 "file": out_name,
-                "width": size,
-                "height": size,
+                "width": base_w,
+                "height": base_h,
                 "mipCount": len(mips),
                 "format": 25,
                 "linear": not name.endswith("_D"),
@@ -523,7 +526,7 @@ def find(query):
     print(f"\n완료: {len(matches)}개 텍스처명")
 
 
-def all_steps(flt=None, size=4096, lam=1.0):
+def all_steps(flt=None, size=None, lam=1.0):
     """derive → repack → hires → deploy 원클릭 실행."""
     print("========== derive ==========")
     try:
@@ -630,12 +633,12 @@ if __name__ == "__main__":
     elif cmd == "repack":
         repack(flt)
     elif cmd == "hires":
-        hires(flt, size=int(sys.argv[3]) if len(sys.argv) > 3 else 4096, lam=float(sys.argv[4]) if len(sys.argv) > 4 else 1.0)
+        hires(flt, size=int(sys.argv[3]) if len(sys.argv) > 3 else None, lam=float(sys.argv[4]) if len(sys.argv) > 4 else 1.0)
     elif cmd == "build":  # derive + repack (한 방)
         derive(flt)
         repack(flt)
     elif cmd == "all":
-        all_steps(flt, size=int(sys.argv[3]) if len(sys.argv) > 3 else 4096, lam=float(sys.argv[4]) if len(sys.argv) > 4 else 1.0)
+        all_steps(flt, size=int(sys.argv[3]) if len(sys.argv) > 3 else None, lam=float(sys.argv[4]) if len(sys.argv) > 4 else 1.0)
     elif cmd == "index":
         index(flt)
     elif cmd == "find":
@@ -643,4 +646,4 @@ if __name__ == "__main__":
     elif cmd == "deploy":
         deploy()
     else:
-        sys.exit("사용법: python tools/auto.py [extract|derive|repack|hires|build|all|index|find|deploy] [필터|경로prefix|검색어] [size] [lambda]")
+        sys.exit("사용법: python tools/auto.py [extract|derive|repack|hires|build|all|index|find|deploy] [필터|경로prefix|검색어] [size(생략=원본크기)] [lambda]")
