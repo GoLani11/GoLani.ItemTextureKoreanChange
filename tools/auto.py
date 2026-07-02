@@ -6,6 +6,7 @@ GUI 클릭 없이 명령 한 줄(또는 .bat 더블클릭)로 동작.
 
 사용법:
   python tools/auto.py extract [필터]   # 게임 번들 → work/1_raw/ 로 PNG 추출
+  python tools/auto.py hires   [필터] [size] [lambda]  # inspect용 BC7 RDO 생성
   python tools/auto.py build   [필터]   # _D 기준 _N/_G 생성 + 번들 리팩 (derive+repack)
   python tools/auto.py deploy           # DLL 빌드 + SPT user/mods 에 모드 설치
   (세부: derive=보조맵 생성만, repack=번들만)
@@ -19,11 +20,15 @@ GUI 클릭 없이 명령 한 줄(또는 .bat 더블클릭)로 동작.
 핵심: 사람은 _D 한 장만 만들면 됨. _N/_G는 원본 스타일 유지하며 글자만 한글로(maps.py).
 [필터]: 번들 key에 포함된 문자열로 일부만 처리 (예: item_food_mayo). 생략 시 전체.
 """
+import gzip
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 import numpy as np
 import UnityPy
@@ -38,6 +43,7 @@ RAW_DIR = os.path.join(PROJ, "work", "1_raw")
 EDITED_DIR = os.path.join(PROJ, "work", "2_edited")
 DEBUG_DIR = os.path.join(PROJ, "work", "_debug")
 OUT_DIR = os.path.join(PROJ, "bundles")
+HIRES_DIR = os.path.join(PROJ, "hires")
 MAP_PATH = os.path.join(PROJ, "tools", "map.json")
 BUNDLES_JSON = os.path.join(PROJ, "bundles.json")
 
@@ -46,6 +52,9 @@ MOD_NAME = "GoLani-ItemTextureKoreanChange"
 MODS_DIR = os.path.join(SPT_DIR, "SPT", "user", "mods", MOD_NAME)
 CSPROJ = os.path.join(PROJ, "GoLani.ItemTextureKoreanChange.csproj")
 DLL_OUT = os.path.join(PROJ, "bin", "Release", "net9.0")
+HIRES_DLL = os.path.join(PROJ, "client", "GoLani.HiResInspect", "bin", "Release", "net471", "GoLani.HiResInspect.dll")
+HIRES_PLUGIN_DIR = os.path.join(SPT_DIR, "BepInEx", "plugins", "GoLani.HiResInspect")
+BC7ENC = os.path.join(PROJ, "tools", "bin", "bc7enc")
 
 DXT5 = 12  # TextureFormat.DXT5 (BC3) 폴백용
 
@@ -183,8 +192,130 @@ def _replace(bundle_path, out_path, replacements):
     if changed:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "wb") as f:
-            f.write(env.file.save())
+            f.write(env.file.save(packer="lz4"))
     return changed
+
+
+def _wsl_path(path):
+    """윈도우 경로를 WSL /mnt/<drive>/... 경로로 바꿈."""
+    p = os.path.abspath(path).replace("\\", "/")
+    if p.startswith("/mnt/"):
+        return p
+    if len(p) >= 3 and p[1] == ":" and p[2] == "/":
+        return f"/mnt/{p[0].lower()}/{p[3:]}"
+    return p
+
+
+def _dds_payload(dds_path, width, height):
+    """bc7enc DDS에서 해당 밉 레벨의 BC7 페이로드만 잘라냄."""
+    with open(dds_path, "rb") as f:
+        data = f.read()
+    if data[:4] != b"DDS ":
+        raise ValueError(f"DDS 매직 불일치: {dds_path}")
+    offset = 148 if data[84:88] == b"DX10" else 128
+    size = math.ceil(width / 4) * math.ceil(height / 4) * 16
+    payload = data[offset:offset + size]
+    if len(payload) != size:
+        raise ValueError(f"DDS 페이로드 크기 불일치: {dds_path} ({len(payload)} != {size})")
+    return payload
+
+
+def _run_bc7enc(src_png, dst_dds, lam):
+    """WSL의 bc7enc_rdo로 PNG 한 장을 BC7 DDS로 인코딩."""
+    cmd = [
+        "wsl", _wsl_path(BC7ENC),
+        "-q", "-g", "-u4", "-e", f"-z{lam}",
+        _wsl_path(src_png), _wsl_path(dst_dds),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        if e.stdout:
+            print(e.stdout)
+        if e.stderr:
+            print(e.stderr, file=sys.stderr)
+        raise
+
+
+def hires(flt=None, size=4096, lam=1.0):
+    """원본 PNG를 업스케일한 뒤 BC7 RDO 밉 체인으로 저장."""
+    if not os.path.exists(MAP_PATH):
+        sys.exit("map.json 없음. 먼저 extract 실행.")
+    if size < 1:
+        sys.exit("size는 1 이상이어야 합니다.")
+    if not os.path.exists(BC7ENC):
+        sys.exit(f"bc7enc 없음: {BC7ENC}")
+
+    with open(MAP_PATH, encoding="utf-8") as f:
+        entries = [e for e in json.load(f) if not flt or flt in e["key"]]
+    if not entries:
+        sys.exit("처리할 텍스처 없음. 필터를 확인하세요.")
+
+    os.makedirs(HIRES_DIR, exist_ok=True)
+    manifest = []
+    total_raw = 0
+    total_gz = 0
+    started = time.perf_counter()
+
+    for idx, e in enumerate(entries, 1):
+        src = os.path.join(RAW_DIR, e["png"])
+        if not os.path.exists(src):
+            print(f"[건너뜀] 원본 PNG 없음: {src}")
+            continue
+
+        tex_started = time.perf_counter()
+        name = e["texture"]
+        print(f"[hires {idx}/{len(entries)}] {name}: {size} BC7 RDO 시작")
+        scratch = tempfile.mkdtemp(prefix="golani_hires_")
+        try:
+            with Image.open(src) as src_img:
+                base = src_img.convert("RGBA").resize((size, size), Image.LANCZOS)
+            mips = []
+            level = 0
+            while True:
+                w = max(1, size >> level)
+                h = max(1, size >> level)
+                png = os.path.join(scratch, f"{name}_{level:02d}.png")
+                dds = os.path.join(scratch, f"{name}_{level:02d}.dds")
+                img = base if w == size and h == size else base.resize((w, h), Image.LANCZOS)
+                img.save(png)
+                print(f"   밉 {level + 1}: {w}x{h} 인코딩")
+                _run_bc7enc(png, dds, lam)
+                mips.append(_dds_payload(dds, w, h))
+                if w == 1 and h == 1:
+                    break
+                level += 1
+
+            raw = b"".join(mips)
+            out_name = f"{name}.bc7.gz"
+            out_path = os.path.join(HIRES_DIR, out_name)
+            with gzip.open(out_path, "wb", compresslevel=9) as f:
+                f.write(raw)
+            gz_size = os.path.getsize(out_path)
+            raw_size = len(raw)
+            total_raw += raw_size
+            total_gz += gz_size
+            manifest.append({
+                "name": name,
+                "file": out_name,
+                "width": size,
+                "height": size,
+                "mipCount": len(mips),
+                "format": 25,
+                "linear": not name.endswith("_D"),
+                "rawSize": raw_size,
+            })
+            elapsed = time.perf_counter() - tex_started
+            print(f"   완료: {elapsed:.1f}초, {raw_size / 1024 / 1024:.1f}MB → {gz_size / 1024 / 1024:.1f}MB")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    with open(os.path.join(HIRES_DIR, "manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    elapsed = time.perf_counter() - started
+    print(f"\n완료: 텍스처 {len(manifest)}개 → {HIRES_DIR}")
+    print(f"요약: {elapsed:.1f}초, {total_raw / 1024 / 1024:.1f}MB → {total_gz / 1024 / 1024:.1f}MB")
 
 
 def repack(flt=None):
@@ -249,6 +380,21 @@ def deploy():
         except PermissionError:
             print(f"  [건너뜀] {f} 잠김(서버 실행 중). 메타데이터 바꿨으면 서버 종료 후 재배포.")
 
+    if os.path.exists(HIRES_DIR):
+        dst = os.path.join(HIRES_PLUGIN_DIR, "hires")
+        if os.path.exists(dst):
+            shutil.rmtree(dst)
+        shutil.copytree(HIRES_DIR, dst)
+        print("하이레즈 텍스처 설치 완료")
+
+    if os.path.exists(HIRES_DLL):
+        os.makedirs(HIRES_PLUGIN_DIR, exist_ok=True)
+        try:
+            shutil.copy2(HIRES_DLL, HIRES_PLUGIN_DIR)
+            print("하이레즈 inspect 플러그인 설치 완료")
+        except PermissionError:
+            print("  [건너뜀] GoLani.HiResInspect.dll 잠김")
+
     print(f"\n완료 → {MODS_DIR}")
     print("다음: SPT 런처에서 '임시 파일 삭제' 후 게임 실행")
 
@@ -262,10 +408,12 @@ if __name__ == "__main__":
         derive(flt)
     elif cmd == "repack":
         repack(flt)
+    elif cmd == "hires":
+        hires(flt, size=int(sys.argv[3]) if len(sys.argv) > 3 else 4096, lam=float(sys.argv[4]) if len(sys.argv) > 4 else 1.0)
     elif cmd == "build":  # derive + repack (한 방)
         derive(flt)
         repack(flt)
     elif cmd == "deploy":
         deploy()
     else:
-        sys.exit("사용법: python tools/auto.py [extract|derive|repack|build|deploy] [필터]")
+        sys.exit("사용법: python tools/auto.py [extract|derive|repack|hires|build|deploy] [필터] [size] [lambda]")

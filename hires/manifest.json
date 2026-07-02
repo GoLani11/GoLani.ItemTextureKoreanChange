@@ -1,0 +1,32 @@
+[
+  {
+    "name": "item_food_mayo_D",
+    "file": "item_food_mayo_D.bc7.gz",
+    "width": 4096,
+    "height": 4096,
+    "mipCount": 13,
+    "format": 25,
+    "linear": false,
+    "rawSize": 22369648
+  },
+  {
+    "name": "item_food_mayo_G",
+    "file": "item_food_mayo_G.bc7.gz",
+    "width": 4096,
+    "height": 4096,
+    "mipCount": 13,
+    "format": 25,
+    "linear": true,
+    "rawSize": 22369648
+  },
+  {
+    "name": "item_food_mayo_N",
+    "file": "item_food_mayo_N.bc7.gz",
+    "width": 4096,
+    "height": 4096,
+    "mipCount": 13,
+    "format": 25,
+    "linear": true,
+    "rawSize": 22369648
+  }
+]
