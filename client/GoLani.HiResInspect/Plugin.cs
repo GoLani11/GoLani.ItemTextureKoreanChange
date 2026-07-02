@@ -201,13 +201,14 @@ public class Plugin : BaseUnityPlugin
         return count;
     }
 
-    private static void OnInspectShown()
+    private static void OnInspectShown(object __instance)
     {
         try
         {
             if (_instance != null)
             {
-                _instance.HandleInspectShown();
+                // __instance = 열린 inspect 패널. 이 하위만 스캔하면 레이드 전체 렌더러 스캔(수만 개)을 피함.
+                _instance.HandleInspectShown(__instance as Component);
             }
         }
         catch (Exception e)
@@ -237,7 +238,7 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private void HandleInspectShown()
+    private void HandleInspectShown(Component panel)
     {
         try
         {
@@ -252,7 +253,7 @@ public class Plugin : BaseUnityPlugin
                 Restore();
             }
 
-            _scanRoutine = StartCoroutine(ScanAfterInspectShown());
+            _scanRoutine = StartCoroutine(ScanAfterInspectShown(panel));
         }
         catch (Exception e)
         {
@@ -278,22 +279,58 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private IEnumerator ScanAfterInspectShown()
+    private IEnumerator ScanAfterInspectShown(Component panel)
     {
         yield return null;
-        ScanRenderers();
+        ScanRenderers(panel, false);  // 1프레임째: 모델이 아직 안 붙었을 수 있으니 전체 스캔 폴백 금지
         yield return new WaitForSeconds(0.5f);
-        ScanRenderers();
+        ScanRenderers(panel, true);   // 0.5초 후에도 패널 하위에 없으면 그때만 전체 스캔 폴백
         _scanRoutine = null;
     }
 
-    private void ScanRenderers()
+    private void ScanRenderers(Component panel, bool allowGlobalFallback)
     {
         try
         {
-            var names = new HashSet<string>(StringComparer.Ordinal);
-            var pendingSwaps = new List<PendingSwap>();
-            foreach (var renderer in UnityEngine.Object.FindObjectsOfType<Renderer>())
+            // 패널 하위만 스캔(값싸다). 못 찾으면(마지막 패스에서만) 전체 씬 스캔 폴백(구버전 동작 보존).
+            var matched = MatchRenderers(GetPanelRenderers(panel));
+            if (matched == 0 && panel != null && allowGlobalFallback)
+            {
+                matched = MatchRenderers(UnityEngine.Object.FindObjectsOfType<Renderer>());
+            }
+
+            Logger.LogInfo($"하이레즈 스캔 완료: 매칭 {matched}개");
+        }
+        catch (Exception e)
+        {
+            Logger.LogError($"하이레즈 스캔 실패: {e}");
+        }
+    }
+
+    private Renderer[] GetPanelRenderers(Component panel)
+    {
+        if (panel == null)
+        {
+            return UnityEngine.Object.FindObjectsOfType<Renderer>();
+        }
+
+        try
+        {
+            return panel.GetComponentsInChildren<Renderer>(true);
+        }
+        catch (Exception e)
+        {
+            Logger.LogError($"패널 렌더러 수집 실패: {e}");
+            return UnityEngine.Object.FindObjectsOfType<Renderer>();
+        }
+    }
+
+    private int MatchRenderers(Renderer[] renderers)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        var pendingSwaps = new List<PendingSwap>();
+        {
+            foreach (var renderer in renderers)
             {
                 if (renderer == null)
                 {
@@ -372,14 +409,10 @@ public class Plugin : BaseUnityPlugin
                     }
                 }
             }
+        }
 
-            EnqueuePendingSwaps(pendingSwaps, names);
-            Logger.LogInfo($"하이레즈 스캔 완료: 매칭 {pendingSwaps.Count}개, 필요 텍스처 {names.Count}개");
-        }
-        catch (Exception e)
-        {
-            Logger.LogError($"하이레즈 스캔 실패: {e}");
-        }
+        EnqueuePendingSwaps(pendingSwaps, names);
+        return pendingSwaps.Count;
     }
 
     private void EnqueuePendingSwaps(List<PendingSwap> pendingSwaps, HashSet<string> names)
