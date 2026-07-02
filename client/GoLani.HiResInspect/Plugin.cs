@@ -1,11 +1,14 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
+using System.Threading.Tasks;
 using BepInEx;
+using BepInEx.Configuration;
 using HarmonyLib;
 using Newtonsoft.Json;
 using UnityEngine;
@@ -16,13 +19,20 @@ public class Plugin : BaseUnityPlugin
     private static Plugin _instance;
 
     private readonly Dictionary<string, Entry> _manifest = new Dictionary<string, Entry>(StringComparer.Ordinal);
-    private readonly Dictionary<string, Texture2D> _cache = new Dictionary<string, Texture2D>(StringComparer.Ordinal);
+    private readonly Dictionary<string, CacheItem> _cache = new Dictionary<string, CacheItem>(StringComparer.Ordinal);
+    private readonly Dictionary<string, Task<LoadResult>> _loadTasks = new Dictionary<string, Task<LoadResult>>(StringComparer.Ordinal);
+    private readonly Dictionary<string, List<PendingSwap>> _pendingSwapsByName = new Dictionary<string, List<PendingSwap>>(StringComparer.Ordinal);
     private readonly List<Swap> _swaps = new List<Swap>();
     private readonly HashSet<string> _activeSwapKeys = new HashSet<string>(StringComparer.Ordinal);
 
     private Harmony _harmony;
     private string _hiresDir;
     private Coroutine _scanRoutine;
+    private Coroutine _applyRoutine;
+    private ConfigEntry<int> _cacheBudgetMb;
+    private int _generation;
+    private long _cacheBytes;
+    private long _lruCounter;
 
     private void Awake()
     {
@@ -30,6 +40,12 @@ public class Plugin : BaseUnityPlugin
 
         try
         {
+            _cacheBudgetMb = Config.Bind(
+                "General",
+                "CacheBudgetMB",
+                256,
+                "하이레즈 텍스처 VRAM 캐시 예산(MB). 0이면 닫을 때 즉시 해제");
+
             if (!LoadManifest())
             {
                 return;
@@ -54,7 +70,21 @@ public class Plugin : BaseUnityPlugin
                 _scanRoutine = null;
             }
 
+            if (_applyRoutine != null)
+            {
+                StopCoroutine(_applyRoutine);
+                _applyRoutine = null;
+            }
+
             Restore();
+            var destroyed = DestroyAllCachedTextures();
+            _loadTasks.Clear();
+            if (destroyed > 0)
+            {
+                Resources.UnloadUnusedAssets();
+                Logger.LogInfo($"하이레즈 캐시 전체 해제: 텍스처 {destroyed}개");
+            }
+
             if (_harmony != null)
             {
                 _harmony.UnpatchSelf();
@@ -217,7 +247,7 @@ public class Plugin : BaseUnityPlugin
                 _scanRoutine = null;
             }
 
-            if (_swaps.Count > 0 || _cache.Count > 0)
+            if (_swaps.Count > 0 || _activeSwapKeys.Count > 0 || _pendingSwapsByName.Count > 0)
             {
                 Restore();
             }
@@ -261,7 +291,8 @@ public class Plugin : BaseUnityPlugin
     {
         try
         {
-            var applied = 0;
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            var pendingSwaps = new List<PendingSwap>();
             foreach (var renderer in UnityEngine.Object.FindObjectsOfType<Renderer>())
             {
                 if (renderer == null)
@@ -328,40 +359,22 @@ public class Plugin : BaseUnityPlugin
                             continue;
                         }
 
-                        var hires = GetOrLoad(original.name);
-                        if (hires == null)
+                        _activeSwapKeys.Add(swapKey);
+                        names.Add(original.name);
+                        pendingSwaps.Add(new PendingSwap
                         {
-                            continue;
-                        }
-
-                        try
-                        {
-                            var liveMaterials = renderer.materials;
-                            if (liveMaterials == null || i >= liveMaterials.Length || liveMaterials[i] == null)
-                            {
-                                continue;
-                            }
-
-                            liveMaterials[i].SetTexture(prop, hires);
-                            _swaps.Add(new Swap
-                            {
-                                Renderer = renderer,
-                                MatIndex = i,
-                                Prop = prop,
-                                Original = original,
-                            });
-                            _activeSwapKeys.Add(swapKey);
-                            applied++;
-                        }
-                        catch (Exception e)
-                        {
-                            Logger.LogError($"하이레즈 텍스처 적용 실패: {original.name}/{prop}\n{e}");
-                        }
+                            Renderer = renderer,
+                            MatIndex = i,
+                            Prop = prop,
+                            Original = original,
+                            Name = original.name,
+                        });
                     }
                 }
             }
 
-            Logger.LogInfo($"하이레즈 스캔 완료: 스왑 {applied}개");
+            EnqueuePendingSwaps(pendingSwaps, names);
+            Logger.LogInfo($"하이레즈 스캔 완료: 매칭 {pendingSwaps.Count}개, 필요 텍스처 {names.Count}개");
         }
         catch (Exception e)
         {
@@ -369,39 +382,276 @@ public class Plugin : BaseUnityPlugin
         }
     }
 
-    private Texture2D GetOrLoad(string name)
+    private void EnqueuePendingSwaps(List<PendingSwap> pendingSwaps, HashSet<string> names)
+    {
+        if (pendingSwaps.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var swap in pendingSwaps)
+        {
+            List<PendingSwap> swaps;
+            if (!_pendingSwapsByName.TryGetValue(swap.Name, out swaps))
+            {
+                swaps = new List<PendingSwap>();
+                _pendingSwapsByName[swap.Name] = swaps;
+            }
+
+            swaps.Add(swap);
+        }
+
+        foreach (var name in names)
+        {
+            EnsureRawLoadStarted(name);
+        }
+
+        if (_applyRoutine == null)
+        {
+            _applyRoutine = StartCoroutine(ProcessPendingSwaps(_generation));
+        }
+    }
+
+    private void EnsureRawLoadStarted(string name)
     {
         Texture2D cached;
-        if (_cache.TryGetValue(name, out cached))
+        if (TryGetCachedTexture(name, out cached))
         {
-            return cached;
+            return;
+        }
+
+        if (_loadTasks.ContainsKey(name))
+        {
+            return;
+        }
+
+        Entry entry;
+        if (!_manifest.TryGetValue(name, out entry))
+        {
+            Logger.LogError($"하이레즈 매니페스트 항목 없음: {name}");
+            return;
+        }
+
+        try
+        {
+            var path = Path.Combine(_hiresDir, entry.File);
+            Logger.LogInfo($"하이레즈 로드 시작: {entry.Name}");
+            _loadTasks[name] = Task.Run(() => LoadRawInBackground(name, entry, path));
+        }
+        catch (Exception e)
+        {
+            Logger.LogError($"하이레즈 로드 작업 시작 실패: {name}\n{e}");
+        }
+    }
+
+    private static LoadResult LoadRawInBackground(string name, Entry entry, string path)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        var raw = ReadGzipRaw(path, entry.RawSize);
+        stopwatch.Stop();
+
+        return new LoadResult
+        {
+            Name = name,
+            Entry = entry,
+            Raw = raw,
+            ElapsedMs = stopwatch.ElapsedMilliseconds,
+        };
+    }
+
+    private IEnumerator ProcessPendingSwaps(int generation)
+    {
+        while (_pendingSwapsByName.Count > 0)
+        {
+            if (generation != _generation)
+            {
+                _applyRoutine = null;
+                yield break;
+            }
+
+            string name;
+            Texture2D cached;
+            if (TryGetCachedReadyName(out name, out cached))
+            {
+                ApplyPendingSwaps(name, cached, generation);
+                PruneCacheAndUnload();
+                yield return null;
+                continue;
+            }
+
+            Task<LoadResult> task;
+            if (TryGetCompletedLoad(out name, out task))
+            {
+                ProcessCompletedLoad(name, task, generation);
+                yield return null;
+                continue;
+            }
+
+            if (DropMissingPendingLoad())
+            {
+                yield return null;
+                continue;
+            }
+
+            yield return null;
+        }
+
+        _applyRoutine = null;
+    }
+
+    private bool TryGetCachedReadyName(out string name, out Texture2D texture)
+    {
+        foreach (var pendingName in _pendingSwapsByName.Keys.ToArray())
+        {
+            if (TryGetCachedTexture(pendingName, out texture))
+            {
+                name = pendingName;
+                return true;
+            }
+        }
+
+        name = null;
+        texture = null;
+        return false;
+    }
+
+    private bool TryGetCompletedLoad(out string name, out Task<LoadResult> task)
+    {
+        foreach (var pendingName in _pendingSwapsByName.Keys.ToArray())
+        {
+            if (_loadTasks.TryGetValue(pendingName, out task) && task.IsCompleted)
+            {
+                name = pendingName;
+                return true;
+            }
+        }
+
+        name = null;
+        task = null;
+        return false;
+    }
+
+    private bool DropMissingPendingLoad()
+    {
+        foreach (var name in _pendingSwapsByName.Keys.ToArray())
+        {
+            if (!_cache.ContainsKey(name) && !_loadTasks.ContainsKey(name))
+            {
+                _pendingSwapsByName.Remove(name);
+                Logger.LogError($"하이레즈 로드 작업 없음: {name}");
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void ProcessCompletedLoad(string name, Task<LoadResult> task, int generation)
+    {
+        if (task.IsCanceled)
+        {
+            _loadTasks.Remove(name);
+            _pendingSwapsByName.Remove(name);
+            Logger.LogError($"하이레즈 로드 취소: {name}");
+            return;
+        }
+
+        if (task.IsFaulted)
+        {
+            _loadTasks.Remove(name);
+            _pendingSwapsByName.Remove(name);
+            Logger.LogError($"하이레즈 로드 실패: {name}\n{task.Exception}");
+            return;
         }
 
         Texture2D texture = null;
         try
         {
-            var entry = _manifest[name];
-            var path = Path.Combine(_hiresDir, entry.File);
-            // inspect를 여는 순간만 동기 로드한다. 느려지면 이후 비동기로 바꿀 수 있다.
-            var raw = ReadGzipRaw(path, entry.RawSize);
+            var result = task.Result;
+            var entry = result.Entry;
+
+            var uploadStopwatch = Stopwatch.StartNew();
             texture = new Texture2D(entry.Width, entry.Height, (TextureFormat)entry.Format, entry.MipCount, entry.Linear);
-            texture.LoadRawTextureData(raw);
+            texture.LoadRawTextureData(result.Raw);
             texture.Apply(false, true);
             texture.name = entry.Name + "@hires";
-            _cache[name] = texture;
-            Logger.LogInfo($"하이레즈 로드: {entry.Name} ({raw.Length / 1024f / 1024f:0.0}MB)");
-            return texture;
+            uploadStopwatch.Stop();
+
+            AddToCache(result.Name, texture, entry.RawSize);
+            _loadTasks.Remove(name);
+            Logger.LogInfo($"하이레즈 로드 완료: {entry.Name} ({result.ElapsedMs}ms, {result.Raw.Length / 1024f / 1024f:0.0}MB)");
+            Logger.LogDebug($"하이레즈 업로드 1장 완료: {entry.Name} ({uploadStopwatch.ElapsedMilliseconds}ms)");
+
+            ApplyPendingSwaps(result.Name, texture, generation);
+            PruneCacheAndUnload();
         }
         catch (Exception e)
         {
-            Logger.LogError($"하이레즈 로드 실패: {name}\n{e}");
+            _loadTasks.Remove(name);
+            _pendingSwapsByName.Remove(name);
+            Logger.LogError($"하이레즈 업로드 실패: {name}\n{e}");
             if (texture != null)
             {
                 UnityEngine.Object.Destroy(texture);
+                Resources.UnloadUnusedAssets();
+            }
+        }
+    }
+
+    private void ApplyPendingSwaps(string name, Texture2D texture, int generation)
+    {
+        if (generation != _generation)
+        {
+            return;
+        }
+
+        List<PendingSwap> pendingSwaps;
+        if (!_pendingSwapsByName.TryGetValue(name, out pendingSwaps))
+        {
+            return;
+        }
+
+        var applied = 0;
+        foreach (var swap in pendingSwaps)
+        {
+            if (generation != _generation)
+            {
+                return;
             }
 
-            return null;
+            try
+            {
+                if (swap.Renderer == null)
+                {
+                    continue;
+                }
+
+                var liveMaterials = swap.Renderer.materials;
+                if (liveMaterials == null || swap.MatIndex < 0 || swap.MatIndex >= liveMaterials.Length || liveMaterials[swap.MatIndex] == null)
+                {
+                    continue;
+                }
+
+                liveMaterials[swap.MatIndex].SetTexture(swap.Prop, texture);
+                _swaps.Add(new Swap
+                {
+                    Renderer = swap.Renderer,
+                    MatIndex = swap.MatIndex,
+                    Prop = swap.Prop,
+                    Original = swap.Original,
+                    HiresName = name,
+                });
+                TouchCache(name);
+                applied++;
+            }
+            catch (Exception e)
+            {
+                Logger.LogError($"하이레즈 텍스처 적용 실패: {name}/{swap.Prop}\n{e}");
+            }
         }
+
+        _pendingSwapsByName.Remove(name);
+        Logger.LogInfo($"하이레즈 스왑 적용: {name} {applied}/{pendingSwaps.Count}개");
     }
 
     private static byte[] ReadGzipRaw(string path, long rawSize)
@@ -445,10 +695,14 @@ public class Plugin : BaseUnityPlugin
     private void Restore()
     {
         var swapCount = _swaps.Count;
-        var textureCount = _cache.Count;
-        if (swapCount == 0 && textureCount == 0)
+        var pendingCount = CountPendingSwaps();
+        var reservedCount = _activeSwapKeys.Count;
+        _generation++;
+
+        if (_applyRoutine != null)
         {
-            return; // 스왑 없었으면 UnloadUnusedAssets 히치도 피한다
+            StopCoroutine(_applyRoutine);
+            _applyRoutine = null;
         }
 
         for (var i = _swaps.Count - 1; i >= 0; i--)
@@ -475,19 +729,229 @@ public class Plugin : BaseUnityPlugin
             }
         }
 
-        foreach (var texture in _cache.Values)
+        _pendingSwapsByName.Clear();
+        _swaps.Clear();
+        _activeSwapKeys.Clear();
+
+        var destroyed = GetCacheBudgetBytes() == 0
+            ? DestroyAllCachedTextures()
+            : PruneCache();
+
+        if (destroyed > 0)
         {
-            if (texture != null)
+            Resources.UnloadUnusedAssets();
+        }
+
+        if (swapCount > 0 || pendingCount > 0 || reservedCount > 0 || destroyed > 0)
+        {
+            Logger.LogInfo($"하이레즈 원복 완료: 스왑 {swapCount}개, 대기 {pendingCount}개, 텍스처 {destroyed}개 해제");
+        }
+    }
+
+    private bool TryGetCachedTexture(string name, out Texture2D texture)
+    {
+        CacheItem item;
+        if (!_cache.TryGetValue(name, out item))
+        {
+            texture = null;
+            return false;
+        }
+
+        if (item.Texture == null)
+        {
+            _cache.Remove(name);
+            _cacheBytes -= item.Bytes;
+            if (_cacheBytes < 0)
             {
-                UnityEngine.Object.Destroy(texture);
+                _cacheBytes = 0;
+            }
+
+            texture = null;
+            return false;
+        }
+
+        TouchCache(name, item);
+        texture = item.Texture;
+        Logger.LogDebug($"하이레즈 캐시 히트: {name}");
+        return true;
+    }
+
+    private void AddToCache(string name, Texture2D texture, long bytes)
+    {
+        CacheItem oldItem;
+        if (_cache.TryGetValue(name, out oldItem))
+        {
+            _cacheBytes -= oldItem.Bytes;
+            if (oldItem.Texture != null && oldItem.Texture != texture)
+            {
+                UnityEngine.Object.Destroy(oldItem.Texture);
+                Resources.UnloadUnusedAssets();
             }
         }
 
-        _cache.Clear();
-        _swaps.Clear();
-        _activeSwapKeys.Clear();
-        Resources.UnloadUnusedAssets();
-        Logger.LogInfo($"하이레즈 원복 완료: 스왑 {swapCount}개, 텍스처 {textureCount}개 해제");
+        if (bytes < 0)
+        {
+            bytes = 0;
+        }
+
+        _cache[name] = new CacheItem
+        {
+            Texture = texture,
+            Bytes = bytes,
+            LastUsed = ++_lruCounter,
+        };
+        _cacheBytes += bytes;
+    }
+
+    private void TouchCache(string name)
+    {
+        CacheItem item;
+        if (_cache.TryGetValue(name, out item))
+        {
+            TouchCache(name, item);
+        }
+    }
+
+    private void TouchCache(string name, CacheItem item)
+    {
+        item.LastUsed = ++_lruCounter;
+        _cache[name] = item;
+    }
+
+    private void PruneCacheAndUnload()
+    {
+        var destroyed = PruneCache();
+        if (destroyed > 0)
+        {
+            Resources.UnloadUnusedAssets();
+        }
+    }
+
+    private int PruneCache()
+    {
+        var budgetBytes = GetCacheBudgetBytes();
+        if (budgetBytes == 0)
+        {
+            return 0;
+        }
+
+        var destroyed = 0;
+        while (_cacheBytes > budgetBytes)
+        {
+            var oldestName = FindOldestEvictableCacheName();
+            if (oldestName == null)
+            {
+                break;
+            }
+
+            if (DestroyCachedTexture(oldestName, true))
+            {
+                destroyed++;
+            }
+        }
+
+        return destroyed;
+    }
+
+    private string FindOldestEvictableCacheName()
+    {
+        string oldestName = null;
+        var oldestUsed = long.MaxValue;
+        foreach (var pair in _cache)
+        {
+            if (IsCacheNameInUse(pair.Key))
+            {
+                continue;
+            }
+
+            if (pair.Value.LastUsed < oldestUsed)
+            {
+                oldestName = pair.Key;
+                oldestUsed = pair.Value.LastUsed;
+            }
+        }
+
+        return oldestName;
+    }
+
+    private bool IsCacheNameInUse(string name)
+    {
+        foreach (var swap in _swaps)
+        {
+            if (string.Equals(swap.HiresName, name, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool DestroyCachedTexture(string name, bool logEviction)
+    {
+        CacheItem item;
+        if (!_cache.TryGetValue(name, out item))
+        {
+            return false;
+        }
+
+        _cache.Remove(name);
+        _cacheBytes -= item.Bytes;
+        if (_cacheBytes < 0)
+        {
+            _cacheBytes = 0;
+        }
+
+        if (item.Texture == null)
+        {
+            return false;
+        }
+
+        UnityEngine.Object.Destroy(item.Texture);
+        if (logEviction)
+        {
+            Logger.LogInfo($"하이레즈 캐시 축출: {name} ({item.Bytes / 1024f / 1024f:0.0}MB)");
+        }
+
+        return true;
+    }
+
+    private int DestroyAllCachedTextures()
+    {
+        var names = _cache.Keys.ToArray();
+        var destroyed = 0;
+        foreach (var name in names)
+        {
+            if (DestroyCachedTexture(name, false))
+            {
+                destroyed++;
+            }
+        }
+
+        _cacheBytes = 0;
+        return destroyed;
+    }
+
+    private long GetCacheBudgetBytes()
+    {
+        var mb = _cacheBudgetMb != null ? _cacheBudgetMb.Value : 256;
+        if (mb <= 0)
+        {
+            return 0;
+        }
+
+        return mb * 1024L * 1024L;
+    }
+
+    private int CountPendingSwaps()
+    {
+        var count = 0;
+        foreach (var swaps in _pendingSwapsByName.Values)
+        {
+            count += swaps.Count;
+        }
+
+        return count;
     }
 
     private static string MakeSwapKey(Renderer renderer, int matIndex, string prop)
@@ -560,11 +1024,36 @@ public class Plugin : BaseUnityPlugin
         public long RawSize { get; set; }
     }
 
+    private sealed class LoadResult
+    {
+        public string Name;
+        public Entry Entry;
+        public byte[] Raw;
+        public long ElapsedMs;
+    }
+
+    private sealed class CacheItem
+    {
+        public Texture2D Texture;
+        public long Bytes;
+        public long LastUsed;
+    }
+
+    private sealed class PendingSwap
+    {
+        public Renderer Renderer;
+        public int MatIndex;
+        public string Prop;
+        public Texture Original;
+        public string Name;
+    }
+
     private sealed class Swap
     {
         public Renderer Renderer;
         public int MatIndex;
         public string Prop;
         public Texture Original;
+        public string HiresName;
     }
 }
