@@ -8,6 +8,9 @@ GUI 클릭 없이 명령 한 줄(또는 .bat 더블클릭)로 동작.
   python tools/auto.py extract [필터]   # 게임 번들 → work/1_raw/ 로 PNG 추출
   python tools/auto.py hires   [필터] [size] [lambda]  # inspect용 BC7 RDO 생성
   python tools/auto.py build   [필터]   # _D 기준 _N/_G 생성 + 번들 리팩 (derive+repack)
+  python tools/auto.py all     [필터] [size] [lambda]  # derive+repack+hires+deploy
+  python tools/auto.py index   [경로prefix]  # 게임 번들 텍스처명 인덱스 생성/갱신
+  python tools/auto.py find    <부분문자열>  # 인덱스에서 텍스처명 검색
   python tools/auto.py deploy           # DLL 빌드 + SPT user/mods 에 모드 설치
   (세부: derive=보조맵 생성만, repack=번들만)
 
@@ -30,10 +33,6 @@ import sys
 import tempfile
 import time
 
-import numpy as np
-import UnityPy
-from PIL import Image
-
 # ── 설정 ───────────────────────────────────────────────
 SPT_DIR = os.environ.get("SPT_DIR", "D:/SPT")
 GAME_ROOT = os.path.join(SPT_DIR, "EscapeFromTarkov_Data/StreamingAssets/Windows")
@@ -54,17 +53,47 @@ CSPROJ = os.path.join(PROJ, "GoLani.ItemTextureKoreanChange.csproj")
 DLL_OUT = os.path.join(PROJ, "bin", "Release", "net9.0")
 HIRES_DLL = os.path.join(PROJ, "client", "GoLani.HiResInspect", "bin", "Release", "net471", "GoLani.HiResInspect.dll")
 HIRES_PLUGIN_DIR = os.path.join(SPT_DIR, "BepInEx", "plugins", "GoLani.HiResInspect")
+PICKER_DLL = os.path.join(PROJ, "client", "GoLani.AssetPicker", "bin", "Release", "net471", "GoLani.AssetPicker.dll")
+PICKER_PLUGIN_DIR = os.path.join(SPT_DIR, "BepInEx", "plugins", "GoLani.AssetPicker")
+TEXINDEX_PATH = os.path.join(PROJ, "tools", "texindex.json")
 BC7ENC = os.path.join(PROJ, "tools", "bin", "bc7enc")
 
+BC7 = 25  # TextureFormat.BC7
 DXT5 = 12  # TextureFormat.DXT5 (BC3) 폴백용
+
+
+def _unitypy():
+    """UnityPy는 쓰는 명령에서만 로드."""
+    import UnityPy
+    return UnityPy
+
+
+def _image():
+    """Pillow는 쓰는 명령에서만 로드."""
+    from PIL import Image
+    return Image
+
+
+def _manifest_entries(flt=None):
+    """bundles.json에서 manifest 항목을 읽음 (필터 적용)."""
+    with open(BUNDLES_JSON, encoding="utf-8") as f:
+        manifest = json.load(f)["manifest"]
+    return [m for m in manifest if not flt or flt in m["key"]]
 
 
 def _keys(flt=None):
     """bundles.json에서 번들 key 목록을 읽음 (필터 적용)."""
-    with open(BUNDLES_JSON, encoding="utf-8") as f:
-        manifest = json.load(f)["manifest"]
-    keys = [m["key"] for m in manifest]
-    return [k for k in keys if not flt or flt in k]
+    return [m["key"] for m in _manifest_entries(flt)]
+
+
+def _asset_type(key, manifest_entry=None):
+    """번들 key/manifest로 item|map 판별."""
+    if manifest_entry and manifest_entry.get("assetType") in ("item", "map"):
+        return manifest_entry["assetType"]
+    k = key.lower()
+    if "/items/" in k or "/usable_items/" in k:
+        return "item"
+    return "map"
 
 
 def _png_name(key, tex):
@@ -72,7 +101,13 @@ def _png_name(key, tex):
     return key.replace("/", "@") + "__" + tex + ".png"
 
 
+def _full_mip_count(width, height):
+    """최종 크기 기준 풀 밉 체인 개수."""
+    return int(math.floor(math.log2(max(width, height)))) + 1
+
+
 def extract(flt=None):
+    UnityPy = _unitypy()
     os.makedirs(RAW_DIR, exist_ok=True)
     entries = []
     for key in _keys(flt):
@@ -99,6 +134,8 @@ def extract(flt=None):
 
 def _classify(orig_png):
     """원본 텍스처 종류 자동 판별: 'N'(노멀) | 'G'(광택) | 'D'(컬러)."""
+    import numpy as np
+    Image = _image()
     a = np.array(Image.open(orig_png).convert("RGBA"))
     R, G, B, A = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
     if R.min() == 255 and R.max() == 255:
@@ -114,6 +151,7 @@ def derive(flt=None):
     원본 _N/_G의 값체계·강도는 유지하고 디자인 위치만 _D 기준으로 이식(maps.py).
     + _D 알파 복구. 디버그 마스크는 work/_debug/ 에 저장."""
     import maps  # cv2 의존 → derive 쓸 때만 로드
+    Image = _image()
 
     if not os.path.exists(MAP_PATH):
         sys.exit("map.json 없음. 먼저 extract 실행.")
@@ -160,8 +198,10 @@ def derive(flt=None):
     print(f"\n완료: {made}개 번들 보조맵 생성 → work/2_edited/  (디버그 마스크: work/_debug/)")
 
 
-def _replace(bundle_path, out_path, replacements):
-    """원본 번들 로드 → 해당 텍스처를 새 PNG로 교체(원본 포맷 유지) → out_path 저장."""
+def _replace(bundle_path, out_path, replacements, target_size):
+    """원본 번들 로드 → 해당 텍스처를 새 PNG로 교체 → out_path 저장."""
+    UnityPy = _unitypy()
+    Image = _image()
     env = UnityPy.load(bundle_path)
     changed = False
     for obj in env.objects:
@@ -172,23 +212,26 @@ def _replace(bundle_path, out_path, replacements):
         if not new_png:
             continue
         img = Image.open(new_png)
-        if (img.width, img.height) != (data.m_Width, data.m_Height):
-            img = img.resize((data.m_Width, data.m_Height), Image.LANCZOS)
+        if target_size is None:
+            width, height = data.m_Width, data.m_Height
+        else:
+            width, height = target_size, target_size
+        if (img.width, img.height) != (width, height):
+            img = img.resize((width, height), Image.LANCZOS)
         if img.mode != "RGBA":
             img = img.convert("RGBA")
-        mip = max(1, int(getattr(data, "m_MipCount", 1) or 1))
-        fmt = data.m_TextureFormat
-        # 핵심: target_format=원본 으로 재인코딩해야 밝아짐/깨짐 안 생김.
-        # (BC7 시도했으나 이 게임 Unity가 디코드 못 해 텍스처 검정 → 원본 DXT5 유지)
+        mip = _full_mip_count(width, height)
+        fmt = BC7 if data.m_Name.endswith("_D") else data.m_TextureFormat
         try:
             data.set_image(img, target_format=fmt, mipmap_count=mip)
             data.save()
         except Exception as e:
-            print(f"   원본포맷({fmt}) 실패 → DXT5 폴백: {e}")
+            print(f"   포맷({fmt}) 실패 → DXT5 폴백: {e}")
+            fmt = DXT5
             data.set_image(img, target_format=DXT5, mipmap_count=mip)
             data.save()
         changed = True
-        print(f"   교체: {data.m_Name} (포맷 {fmt})")
+        print(f"   교체: {data.m_Name} ({width}x{height}, 밉 {mip}, 포맷 {fmt})")
     if changed:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         with open(out_path, "wb") as f:
@@ -239,6 +282,7 @@ def _run_bc7enc(src_png, dst_dds, lam):
 
 def hires(flt=None, size=4096, lam=1.0):
     """원본 PNG를 업스케일한 뒤 BC7 RDO 밉 체인으로 저장."""
+    Image = _image()
     if not os.path.exists(MAP_PATH):
         sys.exit("map.json 없음. 먼저 extract 실행.")
     if size < 1:
@@ -247,9 +291,12 @@ def hires(flt=None, size=4096, lam=1.0):
         sys.exit(f"bc7enc 없음: {BC7ENC}")
 
     with open(MAP_PATH, encoding="utf-8") as f:
-        entries = [e for e in json.load(f) if not flt or flt in e["key"]]
+        entries = [
+            e for e in json.load(f)
+            if (not flt or flt in e["key"]) and _asset_type(e["key"]) == "item"
+        ]
     if not entries:
-        sys.exit("처리할 텍스처 없음. 필터를 확인하세요.")
+        sys.exit("처리할 item 텍스처 없음. 필터를 확인하세요.")
 
     os.makedirs(HIRES_DIR, exist_ok=True)
     manifest = []
@@ -258,9 +305,11 @@ def hires(flt=None, size=4096, lam=1.0):
     started = time.perf_counter()
 
     for idx, e in enumerate(entries, 1):
-        src = os.path.join(RAW_DIR, e["png"])
+        edited = os.path.join(EDITED_DIR, e["png"])
+        raw = os.path.join(RAW_DIR, e["png"])
+        src = edited if os.path.exists(edited) else raw
         if not os.path.exists(src):
-            print(f"[건너뜀] 원본 PNG 없음: {src}")
+            print(f"[건너뜀] 소스 PNG 없음: {e['png']} (extract 먼저 실행)")
             continue
 
         tex_started = time.perf_counter()
@@ -319,32 +368,191 @@ def hires(flt=None, size=4096, lam=1.0):
 
 
 def repack(flt=None):
-    if not os.path.exists(MAP_PATH):
-        sys.exit("map.json 없음. 먼저 extract 실행.")
-    with open(MAP_PATH, encoding="utf-8") as f:
-        entries = json.load(f)
+    UnityPy = _unitypy()
+    entries = _manifest_entries(flt)
+    if not entries:
+        sys.exit("처리할 번들 없음. 필터를 확인하세요.")
 
-    # key별로, work/2_edited/ 에 실제로 있는 편집본만 모음
-    by_key = {}
-    for e in entries:
-        if flt and flt not in e["key"]:
-            continue
-        edited = os.path.join(EDITED_DIR, e["png"])
-        if os.path.exists(edited):
-            by_key.setdefault(e["key"], {})[e["texture"]] = edited
-
-    if not by_key:
-        sys.exit("교체할 PNG 없음. work/2_edited/ 에 한글화 PNG를 넣었는지 확인.")
-
+    skipped_missing_bundle = 0
+    skipped_no_png = 0
+    skipped_errors = 0
     done = 0
-    for key, repl in by_key.items():
+    for entry in entries:
+        key = entry["key"]
         src = os.path.join(GAME_ROOT, key)
         out = os.path.join(OUT_DIR, key)
-        print(f"[리팩] {key}")
-        if _replace(src, out, repl):
+        if not os.path.exists(src):
+            skipped_missing_bundle += 1
+            print(f"[건너뜀] 게임에 없음: {key}")
+            continue
+
+        replacements = {}
+        try:
+            env = UnityPy.load(src)
+            for obj in env.objects:
+                if obj.type.name != "Texture2D":
+                    continue
+                data = obj.read()
+                name = _png_name(key, data.m_Name)
+                edited = os.path.join(EDITED_DIR, name)
+                raw = os.path.join(RAW_DIR, name)
+                if os.path.exists(edited):
+                    replacements[data.m_Name] = edited
+                elif os.path.exists(raw):
+                    replacements[data.m_Name] = raw
+        except Exception as e:
+            skipped_errors += 1
+            print(f"[건너뜀] 번들 읽기 실패: {key}: {e}")
+            continue
+
+        if not replacements:
+            skipped_no_png += 1
+            print(f"[건너뜀] 소스 PNG 없음: {key} (extract 먼저 실행)")
+            continue
+
+        typ = _asset_type(key, entry)
+        size = 1024 if typ == "item" else None
+        size_desc = "1024" if size else "원본크기"
+        print(f"[리팩] {key} ({typ}, {size_desc}, 텍스처 {len(replacements)}개)")
+        if _replace(src, out, replacements, size):
             done += 1
     print(f"\n완료: 번들 {done}개 → {OUT_DIR}")
+    print(f"요약: 게임에 없음 {skipped_missing_bundle}개, 소스 PNG 없음 {skipped_no_png}개, 오류 {skipped_errors}개")
+    if done == 0:
+        sys.exit("생성한 번들 없음. extract 먼저 실행했는지 확인하세요.")
     print("다음: SPT 런처에서 '임시 파일 삭제' 후 게임 실행")
+
+
+def index(prefix=None):
+    """게임 번들의 Texture2D 이름 → 번들 key 인덱스 생성/갱신."""
+    UnityPy = _unitypy()
+    if not os.path.exists(GAME_ROOT):
+        sys.exit(f"게임 번들 폴더 없음: {GAME_ROOT}")
+
+    if prefix:
+        prefix = prefix.replace("\\", "/").lstrip("/")
+
+    bundles = []
+    for root, _, files in os.walk(GAME_ROOT):
+        for fn in files:
+            if not fn.endswith(".bundle"):
+                continue
+            path = os.path.join(root, fn)
+            key = os.path.relpath(path, GAME_ROOT).replace("\\", "/")
+            if prefix and not key.startswith(prefix):
+                continue
+            bundles.append((key, path))
+    bundles.sort()
+
+    if not bundles:
+        sys.exit("인덱싱할 번들 없음. 경로prefix를 확인하세요.")
+
+    current = {}
+    if os.path.exists(TEXINDEX_PATH):
+        with open(TEXINDEX_PATH, encoding="utf-8") as f:
+            loaded = json.load(f)
+        for name, keys in loaded.items():
+            if isinstance(keys, list):
+                current[name] = list(dict.fromkeys(k for k in keys if isinstance(k, str)))
+
+    scanned = {}
+    ok_keys = set()
+    skipped = 0
+    started = time.perf_counter()
+    total = len(bundles)
+    for idx, (key, path) in enumerate(bundles, 1):
+        if idx == 1 or idx == total or idx % 25 == 0:
+            print(f"[index {idx}/{total}] {key}")
+        try:
+            env = UnityPy.load(path)
+            names = set()
+            for obj in env.objects:
+                if obj.type.name != "Texture2D":
+                    continue
+                data = obj.read()
+                if data.m_Name:
+                    names.add(data.m_Name)
+            for name in names:
+                scanned.setdefault(name, []).append(key)
+            ok_keys.add(key)
+        except Exception as e:
+            skipped += 1
+            print(f"[건너뜀] 인덱스 실패: {key}: {e}")
+
+    for name in list(current):
+        current[name] = [k for k in current[name] if k not in ok_keys]
+        if not current[name]:
+            del current[name]
+    for name, keys in scanned.items():
+        merged = current.setdefault(name, [])
+        for key in keys:
+            if key not in merged:
+                merged.append(key)
+
+    for keys in current.values():
+        keys.sort()
+
+    with open(TEXINDEX_PATH, "w", encoding="utf-8") as f:
+        json.dump(dict(sorted(current.items())), f, ensure_ascii=False, indent=2)
+
+    elapsed = time.perf_counter() - started
+    print(f"\n완료: 텍스처명 {len(current)}개 → {TEXINDEX_PATH}")
+    print(f"요약: 번들 {len(ok_keys)}개 갱신, 스킵 {skipped}개, {elapsed:.1f}초")
+
+
+def find(query):
+    """texindex.json에서 텍스처명을 부분 검색."""
+    if not os.path.exists(TEXINDEX_PATH):
+        sys.exit("tools/auto.py index 를 먼저 실행하세요")
+    if not query:
+        sys.exit("검색할 부분문자열을 입력하세요.")
+
+    with open(TEXINDEX_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+
+    q = query.lower()
+    matches = [(name, keys) for name, keys in data.items() if q in name.lower()]
+    if not matches:
+        print("검색 결과 없음")
+        return
+
+    for name, keys in sorted(matches):
+        print(f"{name} →")
+        for key in keys:
+            print(f"  {key}")
+    print(f"\n완료: {len(matches)}개 텍스처명")
+
+
+def all_steps(flt=None, size=4096, lam=1.0):
+    """derive → repack → hires → deploy 원클릭 실행."""
+    print("========== derive ==========")
+    try:
+        derive(flt)
+    except SystemExit as e:
+        print(f"[계속] derive 건너뜀: {e}")
+
+    print("========== repack ==========")
+    repack(flt)
+
+    print("========== hires ==========")
+    hires(flt, size=size, lam=lam)
+
+    print("========== deploy ==========")
+    deploy()
+
+
+def _copy_if_exists(src, dst_dir, label):
+    """있으면 복사하고, 잠김/권한 오류는 배포 흐름을 막지 않음."""
+    if not os.path.exists(src):
+        return False
+    os.makedirs(dst_dir, exist_ok=True)
+    try:
+        shutil.copy2(src, dst_dir)
+        print(f"{label} 설치 완료")
+        return True
+    except OSError:
+        print(f"  [건너뜀] {os.path.basename(src)} 잠김(실행 중). 종료 후 재배포.")
+        return False
 
 
 def deploy():
@@ -398,6 +606,16 @@ def deploy():
         except OSError:
             print("  [건너뜀] GoLani.HiResInspect.dll 잠김(게임 실행 중)")
 
+    picker_index_copied = False
+    if os.path.exists(TEXINDEX_PATH):
+        _copy_if_exists(TEXINDEX_PATH, HIRES_PLUGIN_DIR, "하이레즈 inspect 인덱스")
+        picker_index_copied = _copy_if_exists(TEXINDEX_PATH, PICKER_PLUGIN_DIR, "에셋 피커 인덱스")
+
+    if os.path.exists(PICKER_DLL):
+        _copy_if_exists(PICKER_DLL, PICKER_PLUGIN_DIR, "에셋 피커 플러그인")
+        if os.path.exists(TEXINDEX_PATH) and not picker_index_copied:
+            _copy_if_exists(TEXINDEX_PATH, PICKER_PLUGIN_DIR, "에셋 피커 인덱스")
+
     print(f"\n완료 → {MODS_DIR}")
     print("다음: SPT 런처에서 '임시 파일 삭제' 후 게임 실행")
 
@@ -416,7 +634,13 @@ if __name__ == "__main__":
     elif cmd == "build":  # derive + repack (한 방)
         derive(flt)
         repack(flt)
+    elif cmd == "all":
+        all_steps(flt, size=int(sys.argv[3]) if len(sys.argv) > 3 else 4096, lam=float(sys.argv[4]) if len(sys.argv) > 4 else 1.0)
+    elif cmd == "index":
+        index(flt)
+    elif cmd == "find":
+        find(flt)
     elif cmd == "deploy":
         deploy()
     else:
-        sys.exit("사용법: python tools/auto.py [extract|derive|repack|hires|build|deploy] [필터] [size] [lambda]")
+        sys.exit("사용법: python tools/auto.py [extract|derive|repack|hires|build|all|index|find|deploy] [필터|경로prefix|검색어] [size] [lambda]")
