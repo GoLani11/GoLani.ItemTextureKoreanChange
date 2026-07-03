@@ -61,6 +61,10 @@ BC7ENC = os.path.join(PROJ, "tools", "bin", "bc7enc")
 BC7 = 25  # TextureFormat.BC7
 DXT5 = 12  # TextureFormat.DXT5 (BC3) 폴백용
 
+# ponytail: hires(inspect 4096 demand-load) 잠시 비활성. BC7 포맷만으로 화질 충분.
+#           한글 고해상도 작업 재개 시 True 로. 코드/플러그인은 그대로 둠.
+DEPLOY_HIRES = False
+
 
 def _unitypy():
     """UnityPy는 쓰는 명령에서만 로드."""
@@ -537,8 +541,11 @@ def all_steps(flt=None, size=None, lam=1.0):
     print("========== repack ==========")
     repack(flt)
 
-    print("========== hires ==========")
-    hires(flt, size=size, lam=lam)
+    if DEPLOY_HIRES:
+        print("========== hires ==========")
+        hires(flt, size=size, lam=lam)
+    else:
+        print("========== hires (건너뜀: DEPLOY_HIRES=False) ==========")
 
     print("========== deploy ==========")
     deploy()
@@ -591,27 +598,35 @@ def deploy():
         except OSError:  # WinError 1224(사용 중) 등은 PermissionError가 아님
             print(f"  [건너뜀] {f} 잠김(서버 실행 중). 메타데이터 바꿨으면 서버 종료 후 재배포.")
 
-    if os.path.exists(HIRES_DIR):
-        dst = os.path.join(HIRES_PLUGIN_DIR, "hires")
-        try:
-            if os.path.exists(dst):
-                shutil.rmtree(dst)
-            shutil.copytree(HIRES_DIR, dst)
-            print("하이레즈 텍스처 설치 완료")
-        except OSError:
-            print("  [건너뜀] hires 잠김(게임 실행 중). 게임 종료 후 재배포.")
+    if DEPLOY_HIRES:
+        if os.path.exists(HIRES_DIR):
+            dst = os.path.join(HIRES_PLUGIN_DIR, "hires")
+            try:
+                if os.path.exists(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(HIRES_DIR, dst)
+                print("하이레즈 텍스처 설치 완료")
+            except OSError:
+                print("  [건너뜀] hires 잠김(게임 실행 중). 게임 종료 후 재배포.")
 
-    if os.path.exists(HIRES_DLL):
-        os.makedirs(HIRES_PLUGIN_DIR, exist_ok=True)
+        if os.path.exists(HIRES_DLL):
+            os.makedirs(HIRES_PLUGIN_DIR, exist_ok=True)
+            try:
+                shutil.copy2(HIRES_DLL, HIRES_PLUGIN_DIR)
+                print("하이레즈 inspect 플러그인 설치 완료")
+            except OSError:
+                print("  [건너뜀] GoLani.HiResInspect.dll 잠김(게임 실행 중)")
+    else:
+        # hires 비활성: 이미 깔린 inspect 플러그인/팩 제거해 스왑 중단.
         try:
-            shutil.copy2(HIRES_DLL, HIRES_PLUGIN_DIR)
-            print("하이레즈 inspect 플러그인 설치 완료")
+            if os.path.exists(HIRES_PLUGIN_DIR):
+                shutil.rmtree(HIRES_PLUGIN_DIR)
+                print("하이레즈 inspect 제거됨(DEPLOY_HIRES=False)")
         except OSError:
-            print("  [건너뜀] GoLani.HiResInspect.dll 잠김(게임 실행 중)")
+            print("  [건너뜀] 하이레즈 inspect 제거 실패(게임 실행 중). 게임 종료 후 재배포.")
 
     picker_index_copied = False
     if os.path.exists(TEXINDEX_PATH):
-        _copy_if_exists(TEXINDEX_PATH, HIRES_PLUGIN_DIR, "하이레즈 inspect 인덱스")
         picker_index_copied = _copy_if_exists(TEXINDEX_PATH, PICKER_PLUGIN_DIR, "에셋 피커 인덱스")
 
     if os.path.exists(PICKER_DLL):
