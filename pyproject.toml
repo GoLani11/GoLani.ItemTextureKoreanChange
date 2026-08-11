@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "golani-texture-localizer"
+version = "2.0.0a1"
+description = "검수 중심 SPT 음식 텍스처 한국어 현지화 파이프라인"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0,<3",
+  "opencv-python-headless>=4.10,<5",
+  "Pillow>=11,<13",
+  "UnityPy==1.25.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+golani-localize = "golani_texture_localizer.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "localizer"}
+
+[tool.setuptools.packages.find]
+where = ["localizer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/localizer"]
+addopts = "-q"

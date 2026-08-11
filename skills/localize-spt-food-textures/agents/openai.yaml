@@ -1,0 +1,4 @@
+interface:
+  display_name: "SPT 음식 텍스처 현지화"
+  short_description: "SPT 음식 포장을 한국어화하고 번들을 안전하게 검증해요"
+  default_prompt: "Use $localize-spt-food-textures to localize every visible foreign phrase on an SPT food texture into natural Korean and validate the rebuilt bundle."

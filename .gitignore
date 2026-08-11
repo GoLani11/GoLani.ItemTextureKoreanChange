@@ -1,6 +1,10 @@
 work/
+workspace/
 tools/map.json
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
 node_modules/
 bin/
 obj/
