@@ -46,11 +46,11 @@ HIRES_DIR = os.path.join(PROJ, "hires")
 MAP_PATH = os.path.join(PROJ, "tools", "map.json")
 BUNDLES_JSON = os.path.join(PROJ, "bundles.json")
 
-# 배포 대상 (SPT 4.x: 서버는 D:/SPT/SPT, 모드는 그 아래 user/mods)
+# 배포 대상 (SPT 4.1+: 서버는 D:/SPT/SPT_Runtime, 모드는 그 아래 user/mods)
 MOD_NAME = "GoLani-ItemTextureKoreanChange"
-MODS_DIR = os.path.join(SPT_DIR, "SPT", "user", "mods", MOD_NAME)
+MODS_DIR = os.path.join(SPT_DIR, "SPT_Runtime", "user", "mods", MOD_NAME)
 CSPROJ = os.path.join(PROJ, "GoLani.ItemTextureKoreanChange.csproj")
-DLL_OUT = os.path.join(PROJ, "bin", "Release", "net9.0")
+DLL_OUT = os.path.join(PROJ, "bin", "Release", "net10.0")
 HIRES_DLL = os.path.join(PROJ, "client", "GoLani.HiResInspect", "bin", "Release", "net471", "GoLani.HiResInspect.dll")
 HIRES_PLUGIN_DIR = os.path.join(SPT_DIR, "BepInEx", "plugins", "GoLani.HiResInspect")
 PICKER_DLL = os.path.join(PROJ, "client", "GoLani.AssetPicker", "bin", "Release", "net471", "GoLani.AssetPicker.dll")
@@ -566,7 +566,7 @@ def _copy_if_exists(src, dst_dir, label):
 
 
 def deploy():
-    # 1. C# DLL 빌드 (SPT 4.x 번들 모드는 DLL 필수)
+    # 1. C# DLL 빌드 (SPT 4.1 번들 모드는 DLL 필수)
     print("[빌드] dotnet build ...")
     subprocess.run(["dotnet", "build", CSPROJ, "-c", "Release"], check=True)
 

@@ -10,7 +10,7 @@ Currently, only food items have been changed, but other items will also be chang
 
 ### How to apply it?
 
-SPT / user / mods / GoLani-ItemTextureKoreanChange
+SPT / SPT_Runtime / user / mods / GoLani-ItemTextureKoreanChange
 
 Please apply it so that it becomes a path like this.
 
@@ -30,7 +30,7 @@ You can use the source code freely if you just leave a comment and an address.
 
 ### 모드 적용 방법
 
-SPT 설치 파일 / user / mods / GoLani-ItemTextureKoreanChange
+SPT 설치 파일 / SPT_Runtime / user / mods / GoLani-ItemTextureKoreanChange
 
 이렇게 경로가 되도록 적용해주세요.
 
@@ -40,9 +40,9 @@ SPT 설치 파일 / user / mods / GoLani-ItemTextureKoreanChange
 댓글과 출처만 남겨주시면 자유롭게 소스 코드 활용하셔도 됩니다.
 
 
-## 개발자용 — 자동화 파이프라인 (SPT 4.x)
+## 개발자용 — 자동화 파이프라인 (SPT 4.1)
 
-SPT 4.x(C# 서버)용 번들 모드입니다. 텍스처 추출·교체·설치를 스크립트로 자동화합니다.
+SPT 4.1(C# 서버)용 번들 모드입니다. 텍스처 추출·교체·설치를 스크립트로 자동화합니다.
 
 | 단계 | 명령 / 더블클릭 | 내용 |
 |------|----------------|------|
@@ -52,7 +52,7 @@ SPT 4.x(C# 서버)용 번들 모드입니다. 텍스처 추출·교체·설치�
 | 2 | `2_적용.bat [필터]` | `work/2_edited/` → `bundles/` 번들 생성 (원본 포맷 유지) |
 | 3 | `3_배포.bat` | C# DLL 빌드 + `bundles/` 전체를 `user/mods` 에 설치 |
 
-- 빌드 요구: .NET 9 SDK (`dotnet`), 파이썬 3 + UnityPy 1.25.0.
+- 빌드 요구: .NET 10 SDK (`dotnet`), 파이썬 3 + UnityPy 1.25.0.
 - 게임 경로는 `D:\SPT` 기준. 다르면 환경변수 `SPT_DIR` 로 지정.
 - 적용 후 **런처에서 "임시 파일 삭제"** 필수.
 - 설계·주의사항: [docs/automation-design.md](docs/automation-design.md)
