@@ -3,17 +3,17 @@
         {
 			"_comment" : "차 배터리",
             "key": "assets/content/items/barter/car_battery/item_car_battery.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["assets/commonassets/physics/physicsmaterials.bundle", "cubemaps", "shaders"]
         },
         {
 			"_comment" : "마요네즈",
             "key": "assets/content/items/food/item_food_mayo/item_food_mayo.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["assets/commonassets/physics/physicsmaterials.bundle", "cubemaps", "shaders"]
         },
 		{
 			"_comment" : "소시지",
             "key": "assets/content/weapons/usable_items/item_food_sausage/client_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["assets/content/weapons/usable_items/item_food_sausage/textures/client_assets.bundle", "cubemaps", "shaders"]
         },
 		{
             "key": "assets/content/weapons/usable_items/item_food_sausage/textures/client_assets.bundle",
@@ -22,17 +22,17 @@
 		{
 			"_comment" : "보드카",
             "key": "assets/content/items/food/bottles_with_alcohol/item_food_vodka.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["assets/commonassets/physics/physicsmaterials.bundle", "cubemaps", "shaders"]
         },
 		{
 			"_comment" : "댄 재키엘",
             "key": "assets/content/items/food/bottles_with_alcohol/item_food_jack.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["assets/commonassets/physics/physicsmaterials.bundle", "cubemaps", "shaders"]
         },
 		{
 			"_comment" : "스프랫(정어리) 캔",
             "key": "assets/content/items/food/item_food_sprats/item_food_sprats.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["assets/commonassets/physics/physicsmaterials.bundle", "cubemaps", "shaders"]
         },
 		{
 			"_comment" : "수분 공급팩",
@@ -47,32 +47,32 @@
 		{
 			"_comment" : "타르콜라,레트콜라캔",
             "key": "assets/content/weapons/usable_items/item_drink_cans/textures/client_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "맥스 에너지캔",
             "key": "assets/content/weapons/usable_items/item_drink_cans/item_maxenergy_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "녹차캔",
             "key": "assets/content/weapons/usable_items/item_drink_cans/item_icegeen_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "사과주스",
             "key": "assets/content/weapons/usable_items/item_juice/item_juice_apple_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "그랜드 자몽주스",
             "key": "assets/content/weapons/usable_items/item_juice/item_juice_grand_textures.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "비타주스",
             "key": "assets/content/weapons/usable_items/item_juice/item_juice_vita_textures.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "연유",
@@ -152,12 +152,12 @@
 		{
 			"_comment" : "MRE",
             "key": "assets/content/weapons/usable_items/item_mre/item_mre_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "이스크라",
             "key": "assets/content/weapons/usable_items/item_ifr/item_ifr_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "과자들",
@@ -172,12 +172,12 @@
 		{
 			"_comment" : "파인애플 주스",
             "key": "assets/content/weapons/usable_items/item_tetrapak/item_juice_army_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "우유",
             "key": "assets/content/weapons/usable_items/item_tetrapak/item_milk_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "알론카",
@@ -207,12 +207,12 @@
 		{
 			"_comment" : "군용 붕대",
             "key": "assets/content/weapons/usable_items/item_bandage/item_bandage_army_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "무균 붕대",
             "key": "assets/content/weapons/usable_items/item_bandage/item_bandage_med_assets.bundle",
-            "dependencyKeys": []
+            "dependencyKeys": ["cubemaps", "shaders"]
         },
 		{
 			"_comment" : "아날긴 진통제",

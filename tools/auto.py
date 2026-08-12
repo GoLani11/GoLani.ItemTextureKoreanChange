@@ -36,6 +36,7 @@ import time
 # ── 설정 ───────────────────────────────────────────────
 SPT_DIR = os.environ.get("SPT_DIR", "D:/SPT")
 GAME_ROOT = os.path.join(SPT_DIR, "EscapeFromTarkov_Data/StreamingAssets/Windows")
+GAME_BUNDLE_CATALOG = os.path.join(GAME_ROOT, "Windows.json")
 
 PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DIR = os.path.join(PROJ, "work", "1_raw")
@@ -88,6 +89,31 @@ def _manifest_entries(flt=None):
 def _keys(flt=None):
     """bundles.json에서 번들 key 목록을 읽음 (필터 적용)."""
     return [m["key"] for m in _manifest_entries(flt)]
+
+
+def _deployment_manifest(keys, catalog_path=GAME_BUNDLE_CATALOG):
+    """원본 게임 카탈로그의 의존성을 보존한 SPT bundles.json을 만든다."""
+    if not os.path.isfile(catalog_path):
+        raise FileNotFoundError(f"게임 bundle 카탈로그 없음: {catalog_path}")
+    with open(catalog_path, encoding="utf-8") as f:
+        catalog = json.load(f)
+
+    manifest = []
+    missing = []
+    for key in sorted(set(keys)):
+        source = catalog.get(key)
+        dependencies = source.get("Dependencies") if isinstance(source, dict) else None
+        if not isinstance(dependencies, list) or not all(isinstance(value, str) for value in dependencies):
+            missing.append(key)
+            continue
+        manifest.append({
+            "key": key,
+            "dependencyKeys": list(dict.fromkeys(dependencies)),
+        })
+
+    if missing:
+        raise ValueError("게임 bundle 카탈로그에서 의존성을 찾지 못함: " + ", ".join(missing))
+    return {"manifest": manifest}
 
 
 def _asset_type(key, manifest_entry=None):
@@ -581,8 +607,10 @@ def deploy():
         sys.exit("bundles/ 에 .bundle 없음. 먼저 repack 실행.")
 
     # 3. 모드 폴더 구성. 번들(매번 바뀜) 먼저, DLL(거의 안 바뀜)은 best-effort.
+    # 모델/재질이 든 bundle은 shaders/cubemaps 등의 원본 의존성이 없으면 보라색으로 렌더링된다.
+    # 설치 폴더를 건드리기 전에 전체 key를 검증해 불완전한 매니페스트 배포를 막는다.
+    manifest = _deployment_manifest(keys)
     os.makedirs(MODS_DIR, exist_ok=True)
-    manifest = {"manifest": [{"key": k, "dependencyKeys": []} for k in keys]}
     with open(os.path.join(MODS_DIR, "bundles.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=4)
     dst = os.path.join(MODS_DIR, "bundles")
