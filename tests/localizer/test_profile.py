@@ -24,6 +24,22 @@ def test_food_profile_covers_full_inventory() -> None:
     assert len({target.id for target in profile.targets}) == len(profile.targets)
 
 
+def test_direction_sensitive_targets_document_natural_korean_layout() -> None:
+    profile = load_profile(ROOT / "profiles" / "food" / "collection.json")
+
+    for target_id in ("ratcola", "max-energy", "aquamari"):
+        notes = profile.target_by_id(target_id).notes
+        assert "회전" in notes
+        assert "쌓" in notes or "적층" in notes
+    assert profile.target_by_id("ratcola").exact_text == ("랫콜라", "샘 아저씨 특제")
+    assert profile.target_by_id("herring").exact_text[0] == "태평양 청어"
+    assert "자간" in profile.target_by_id("milk").notes
+    assert profile.target_by_id("green-ice").exact_text == ("그린 아이스", "녹차")
+    assert "자연스러운 어순" in profile.target_by_id("green-ice").notes
+    assert profile.target_by_id("peas").exact_text[-1] == "완두콩"
+    assert "그린피스" in profile.target_by_id("peas").notes
+
+
 def test_texture_name_classification() -> None:
     assert texture_role("item_food_mayo_D") == "diffuse"
     assert texture_role("item_mre_LOD0_nrm") == "normal"

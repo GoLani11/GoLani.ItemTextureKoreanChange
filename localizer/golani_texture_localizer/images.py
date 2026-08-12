@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any
 
 import cv2
@@ -24,6 +26,13 @@ def _sha256(path: Path) -> str:
 
 def _approved_path(paths: ProjectPaths, target: TargetSpec) -> Path:
     return paths.approved / f"{target.id}.png"
+
+
+def _temporary_png(directory: Path, stem: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    descriptor, value = tempfile.mkstemp(dir=directory, prefix=f".{stem}.", suffix=".png")
+    os.close(descriptor)
+    return Path(value)
 
 
 def stage_candidate(
@@ -55,9 +64,21 @@ def stage_candidate(
     candidate.putalpha(source.getchannel("A"))
 
     destination = _approved_path(paths, target)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    candidate.save(destination)
-    report = validate_image_pair(source_path, destination)
+    temporary = _temporary_png(destination.parent, target.id)
+    try:
+        candidate.save(temporary)
+        report = validate_image_pair(source_path, temporary)
+        if not report["passed"]:
+            raise ValueError(
+                f"{target.id} 후보가 품질 게이트를 통과하지 못했어요: "
+                f"alpha_equal={report['alpha_equal']}, "
+                f"structure_edge_f1={report['structure_edge_f1']}"
+            )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    report["edited_sha256"] = _sha256(destination)
+    report["edited"] = str(destination.resolve())
     report.update(
         {
             "target_id": target.id,
