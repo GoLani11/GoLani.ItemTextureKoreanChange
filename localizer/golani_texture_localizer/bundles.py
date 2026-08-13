@@ -23,6 +23,7 @@ from .unityfs import (
     merge_ranges,
     parse_unityfs_layout,
     patch_uncompressed_logical_range,
+    rebase_unityfs_cab_exact,
 )
 
 
@@ -51,14 +52,34 @@ def _find_texture(environment: Any, name: str):
     return matches[0]
 
 
-def _object_hashes(environment: Any) -> dict[str, str]:
-    return {
-        f"{obj.assets_file.name}:{obj.path_id}:{obj.type.name}": _sha256_bytes(obj.get_raw_data())
-        for obj in environment.objects
+def _replace_text(value: str, replacements: Mapping[str, str] | None) -> str:
+    for source, target in (replacements or {}).items():
+        value = value.replace(source, target)
+    return value
+
+
+def _object_hashes(
+    environment: Any,
+    replacements: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    byte_replacements = {
+        source.encode("ascii"): target.encode("ascii")
+        for source, target in (replacements or {}).items()
     }
+    hashes = {}
+    for obj in environment.objects:
+        raw = obj.get_raw_data()
+        for source, target in byte_replacements.items():
+            raw = raw.replace(source, target)
+        asset_name = _replace_text(obj.assets_file.name, replacements)
+        hashes[f"{asset_name}:{obj.path_id}:{obj.type.name}"] = _sha256_bytes(raw)
+    return hashes
 
 
-def _texture_metadata(texture: Any) -> tuple[Any, ...]:
+def _texture_metadata(
+    texture: Any,
+    replacements: Mapping[str, str] | None = None,
+) -> tuple[Any, ...]:
     stream = texture.m_StreamData
     return (
         texture.m_Name,
@@ -67,7 +88,7 @@ def _texture_metadata(texture: Any) -> tuple[Any, ...]:
         int(texture.m_TextureFormat),
         texture.m_MipCount,
         texture.m_CompleteImageSize,
-        stream.path,
+        _replace_text(stream.path, replacements),
         stream.offset,
         stream.size,
     )
@@ -127,6 +148,13 @@ def _verified_source_bundle(
         if not all(isinstance(value, str) and value for value in (source_value, expected_sha256)):
             raise ValueError(f"source override 필수 필드가 누락됐어요: {bundle_key}")
         source = Path(source_value).expanduser().resolve()
+        fallback = (bundle_root / Path(bundle_key)).expanduser().resolve()
+        if (
+            (not source.is_file() or _sha256_file(source) != expected_sha256)
+            and fallback.is_file()
+            and _sha256_file(fallback) == expected_sha256
+        ):
+            source = fallback
     else:
         source = (bundle_root / Path(bundle_key)).expanduser().resolve()
         hashes = {
@@ -208,8 +236,8 @@ def patch_bundle_exact(
             "resource": resource_name,
         }
 
-    merged_ranges = merge_ranges(physical_ranges)
-    if not bytes_equal_outside_ranges(original_bytes, rebuilt_bytes, merged_ranges):
+    payload_ranges = merge_ranges(physical_ranges)
+    if not bytes_equal_outside_ranges(original_bytes, rebuilt_bytes, payload_ranges):
         raise AssertionError("대상 stream payload 밖의 bundle bytes가 달라졌어요")
 
     rebuilt = UnityPy.load(rebuilt_bytes)
@@ -219,10 +247,27 @@ def patch_bundle_exact(
     if layout_signature(original_layout) != layout_signature(rebuilt_layout):
         raise AssertionError("UnityFS layout이 변경됐어요")
 
+    final_bytes, cab_rebase = rebase_unityfs_cab_exact(
+        rebuilt_bytes,
+        rebuilt.file,
+        rebuilt_layout,
+    )
+    declared_ranges = merge_ranges([*payload_ranges, *cab_rebase.physical_ranges])
+    if not bytes_equal_outside_ranges(original_bytes, final_bytes, declared_ranges):
+        raise AssertionError("texture payload와 CAB 식별자 밖의 bundle bytes가 달라졌어요")
+
+    final = UnityPy.load(final_bytes)
+    final_layout = parse_unityfs_layout(final_bytes, final.file)
+    cab_normalization = {cab_rebase.output_cab: cab_rebase.source_cab}
+    if before_objects != _object_hashes(final, cab_normalization):
+        raise AssertionError("CAB 식별자 외의 serialized object가 변경됐어요")
+    if layout_signature(original_layout) != layout_signature(final_layout, cab_normalization):
+        raise AssertionError("CAB 식별자 외의 UnityFS layout이 변경됐어요")
+
     texture_reports = []
     for texture_name, info in expected.items():
-        _, texture = _find_texture(rebuilt, texture_name)
-        if _texture_metadata(texture) != info["metadata"]:
+        _, texture = _find_texture(final, texture_name)
+        if _texture_metadata(texture, cab_normalization) != info["metadata"]:
             raise AssertionError(f"{texture_name} metadata가 변경됐어요")
         roundtrip = texture.image.convert("RGBA")
         intended = np.asarray(info["image"], dtype=np.int16)
@@ -244,25 +289,36 @@ def patch_bundle_exact(
                 "texture": texture_name,
                 "source_image": str(info["image_path"]),
                 "payload_size": info["payload_size"],
-                "resource": info["resource"],
+                "resource": info["resource"].replace(
+                    cab_rebase.source_cab,
+                    cab_rebase.output_cab,
+                ),
                 "channel_mae": [round(float(value), 6) for value in channel_mae],
                 "roundtrip": str(roundtrip_path) if roundtrip_path else None,
             }
         )
 
-    _atomic_write(output_bundle, rebuilt_bytes)
-    if output_bundle.read_bytes() != rebuilt_bytes:
+    _atomic_write(output_bundle, final_bytes)
+    if output_bundle.read_bytes() != final_bytes:
         raise AssertionError("공개된 bundle bytes가 검증본과 달라요")
     return {
         "source_bundle": str(source_bundle),
         "source_sha256": _sha256_bytes(original_bytes),
         "output_bundle": str(output_bundle),
-        "output_sha256": _sha256_bytes(rebuilt_bytes),
-        "bundle_size": len(rebuilt_bytes),
-        "physical_patch_ranges": merged_ranges,
-        "bytes_equal_outside_payloads": True,
-        "layout_equal": True,
-        "serialized_objects_equal": True,
+        "output_sha256": _sha256_bytes(final_bytes),
+        "bundle_size": len(final_bytes),
+        "physical_patch_ranges": declared_ranges,
+        "texture_payload_ranges": payload_ranges,
+        "cab_patch_ranges": merge_ranges(cab_rebase.physical_ranges),
+        "bytes_equal_outside_declared_ranges": True,
+        "layout_equal_except_cab": True,
+        "serialized_objects_equal_except_cab": True,
+        "cab": {
+            "source": cab_rebase.source_cab,
+            "output": cab_rebase.output_cab,
+            "blocks_info_occurrences": cab_rebase.blocks_info_occurrences,
+            "data_occurrences": cab_rebase.data_occurrences,
+        },
         "textures": texture_reports,
         "passed": True,
     }
@@ -319,11 +375,17 @@ def repack_collection(
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         reports.append(report)
 
+    output_cabs = [report["cab"]["output"] for report in reports]
+    unique_cab_count = len(set(output_cabs))
+    if unique_cab_count != len(output_cabs):
+        raise AssertionError("재패킹된 bundle의 CAB 식별자가 서로 충돌해요")
+
     payload = {
         "schema_version": 1,
         "collection": profile.id,
         "partial": bool(image_report["missing"]),
         "bundle_count": len(reports),
+        "unique_cab_count": unique_cab_count,
         "texture_count": sum(len(report["textures"]) for report in reports),
         "passed": all(report["passed"] for report in reports),
         "bundles": reports,
