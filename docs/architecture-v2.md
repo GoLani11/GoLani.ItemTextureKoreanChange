@@ -25,7 +25,7 @@ mod/                                 향후 C# 게임 적용 코드를 이관할
 
 ## 작업 흐름
 
-1. `python localize.py --spt-root D:/SPT inventory`: Texture2D 메타데이터만 읽는다.
+1. `python localize.py --spt-root D:/SPT inventory`: Texture2D와 실제 Material PPtr를 읽는다.
 2. `python localize.py --spt-root D:/SPT extract`: 원본을 `workspace/source/`에 추출한다.
 3. OCR·Codex 독립 판독·교차검증: 모든 보이는 문구의 뜻·좌표·방향을 확정한다.
 4. 편집 명세: 영역별 원문·뜻·번역·좌표·방향과 편집·보호·seam 마스크를 확정한다.
@@ -53,8 +53,11 @@ mod/                                 향후 C# 게임 적용 코드를 이관할
 - SPT 클라이언트가 사용하는 로컬 경로에서 재패킹 번들의 전체 자산을 로드할 수 있다.
 - 원본·판독·번역·마스크·후보·보조맵·밉·렌더·번들의 해시와 백업 기록이 있다.
 
-현재 구현된 전역 edge F1과 전체 평균 MAE는 참고 지표일 뿐 위 조건을 대신하지 않는다.
-필수 게이트가 아직 구현되지 않았거나 실행되지 않았다면 release를 만들지 않는다.
+`stage`는 작업 기록·마스크 SHA와 후보 SHA를 다시 계산하고 마스크 밖 변경을 실측한다.
+`derive`는 actual Material graph와 기록이 같을 때만 명시된 보조맵 영역을 처리한다. `repack`은
+승인·derived SHA가 오래되었거나 어떤 품목이라도 실패하면 중단한다. 전역 edge F1과 전체 평균
+MAE는 참고 지표일 뿐 위 조건을 대신하지 않으며, 실제 렌더 기록까지 있는 작업 기록만
+`release`로 승격한다.
 
 ## 현재 범위
 

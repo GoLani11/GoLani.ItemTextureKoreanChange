@@ -16,6 +16,7 @@ from .inventory import load_inventory, record_for_target
 from .models import CollectionProfile
 from .names import safe_bundle_name
 from .paths import ProjectPaths
+from .review import approval_path, sha256_file, verify_approval
 from .unityfs import (
     bytes_equal_outside_ranges,
     find_directory_entry,
@@ -73,7 +74,51 @@ def _texture_metadata(texture: Any) -> tuple[Any, ...]:
     )
 
 
-def _encode_mip_chain(obj: Any, texture: Any, image: Image.Image) -> bytes:
+def _srgb_to_linear(values: np.ndarray) -> np.ndarray:
+    values = values.astype(np.float32) / 255.0
+    return np.where(values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(values: np.ndarray) -> np.ndarray:
+    values = np.clip(values, 0.0, 1.0)
+    encoded = np.where(values <= 0.0031308, values * 12.92, 1.055 * values ** (1 / 2.4) - 0.055)
+    return np.clip(np.round(encoded * 255), 0, 255).astype(np.uint8)
+
+
+def _resize_float(values: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    import cv2
+
+    return cv2.resize(values, size, interpolation=cv2.INTER_AREA)
+
+
+def _next_mip(image: Image.Image, role: str) -> Image.Image:
+    size = (max(1, image.width // 2), max(1, image.height // 2))
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    if role == "diffuse":
+        rgb = _linear_to_srgb(_resize_float(_srgb_to_linear(rgba[..., :3]), size))
+        alpha = np.clip(np.round(_resize_float(rgba[..., 3].astype(np.float32), size)), 0, 255).astype(np.uint8)
+        return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
+    if role == "normal":
+        x = rgba[..., 3].astype(np.float32) / 127.5 - 1.0
+        y = rgba[..., 1].astype(np.float32) / 127.5 - 1.0
+        z = np.sqrt(np.clip(1.0 - x * x - y * y, 0.0, 1.0))
+        vector = _resize_float(np.dstack((x, y, z)), size)
+        length = np.linalg.norm(vector, axis=2, keepdims=True)
+        vector /= np.maximum(length, 1e-8)
+        other = np.clip(np.round(_resize_float(rgba[..., [0, 2]].astype(np.float32), size)), 0, 255).astype(np.uint8)
+        output = np.empty((size[1], size[0], 4), dtype=np.uint8)
+        output[..., 0] = other[..., 0]
+        output[..., 1] = np.clip(np.round((vector[..., 1] + 1.0) * 127.5), 0, 255).astype(np.uint8)
+        output[..., 2] = other[..., 1]
+        output[..., 3] = np.clip(np.round((vector[..., 0] + 1.0) * 127.5), 0, 255).astype(np.uint8)
+        return Image.fromarray(output, "RGBA")
+    if role == "gloss":
+        values = np.clip(np.round(_resize_float(rgba.astype(np.float32), size)), 0, 255).astype(np.uint8)
+        return Image.fromarray(values, "RGBA")
+    raise ValueError(f"지원하지 않는 텍스처 역할이에요: {role}")
+
+
+def _encode_mip_chain(obj: Any, texture: Any, image: Image.Image, role: str) -> bytes:
     from UnityPy.export import Texture2DConverter
 
     parts: list[bytes] = []
@@ -89,10 +134,7 @@ def _encode_mip_chain(obj: Any, texture: Any, image: Image.Image) -> bytes:
             raise ValueError(f"mip {index} 포맷이 {actual_format}으로 바뀌었어요")
         parts.append(encoded)
         if index + 1 < texture.m_MipCount:
-            level = level.resize(
-                (max(1, level.width // 2), max(1, level.height // 2)),
-                Image.Resampling.BICUBIC,
-            )
+            level = _next_mip(level, role)
     return b"".join(parts)
 
 
@@ -159,6 +201,7 @@ def patch_bundle_exact(
     *,
     roundtrip_dir: Path | None = None,
     max_mae: float = 6.0,
+    roles: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     import UnityPy
 
@@ -191,7 +234,10 @@ def patch_bundle_exact(
         stream = texture.m_StreamData
         if not stream.path or stream.offset < 0 or stream.size <= 0:
             raise ValueError(f"{texture_name}에 유효한 streamed image data가 없어요")
-        payload = _encode_mip_chain(obj, texture, image)
+        role = (roles or {}).get(texture_name)
+        if role not in {"diffuse", "normal", "gloss"}:
+            raise ValueError(f"{texture_name}의 diffuse/normal/gloss 역할이 명시되지 않았어요")
+        payload = _encode_mip_chain(obj, texture, image, role)
         if len(payload) != stream.size:
             raise ValueError(f"{texture_name} payload {len(payload)} != stream size {stream.size}")
         resource_name = stream.path.rsplit("/", 1)[-1]
@@ -213,6 +259,7 @@ def patch_bundle_exact(
             "image_path": image_path,
             "payload_size": len(payload),
             "resource": resource_name,
+            "role": role,
         }
 
     merged_ranges = merge_ranges(physical_ranges)
@@ -237,9 +284,18 @@ def patch_bundle_exact(
         if intended.shape != actual.shape:
             raise AssertionError(f"{texture_name} 왕복 이미지 shape가 달라요")
         channel_mae = np.abs(intended - actual).mean(axis=(0, 1))
+        absolute = np.abs(intended - actual)
+        p95 = np.percentile(absolute, 95, axis=(0, 1))
+        p99 = np.percentile(absolute, 99, axis=(0, 1))
+        maximum = absolute.max(axis=(0, 1))
+        localized_p99_limit = max(32.0, max_mae * 8.0)
         if np.any(channel_mae > max_mae):
             raise AssertionError(
                 f"{texture_name} 왕복 MAE {channel_mae.tolist()}가 제한 {max_mae}를 넘었어요"
+            )
+        if np.any(p99 > localized_p99_limit):
+            raise AssertionError(
+                f"{texture_name} 왕복 p99 {p99.tolist()}가 제한 {localized_p99_limit}를 넘었어요"
             )
         roundtrip_path = None
         if roundtrip_dir is not None:
@@ -253,6 +309,14 @@ def patch_bundle_exact(
                 "payload_size": info["payload_size"],
                 "resource": info["resource"],
                 "channel_mae": [round(float(value), 6) for value in channel_mae],
+                "channel_p95": [round(float(value), 6) for value in p95],
+                "channel_p99": [round(float(value), 6) for value in p99],
+                "channel_max": [int(value) for value in maximum],
+                "mip_filter": {
+                    "diffuse": "linear-light-area",
+                    "normal": "vector-area-renormalized",
+                    "gloss": "linear-area",
+                }[info["role"]],
                 "roundtrip": str(roundtrip_path) if roundtrip_path else None,
             }
         )
@@ -280,27 +344,73 @@ def repack_collection(
     paths: ProjectPaths,
     bundle_root: Path,
     *,
-    allow_partial: bool = False,
     max_mae: float = 6.0,
 ) -> dict[str, Any]:
     image_report = validate_approved(profile, paths)
-    if image_report["missing"] and not allow_partial:
-        raise ValueError(f"승인되지 않은 대상이 있어요: {image_report['missing']}")
+    if not image_report["passed"]:
+        failed = [report["target_id"] for report in image_report["reports"] if not report["passed"]]
+        raise ValueError(
+            f"승인 이미지 게이트가 실패해 재패킹을 중단해요: "
+            f"missing={image_report['missing']}, failed={failed}"
+        )
     inventory = load_inventory(paths.inventory)
     groups: dict[str, dict[str, Path]] = {}
+    roles: dict[str, dict[str, str]] = {}
     for target in profile.targets:
         approved = paths.approved / f"{target.id}.png"
         if target.action != "localize" or not approved.is_file():
             continue
         record = record_for_target(inventory, target)
         groups.setdefault(record["bundle_key"], {})[record["texture"]] = approved
+        roles.setdefault(record["bundle_key"], {})[record["texture"]] = "diffuse"
 
-    if paths.derived_manifest.is_file():
-        derived = json.loads(paths.derived_manifest.read_text(encoding="utf-8"))
-        for output in derived.get("outputs", []):
-            source = Path(output["derived_png"])
-            if source.is_file():
-                groups.setdefault(output["bundle_key"], {})[output["texture"]] = source
+    if not paths.derived_manifest.is_file():
+        raise ValueError("현재 승인 SHA에 묶인 D/N/G derived manifest가 없어요")
+    derived = json.loads(paths.derived_manifest.read_text(encoding="utf-8"))
+    if derived.get("schema_version") != 2:
+        raise ValueError("예전 derived manifest는 재사용할 수 없어요. derive를 다시 실행해 주세요")
+    expected_targets = {target.id for target in profile.targets if target.action == "localize"}
+    validated = {
+        value.get("target_id"): value
+        for value in derived.get("validated_targets", [])
+        if isinstance(value, dict)
+    }
+    missing_material_validation = expected_targets - set(validated)
+    if missing_material_validation:
+        raise ValueError(
+            f"재질 게이트를 통과하지 않은 대상이 있어요: {sorted(missing_material_validation)}"
+        )
+    for target_id, value in validated.items():
+        target = profile.target_by_id(target_id)
+        approved = paths.approved / f"{target.id}.png"
+        if value.get("approved_sha256") != sha256_file(approved):
+            raise ValueError(f"{target.id} 재질 검증 뒤 승인본이 변경됐어요")
+        if value.get("approval_sha256") != sha256_file(approval_path(paths, target.id)):
+            raise ValueError(f"{target.id} 재질 검증 뒤 승인 증거가 변경됐어요")
+    output_targets = {output.get("target_id") for output in derived.get("outputs", [])}
+    unknown = output_targets - expected_targets
+    if unknown:
+        raise ValueError(f"derived manifest에 profile 밖 대상이 있어요: {sorted(unknown)}")
+    for output in derived.get("outputs", []):
+        target = profile.target_by_id(output["target_id"])
+        approved = paths.approved / f"{target.id}.png"
+        source_record = record_for_target(inventory, target)
+        verify_approval(paths, target, Path(source_record["source_png"]), approved)
+        source = Path(output["derived_png"])
+        source_map = Path(output["source_png"])
+        checks = {
+            "approved_sha256": sha256_file(approved),
+            "approval_sha256": sha256_file(approval_path(paths, target.id)),
+            "source_sha256": sha256_file(source_map),
+            "derived_sha256": sha256_file(source),
+        }
+        for field, current in checks.items():
+            if output.get(field) != current:
+                raise ValueError(
+                    f"{target.id}::{output['texture']} derived {field}가 현재 입력과 달라요"
+                )
+        groups.setdefault(output["bundle_key"], {})[output["texture"]] = source
+        roles.setdefault(output["bundle_key"], {})[output["texture"]] = output["role"]
 
     reports = []
     overrides = inventory.get("source_bundle_overrides", {})
@@ -319,6 +429,7 @@ def repack_collection(
             replacements,
             roundtrip_dir=roundtrip,
             max_mae=max_mae,
+            roles=roles[bundle_key],
         )
         report["bundle_key"] = bundle_key
         report_path = paths.reports / "bundles" / f"{safe_bundle_name(bundle_key)}.json"
@@ -329,7 +440,7 @@ def repack_collection(
     payload = {
         "schema_version": 1,
         "collection": profile.id,
-        "partial": bool(image_report["missing"]),
+        "partial": False,
         "bundle_count": len(reports),
         "texture_count": sum(len(report["textures"]) for report in reports),
         "passed": all(report["passed"] for report in reports),

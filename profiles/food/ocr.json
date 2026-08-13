@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "detector": "PP-OCRv5_server_det",
+  "source_recognizers": [
+    "en_PP-OCRv5_mobile_rec",
+    "eslav_PP-OCRv5_mobile_rec"
+  ],
+  "candidate_recognizers": [
+    "korean_PP-OCRv5_mobile_rec",
+    "en_PP-OCRv5_mobile_rec",
+    "eslav_PP-OCRv5_mobile_rec"
+  ],
+  "easyocr_languages": {
+    "source": [["en"], ["ru", "en"]],
+    "candidate": [["ko", "en"], ["ru", "en"]]
+  },
+  "rotations_clockwise": [0, 90, 180, 270],
+  "alpha_backgrounds": ["white", "black"],
+  "tile_size": 1536,
+  "tile_overlap": 192,
+  "minimum_confidence": 0.15,
+  "device": "cpu"
+}

@@ -1,59 +1,71 @@
 # GoLani.ItemTextureKoreanChange
 
-## English
-Mod to change Tarkov item texture to Korean. Not in "add" mode.
+SPT/Escape from Tarkov 음식·음료 포장의 외국어 인쇄를 한국어로 현지화하는 모드예요.
 
-It is manufactured upscale to a size 4096x4096.
-There may be lags during loading and playing.
+이 저장소의 개발 파이프라인은 원본 해상도를 유지하고, OCR과 독립 시각 판독을 교차 검증한
+뒤 허용한 문자 영역만 바꾸도록 설계돼 있어요. Diffuse만 보지 않고 실제 Unity Material이
+연결한 Normal·Gloss와 모든 밉, 사광·그림자 렌더까지 검증되지 않으면 release를 만들지 않아요.
 
-Currently, only food items have been changed, but other items will also be changed in the future.
+## 사용자 설치 경로
 
-### How to apply it?
+```text
+SPT/SPT_Runtime/user/mods/GoLani-ItemTextureKoreanChange
+```
 
-SPT / SPT_Runtime / user / mods / GoLani-ItemTextureKoreanChange
+적용 후 SPT 런처에서 임시 파일을 삭제해야 이전 bundle 캐시가 남지 않아요.
 
-Please apply it so that it becomes a path like this.
+## 개발 환경 준비
 
-Before you start, run "Clean Temp File" in the launcher before you start, or the icon may not apply.
+Windows에서 `0_설치.bat`을 실행하면 다음 두 환경을 따로 준비해요.
 
+- `work/.venv`: UnityFS 추출·검증·재패킹
+- `work/.venv-ocr`: PaddleOCR 3.5.0, EasyOCR 1.7.2와 공식 모델
 
-You can use the source code freely if you just leave a comment and an address.
+OCR은 정확도 우선 `PP-OCRv5_server_det` 검출기에 영문·키릴·한글 인식기를 나눠 적용하고,
+EasyOCR을 두 번째 엔진으로 사용해요. 모델이 준비됐는지는 다음 명령으로 확인할 수 있어요.
 
+```bat
+work\.venv-ocr\Scripts\python.exe localize.py ocr doctor
+```
 
-## 한국어
-타르코프 아이템 텍스처를 한국어로 변경하는 모드입니다. "추가"모드가 아닙니다.
+SPT가 `D:\SPT`가 아니면 `SPT_DIR` 환경변수 또는 `--spt-root`를 지정해 주세요.
 
-4096x4096사이즈로 업스케일되어 제작됬습니다.
-로딩 및 플레이 중 렉이 발생할 수 있습니다.
+## 안전한 작업 흐름
 
-현재는 음식품만 변경되었으나 추후 다른 아이템들도 변경될 예정입니다.
+1. `1_추출.bat`: 원본 Texture2D와 실제 Material 연결을 `workspace/`에 기록해요.
+2. 품목별 작업 기록을 만들고 원본 OCR을 실행해요.
 
-### 모드 적용 방법
+```bat
+work\.venv\Scripts\python.exe .agents\skills\localize-spt-food-textures\scripts\review_record.py init mayo
+work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase source
+```
 
-SPT 설치 파일 / SPT_Runtime / user / mods / GoLani-ItemTextureKoreanChange
+3. Codex가 원본을 독립 판독하고 OCR과 교차 검증해 번역·좌표·방향·UV 면을 확정해요.
+4. 원본 크기의 `old_text`, `new_text`, `editable`, `protected`, `seam_guard` 마스크를 만들어요.
+5. AI 편집은 글자 배경 복구 초안에만 쓰고, 최종 글자는 확정 좌표로 결정적으로 합성해요.
+6. 후보 OCR과 Codex 시각 비교를 모두 기록한 뒤 `stage`해요.
 
-이렇게 경로가 되도록 적용해주세요.
+```bat
+work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase candidate --image 후보.png
+work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
+```
 
-시작하기 전 런처에서 임시 파일 삭제를 한 후 시작하세요. 그렇지 않으면 아이콘이 적용되지 않을 수 있습니다.
+7. 모든 품목의 실제 D/N/G·밉·압축·번들·게임 렌더 기록까지 통과하면
+   `2_적용.bat`이 해시 고정 release를 만들어요.
+8. `3_배포.bat`은 그 release만 기존 설치 백업 후 배포해요.
 
+실제 세부 필드와 중단 조건은
+[저장소 전용 스킬](.agents/skills/localize-spt-food-textures/SKILL.md)과
+[파이프라인 구조](docs/architecture-v2.md)에 있어요.
 
-댓글과 출처만 남겨주시면 자유롭게 소스 코드 활용하셔도 됩니다.
+## 중요한 제한
 
+- 전체 이미지를 재생성하거나 크기를 맞추기 위해 리사이즈하지 않아요.
+- 예전 `work/2_edited`, 루트 `bundles/`, `tools/auto.py build/deploy` 결과는 새 release로
+  간주하지 않아요.
+- OCR 무검출은 “문자가 없음”의 증거가 아니며, OCR 결과만으로 승인하지 않아요.
+- 현재 `workspace/approved`의 옛 결과는 마스크·이중 검토·재질 증거가 없으므로 새 게이트에서
+  의도적으로 실패해요. 품목별로 다시 검증해야 해요.
+- 원본보다 큰 4096 업스케일은 실제 디테일을 늘리지 않고 흐림·메모리 사용을 키워 사용하지 않아요.
 
-## 개발자용 — 자동화 파이프라인 (SPT 4.1)
-
-SPT 4.1(C# 서버)용 번들 모드입니다. 텍스처 추출·교체·설치를 스크립트로 자동화합니다.
-
-| 단계 | 명령 / 더블클릭 | 내용 |
-|------|----------------|------|
-| 0 | `0_설치.bat` | 파이썬 라이브러리 설치 (UnityPy 등) |
-| 1 | `1_추출.bat [필터]` | 게임 번들 → `work/1_raw/` PNG 추출 |
-| — | (사람) | GPT 등으로 한글화 → 같은 파일명으로 `work/2_edited/` 저장 |
-| 2 | `2_적용.bat [필터]` | `work/2_edited/` → `bundles/` 번들 생성 (원본 포맷 유지) |
-| 3 | `3_배포.bat` | C# DLL 빌드 + `bundles/` 전체를 `user/mods` 에 설치 |
-
-- 빌드 요구: .NET 10 SDK (`dotnet`), 파이썬 3 + UnityPy 1.25.0.
-- 게임 경로는 `D:\SPT` 기준. 다르면 환경변수 `SPT_DIR` 로 지정.
-- SPT 4.1의 로컬 번들 경로 호환을 위해 배포 시 `SPT` 폴더를 `SPT_Runtime`에 연결합니다.
-- 적용 후 **런처에서 "임시 파일 삭제"** 필수.
-- 설계·주의사항: [docs/automation-design.md](docs/automation-design.md)
+소스 코드는 출처와 주소를 남기면 자유롭게 활용할 수 있어요.

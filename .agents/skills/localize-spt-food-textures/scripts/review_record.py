@@ -342,8 +342,12 @@ def _validate_material_metrics(data: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
         return ["stages.material_validation.data: 객체가 아니에요"]
-    if not isinstance(data.get("bindings"), list) or not data["bindings"]:
-        errors.append("stages.material_validation.data.bindings: 실제 Material 연결이 없어요")
+    graph_scope = data.get("graph_scope")
+    bindings = data.get("bindings")
+    if not isinstance(bindings, list) or not bindings:
+        errors.append("stages.material_validation.data.bindings: 배열이 아니에요")
+    if graph_scope != "resolved":
+        errors.append("stages.material_validation.data.graph_scope: resolved여야 해요")
     expected = {
         "shared_consumers_resolved": True,
         "alignment_passed": True,

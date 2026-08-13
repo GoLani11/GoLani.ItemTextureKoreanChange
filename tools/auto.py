@@ -201,7 +201,14 @@ def derive(flt=None):
     """work/2_edited 의 _D(컬러)만 기준으로 같은 번들의 _N/_G를 생성.
     원본 _N/_G의 값체계·강도는 유지하고 디자인 위치만 _D 기준으로 이식(maps.py).
     + _D 알파 복구. 디버그 마스크는 work/_debug/ 에 저장."""
-    import maps  # cv2 의존 → derive 쓸 때만 로드
+    raise RuntimeError(
+        "tools/auto.py derive는 고주파를 글자로 오인해 비활성화됐어요. "
+        "localize.py derive를 사용해 주세요."
+    )
+
+
+def _legacy_derive_disabled_reference(flt=None):
+    import maps  # 과거 구현 참고용
     Image = _image()
 
     if not os.path.exists(MAP_PATH):
@@ -250,7 +257,15 @@ def derive(flt=None):
 
 
 def _replace(bundle_path, out_path, replacements):
-    """원본 Texture2D 메타데이터는 그대로 두고 stream payload만 교체한다."""
+    """Legacy 진입점. 새 현지화 작업에는 localize.py만 사용한다."""
+    raise RuntimeError(
+        "tools/auto.py의 build/repack은 검토 기록·마스크·Material 검증을 우회하므로 "
+        "비활성화됐어요. localize.py validate/derive/repack/release를 사용해 주세요."
+    )
+
+
+def _legacy_replace_disabled_reference(bundle_path, out_path, replacements):
+    """과거 exact patch 구현을 참고용으로만 보존한다."""
     localizer_root = os.path.join(PROJ, "localizer")
     if localizer_root not in sys.path:
         sys.path.insert(0, localizer_root)
@@ -278,6 +293,7 @@ def _replace(bundle_path, out_path, replacements):
 
     with tempfile.TemporaryDirectory(prefix="golani-default-texture-") as temporary:
         normalized = {}
+        replacement_roles = {}
         for index, (name, new_png) in enumerate(sorted(replacements.items())):
             data = textures[name]
             width, height = data.m_Width, data.m_Height
@@ -288,6 +304,11 @@ def _replace(bundle_path, out_path, replacements):
                 target = Path(temporary) / f"{index}.png"
                 image.save(target)
             normalized[name] = target
+            replacement_roles[name] = {
+                "D": "diffuse",
+                "N": "normal",
+                "G": "gloss",
+            }[_classify(os.path.join(RAW_DIR, replacements[name]))]
             stream = data.m_StreamData
             print(
                 f"   교체: {name} ({width}x{height}, 밉 {data.m_MipCount}, "
@@ -298,6 +319,7 @@ def _replace(bundle_path, out_path, replacements):
             Path(bundle_path),
             Path(out_path),
             normalized,
+            roles=replacement_roles,
         )
     return True
 
@@ -623,6 +645,13 @@ def _copy_if_exists(src, dst_dir, label):
 
 
 def deploy():
+    raise RuntimeError(
+        "tools/auto.py deploy는 오래된 루트 bundles를 설치할 수 있어 비활성화됐어요. "
+        "localize.py deploy --release latest --execute를 사용해 주세요."
+    )
+
+
+def _legacy_deploy_disabled_reference():
     # 1. C# DLL 빌드 (SPT 4.1 번들 모드는 DLL 필수)
     print("[빌드] dotnet build ...")
     subprocess.run(["dotnet", "build", CSPROJ, "-c", "Release"], check=True)

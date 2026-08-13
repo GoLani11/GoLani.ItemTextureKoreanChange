@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 
 from .bundles import repack_collection
+from .deployment import create_release, deploy_release
 from .images import create_review_sheets, stage_candidate, validate_approved
 from .inventory import load_inventory, register_source_override, scan_collection
 from .materials import derive_approved_materials
+from .ocr import ocr_doctor, run_ocr, setup_ocr_models
 from .paths import ProjectPaths, discover_project_root, game_bundle_root
 from .profile import load_profile
 
@@ -27,7 +29,16 @@ def _parser() -> argparse.ArgumentParser:
     stage = subparsers.add_parser("stage", help="시안을 원본 규격으로 검사해 승인 폴더에 넣어요")
     stage.add_argument("target_id")
     stage.add_argument("image", type=Path)
-    stage.add_argument("--allow-resize", action="store_true")
+
+    ocr = subparsers.add_parser("ocr", help="PaddleOCR와 EasyOCR로 품목 문자를 교차 판독해요")
+    ocr_subparsers = ocr.add_subparsers(dest="ocr_command", required=True)
+    ocr_subparsers.add_parser("doctor", help="OCR 패키지와 모델 준비 상태를 확인해요")
+    ocr_subparsers.add_parser("setup", help="공식 OCR 모델을 내려받아 로컬 캐시에 준비해요")
+    ocr_run = ocr_subparsers.add_parser("run", help="원본 또는 후보 이미지를 실제 판독해요")
+    ocr_run.add_argument("target_id")
+    ocr_run.add_argument("--phase", choices=("source", "candidate"), required=True)
+    ocr_run.add_argument("--image", type=Path)
+    ocr_run.add_argument("--output", type=Path)
 
     source_override = subparsers.add_parser(
         "source-override",
@@ -43,8 +54,11 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("validate", help="승인된 전체 이미지의 크기·알파·변경 여부를 검사해요")
     subparsers.add_parser("derive", help="승인된 diffuse를 기준으로 normal·gloss 인쇄 위치를 이식해요")
     repack = subparsers.add_parser("repack", help="승인된 이미지만 원본 UnityFS payload에 패치해요")
-    repack.add_argument("--allow-partial", action="store_true")
     repack.add_argument("--max-mae", type=float, default=6.0)
+    subparsers.add_parser("release", help="모든 렌더·밉·번들 검증을 통과한 해시 고정본을 만들어요")
+    deploy = subparsers.add_parser("deploy", help="검증된 release만 설치 계획 또는 실제 설치로 적용해요")
+    deploy.add_argument("--release", default="latest")
+    deploy.add_argument("--execute", action="store_true")
     subparsers.add_parser("status", help="전체 대상과 승인 진행률을 보여줘요")
     return parser
 
@@ -80,7 +94,50 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "stage":
-        _print(stage_candidate(profile, paths, args.target_id, args.image.resolve(), allow_resize=args.allow_resize))
+        _print(stage_candidate(profile, paths, args.target_id, args.image.resolve()))
+        return
+
+    if args.command == "ocr":
+        if args.ocr_command == "doctor":
+            result = ocr_doctor(paths.root)
+            _print(result)
+            if not result["offline_ready"]:
+                raise SystemExit(2)
+            return
+        if args.ocr_command == "setup":
+            _print(setup_ocr_models(paths.root))
+            return
+        target = profile.target_by_id(args.target_id)
+        if args.image:
+            image = args.image.expanduser().resolve()
+        elif args.phase == "source":
+            inventory = load_inventory(paths.inventory)
+            from .inventory import record_for_target
+
+            image = Path(record_for_target(inventory, target)["source_png"])
+        else:
+            image = paths.drafts / f"{target.id}.png"
+        output = (
+            args.output.expanduser().resolve()
+            if args.output
+            else paths.reviews / target.id / f"{args.phase}-ocr.json"
+        )
+        result = run_ocr(paths.root, image, output, phase=args.phase)
+        _print(
+            {
+                "target_id": target.id,
+                "phase": args.phase,
+                "report": str(output),
+                "image_sha256": result["image_sha256"],
+                "detections": len(result["detections"]),
+                "conflicting_regions": sum(
+                    bool(detection.get("conflicting_readings"))
+                    for detection in result["detections"]
+                ),
+                "errors": len(result["errors"]),
+                "requires_independent_visual_review": True,
+            }
+        )
         return
 
     if args.command == "source-override":
@@ -101,7 +158,10 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "validate":
-        _print(validate_approved(profile, paths))
+        result = validate_approved(profile, paths)
+        _print(result)
+        if not result["passed"]:
+            raise SystemExit(2)
         return
 
     if args.command == "derive":
@@ -115,8 +175,22 @@ def main(argv: list[str] | None = None) -> None:
                 profile,
                 paths,
                 bundle_root,
-                allow_partial=args.allow_partial,
                 max_mae=args.max_mae,
+            )
+        )
+        return
+
+    if args.command == "release":
+        _print(create_release(profile, paths))
+        return
+
+    if args.command == "deploy":
+        _print(
+            deploy_release(
+                paths,
+                args.spt_root,
+                release_id=args.release,
+                execute=args.execute,
             )
         )
         return

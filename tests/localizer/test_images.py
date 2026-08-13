@@ -45,6 +45,18 @@ def test_validate_image_pair_rejects_alpha_change(tmp_path: Path) -> None:
     assert validate_image_pair(source_path, changed_path)["passed"] is False
 
 
+def test_validate_image_pair_rejects_color_mode_change(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.png"
+    changed_path = tmp_path / "changed.png"
+    Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(source_path)
+    Image.new("RGB", (4, 4), (1, 0, 0)).save(changed_path)
+
+    report = validate_image_pair(source_path, changed_path)
+
+    assert report["color_mode_equal"] is False
+    assert report["passed"] is False
+
+
 def test_validate_image_pair_rejects_displaced_structure(tmp_path: Path) -> None:
     source = np.zeros((64, 64, 4), dtype=np.uint8)
     source[..., 3] = 255
@@ -64,7 +76,7 @@ def test_validate_image_pair_rejects_displaced_structure(tmp_path: Path) -> None
     assert report["passed"] is False
 
 
-def test_stage_candidate_does_not_replace_approved_image_when_validation_fails(
+def test_stage_candidate_does_not_replace_approved_image_when_review_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -9,176 +9,278 @@ import numpy as np
 from PIL import Image
 
 from .inventory import load_inventory, record_for_target
-from .models import CollectionProfile
+from .models import CollectionProfile, TargetSpec
 from .names import safe_bundle_name
 from .paths import ProjectPaths
+from .review import approval_path, load_review, sha256_file, verify_approval
 
 
-NORMAL_RELIEF_THRESHOLD = 0.012
-GLOSS_DELTA_THRESHOLD = 3 / 255.0
+DIFFUSE_PROPERTIES = {"_MainTex", "_BaseMap", "_BaseColorMap"}
+NORMAL_PROPERTIES = {"_BumpMap", "_NormalMap"}
+GLOSS_PROPERTIES = {"_SpecMap", "_GlossMap", "_MetallicGlossMap"}
 
 
-def _unit(width: int, height: int) -> float:
-    return min(width, height) / 512.0
+def _target_bindings(
+    inventory: dict[str, Any],
+    target: TargetSpec,
+    diffuse_record: dict[str, Any],
+) -> list[dict[str, Any]]:
+    materials = inventory.get("materials")
+    if not isinstance(materials, list) or not materials:
+        raise ValueError(
+            f"{target.id}: inventory에 Material graph가 없어요. extract를 다시 실행해 주세요"
+        )
+    diffuse_id = int(diffuse_record["path_id"])
+    bindings = []
+    for material in materials:
+        slots = material.get("texture_slots", [])
+        if not any(
+            slot.get("property") in DIFFUSE_PROPERTIES
+            and slot.get("path_id") == diffuse_id
+            and slot.get("texture_bundle_key") == diffuse_record["bundle_key"]
+            for slot in slots
+        ):
+            continue
+        bindings.append(material)
+    return bindings
 
 
-def _rgb(path: Path, size: tuple[int, int]) -> np.ndarray:
-    with Image.open(path) as image_file:
-        return np.asarray(image_file.convert("RGB").resize(size, Image.Resampling.LANCZOS))
+def _auxiliary_slots(bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    found: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for material in bindings:
+        for slot in material["texture_slots"]:
+            if slot.get("property") in NORMAL_PROPERTIES:
+                role = "normal"
+            elif slot.get("property") in GLOSS_PROPERTIES:
+                role = "gloss"
+            else:
+                continue
+            if not slot.get("path_id") or not slot.get("texture") or not slot.get("texture_bundle_key"):
+                raise ValueError(
+                    f"{material['material']}::{slot.get('property')} 외부/미해결 텍스처 연결은 자동 처리하지 않아요"
+                )
+            value = {
+                "material_bundle_key": material["bundle_key"],
+                "material": material["material"],
+                "material_path_id": material["path_id"],
+                "property": slot["property"],
+                "path_id": int(slot["path_id"]),
+                "texture": slot["texture"],
+                "texture_bundle_key": slot["texture_bundle_key"],
+                "role": role,
+                "scale": slot["scale"],
+                "offset": slot["offset"],
+            }
+            found[(role, str(slot["texture_bundle_key"]), int(slot["path_id"]))] = value
+    return list(found.values())
 
 
-def _design_mask(rgb_u8: np.ndarray, unit: float) -> np.ndarray:
-    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.float32)
-    lightness, channel_a, channel_b = lab[..., 0], lab[..., 1], lab[..., 2]
-    high_small = np.abs(lightness - cv2.GaussianBlur(lightness, (0, 0), max(1.0, 1.2 * unit)))
-    high_medium = np.abs(lightness - cv2.GaussianBlur(lightness, (0, 0), max(1.0, 3.0 * unit)))
-    chroma = np.abs(channel_a - cv2.GaussianBlur(channel_a, (0, 0), max(1.0, 2.0 * unit)))
-    chroma += np.abs(channel_b - cv2.GaussianBlur(channel_b, (0, 0), max(1.0, 2.0 * unit)))
-    score = np.maximum.reduce([high_small, high_medium, 0.5 * chroma])
-    median = np.median(score)
-    mad = np.median(np.abs(score - median)) + 1e-6
-    mask = (score > median + 3.0 * mad).astype(np.uint8)
-    kernel_size = max(1, int(round(1.5 * unit)))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((kernel_size, kernel_size), np.uint8))
-
-    count, components, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-    total = mask.size
-    filtered = np.zeros_like(mask)
-    for index in range(1, count):
-        ratio = stats[index, cv2.CC_STAT_AREA] / total
-        if 3e-6 <= ratio <= 0.30:
-            filtered[components == index] = 1
-    dilation = max(1, int(round(1.5 * unit)))
-    filtered = cv2.dilate(filtered, np.ones((dilation, dilation), np.uint8))
-    return np.clip(
-        cv2.GaussianBlur(filtered.astype(np.float32), (0, 0), max(1.0, 1.5 * unit)),
-        0,
-        1,
+def _binding_signature(
+    bindings: list[dict[str, Any]],
+) -> list[tuple[str, str, str, str | None, int, str | None]]:
+    relevant = DIFFUSE_PROPERTIES | NORMAL_PROPERTIES | GLOSS_PROPERTIES
+    return sorted(
+        (
+            material["bundle_key"],
+            material["material"],
+            slot["property"],
+            slot.get("texture_bundle_key"),
+            int(slot["path_id"]),
+            slot.get("texture"),
+        )
+        for material in bindings
+        for slot in material["texture_slots"]
+        if slot.get("property") in relevant and slot.get("path_id")
     )
 
 
-def transplant_normal(original_map: Path, original_diffuse: Path, localized_diffuse: Path):
-    with Image.open(original_map) as image_file:
-        original = np.asarray(image_file.convert("RGBA"))
-    height, width = original.shape[:2]
-    unit = _unit(width, height)
-    x = original[..., 3].astype(np.float32) / 255 * 2 - 1
-    y = original[..., 1].astype(np.float32) / 255 * 2 - 1
-
-    sigma = max(1.0, 3.0 * unit)
-    x_base = cv2.GaussianBlur(x, (0, 0), sigma)
-    y_base = cv2.GaussianBlur(y, (0, 0), sigma)
-    x_detail, y_detail = x - x_base, y - y_base
-    relief = np.sqrt(x_detail * x_detail + y_detail * y_detail)
-    old_mask = _design_mask(_rgb(original_diffuse, (width, height)), unit)
-    new_mask = _design_mask(_rgb(localized_diffuse, (width, height)), unit)
-    protect = (relief > np.percentile(relief, 90)).astype(np.float32)
-    remove = old_mask * (1 - protect)
-    selected = (old_mask > 0.5) & (protect < 0.5)
-    strength = float(np.median(relief[selected])) if selected.sum() > 50 else 0.0
-
-    x = x_base + x_detail * (1 - remove)
-    y = y_base + y_detail * (1 - remove)
-    added = False
-    if strength > NORMAL_RELIEF_THRESHOLD:
-        hard_mask = (new_mask > 0.5).astype(np.uint8)
-        signed_distance = cv2.distanceTransform(hard_mask, cv2.DIST_L2, 5)
-        signed_distance -= cv2.distanceTransform(1 - hard_mask, cv2.DIST_L2, 5)
-        gradient_x = cv2.Sobel(signed_distance, cv2.CV_32F, 1, 0, ksize=3)
-        gradient_y = cv2.Sobel(signed_distance, cv2.CV_32F, 0, 1, ksize=3)
-        norm = np.sqrt(gradient_x * gradient_x + gradient_y * gradient_y) + 1e-6
-        x += strength * (gradient_x / norm) * new_mask
-        y += strength * (gradient_y / norm) * new_mask
-        added = True
-
-    length = np.sqrt(x * x + y * y)
-    scale = np.minimum(0.98 / np.maximum(length, 1e-6), 1.0)
-    x, y = x * scale, y * scale
-    output = original.copy()
-    output[..., 0] = 255
-    output[..., 1] = np.clip((y * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
-    output[..., 3] = np.clip((x * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
-    return Image.fromarray(output, "RGBA"), {"strength": round(strength, 6), "added": added}
+def _all_consumers(inventory: dict[str, Any], bundle_key: str, path_id: int) -> list[dict[str, Any]]:
+    consumers = []
+    for material in inventory.get("materials", []):
+        for slot in material.get("texture_slots", []):
+            if slot.get("texture_bundle_key") == bundle_key and slot.get("path_id") == path_id:
+                consumers.append(
+                    {
+                        "material": material["material"],
+                        "material_bundle_key": material["bundle_key"],
+                        "material_path_id": material["path_id"],
+                        "property": slot["property"],
+                    }
+                )
+    return consumers
 
 
-def transplant_gloss(original_map: Path, original_diffuse: Path, localized_diffuse: Path):
-    with Image.open(original_map) as image_file:
-        original = np.asarray(image_file.convert("RGBA"))
-    height, width = original.shape[:2]
-    unit = _unit(width, height)
-    values = original[..., 0].astype(np.float32) / 255.0
-    old_mask = _design_mask(_rgb(original_diffuse, (width, height)), unit)
-    new_mask = _design_mask(_rgb(localized_diffuse, (width, height)), unit)
-    hard_mask = (old_mask > 0.5).astype(np.uint8)
-    erosion = max(1, int(round(2 * unit)))
-    dilation = max(2, int(round(5 * unit)))
-    core = cv2.erode(hard_mask, np.ones((erosion, erosion), np.uint8))
-    ring = cv2.dilate(hard_mask, np.ones((dilation, dilation), np.uint8))
-    ring -= cv2.dilate(hard_mask, np.ones((erosion, erosion), np.uint8))
-    design_value = np.median(values[core > 0]) if (core > 0).sum() > 50 else 0.0
-    background_value = np.median(values[ring > 0]) if (ring > 0).sum() > 50 else 0.0
-    delta = float(design_value - background_value)
+def _map_record(inventory: dict[str, Any], bundle_key: str, path_id: int) -> dict[str, Any]:
+    matches = [
+        record
+        for record in inventory["records"]
+        if record["bundle_key"] == bundle_key and int(record["path_id"]) == path_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Texture2D path ID {path_id}를 정확히 하나 찾지 못했어요")
+    return matches[0]
 
-    inpaint_mask = (old_mask > 0.3).astype(np.uint8) * 255
-    cleaned = cv2.inpaint(
-        (values * 255).astype(np.uint8),
-        inpaint_mask,
-        max(1, int(round(3 * unit))),
-        cv2.INPAINT_TELEA,
-    ).astype(np.float32) / 255.0
-    added = False
-    if abs(delta) > GLOSS_DELTA_THRESHOLD:
-        soft = cv2.GaussianBlur(new_mask, (0, 0), max(1.0, 1.2 * unit))
-        cleaned = np.clip(cleaned + delta * soft, 0, 1)
-        added = True
-    output_value = (cleaned * 255).astype(np.uint8)
-    output = np.dstack([output_value, output_value, output_value, np.full_like(output_value, 255)])
-    return Image.fromarray(output, "RGBA"), {"delta": round(delta, 6), "added": added}
+
+def _mask(paths: ProjectPaths, descriptor: dict[str, Any], expected_size: tuple[int, int]) -> np.ndarray:
+    path = (paths.root / descriptor["path"]).resolve()
+    if sha256_file(path) != descriptor["sha256"]:
+        raise ValueError(f"보조맵 마스크 SHA-256이 달라요: {path}")
+    with Image.open(path) as image_file:
+        if image_file.size != expected_size or image_file.mode not in {"1", "L"}:
+            raise ValueError(f"보조맵 마스크 규격이 원본과 달라요: {path}")
+        values = np.asarray(image_file.convert("L"), dtype=np.uint8)
+    if not set(int(value) for value in np.unique(values)).issubset({0, 255}):
+        raise ValueError(f"보조맵 마스크는 0/255만 사용해야 해요: {path}")
+    return values == 255
+
+
+def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Image, dict[str, Any]]:
+    with Image.open(source) as source_file:
+        mode = source_file.mode
+        image = np.asarray(source_file.convert("RGBA"), dtype=np.uint8)
+    if mask.shape != image.shape[:2]:
+        raise ValueError(f"{role} 마스크 크기가 맵과 달라요")
+    output = image.copy()
+    hard_mask = mask.astype(np.uint8) * 255
+    if not mask.any():
+        return Image.fromarray(output, "RGBA"), {"changed_pixels": 0, "changed_outside_mask": 0}
+    radius = max(1, round(min(mask.shape) / 512 * 3))
+    if role == "normal":
+        # Tarkov의 DXT5nm packing에서 X=A, Y=G예요. R/B는 원본 그대로 둬요.
+        for channel in (1, 3):
+            output[..., channel] = cv2.inpaint(
+                image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
+            )
+        x = output[..., 3].astype(np.float32) / 127.5 - 1.0
+        y = output[..., 1].astype(np.float32) / 127.5 - 1.0
+        length = np.maximum(1.0, np.sqrt(x * x + y * y))
+        normalized_x = np.clip((x / length + 1.0) * 127.5, 0, 255).astype(np.uint8)
+        normalized_y = np.clip((y / length + 1.0) * 127.5, 0, 255).astype(np.uint8)
+        output[..., 3][mask] = normalized_x[mask]
+        output[..., 1][mask] = normalized_y[mask]
+    elif role == "gloss":
+        # 채널 레이아웃을 추측해 회색맵으로 재작성하지 않고 기존 네 채널을 각각 복원해요.
+        for channel in range(4):
+            output[..., channel] = cv2.inpaint(
+                image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
+            )
+    else:
+        raise ValueError(f"지원하지 않는 보조맵 역할이에요: {role}")
+    changed = np.any(output != image, axis=2)
+    return Image.fromarray(output, "RGBA"), {
+        "changed_pixels": int(changed.sum()),
+        "changed_outside_mask": int((changed & ~mask).sum()),
+        "mode_preserved": mode == "RGBA",
+    }
 
 
 def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -> dict[str, Any]:
     inventory = load_inventory(paths.inventory)
     outputs: list[dict[str, Any]] = []
+    validated_targets: list[dict[str, Any]] = []
     for target in profile.targets:
-        localized = paths.approved / f"{target.id}.png"
-        if target.action != "localize" or not localized.is_file():
+        approved = paths.approved / f"{target.id}.png"
+        if target.action != "localize" or not approved.is_file():
             continue
-        diffuse_record = record_for_target(inventory, target)
-        original_diffuse = Path(diffuse_record["source_png"])
-        companions = [
-            record
-            for record in inventory["records"]
-            if record["family"] == diffuse_record["family"] and record["role"] in {"normal", "gloss"}
-        ]
-        for record in companions:
-            original_map = Path(record["source_png"])
+        diffuse = record_for_target(inventory, target)
+        source_diffuse = Path(diffuse["source_png"])
+        approval = verify_approval(paths, target, source_diffuse, approved)
+        review_path, review = load_review(paths, target.id, through="material")
+        bindings = _target_bindings(inventory, target, diffuse)
+        material_data = review["stages"]["material_validation"]["data"]
+        graph_scope = material_data.get("graph_scope")
+        if graph_scope != "resolved":
+            raise ValueError(f"{target.id}: material graph_scope 판정이 없어요")
+        if not bindings:
+            raise ValueError(f"{target.id}: 실제 Material 연결을 찾지 못했어요")
+        actual_aux = _auxiliary_slots(bindings)
+        reviewed_bindings = material_data["bindings"]
+        actual_signature = _binding_signature(bindings)
+        reviewed_signature = sorted(
+            (
+                value.get("material_bundle_key"),
+                value.get("material"),
+                value.get("property"),
+                value.get("texture_bundle_key"),
+                int(value.get("path_id", 0)),
+                value.get("texture"),
+            )
+            for value in reviewed_bindings
+            if isinstance(value, dict)
+        )
+        if actual_signature != reviewed_signature:
+            raise ValueError(f"{target.id}: 검토한 D/N/G 연결이 현재 Material graph와 달라요")
+        policies = material_data.get("policies")
+        if not isinstance(policies, dict):
+            raise ValueError(f"{target.id}: 보조맵별 policies가 없어요")
+        masks = review["stages"]["edit_plan"]["data"]["masks"]
+        if material_data.get("text_mask_sha256") != masks["new_text"]["sha256"]:
+            raise ValueError(f"{target.id}: material 글자 마스크가 edit plan과 달라요")
+        validated_targets.append(
+            {
+                "target_id": target.id,
+                "approved_sha256": approval["candidate_sha256"],
+                "approval_sha256": sha256_file(approval_path(paths, target.id)),
+                "review_sha256": sha256_file(review_path),
+                "material_bindings": [list(value) for value in actual_signature],
+            }
+        )
+        for slot in actual_aux:
+            key = f"{slot['material']}::{slot['property']}"
+            policy = policies.get(key)
+            if policy not in {"preserve", "neutralize_old_text"}:
+                raise ValueError(f"{target.id}: {key} 정책을 명시해야 해요")
+            consumers = _all_consumers(inventory, diffuse["bundle_key"], slot["path_id"])
+            reviewed_consumers = material_data.get("shared_consumers", {}).get(key)
+            if reviewed_consumers != consumers:
+                raise ValueError(f"{target.id}: {key} 공유 소비자 검토가 현재 graph와 달라요")
+            if policy == "preserve":
+                continue
+            if len(consumers) > 1 and not material_data.get("shared_consumers_resolved"):
+                raise ValueError(f"{target.id}: 공유 보조맵 {key} 충돌이 해결되지 않았어요")
+            record = _map_record(inventory, slot["texture_bundle_key"], slot["path_id"])
+            source_map = Path(record["source_png"])
+            with Image.open(source_map) as map_file:
+                size = map_file.size
+            old_text = _mask(paths, masks["old_text"], size)
+            image, metrics = _neutralize_map(source_map, old_text, slot["role"])
+            if metrics["changed_outside_mask"] != 0:
+                raise AssertionError(f"{target.id} {key} 마스크 밖 픽셀이 바뀌었어요")
+            if not metrics.get("mode_preserved", True):
+                raise ValueError(f"{target.id} {key} 원본 색 모드가 RGBA가 아니에요")
             destination = paths.derived / safe_bundle_name(record["bundle_key"]) / f"{record['texture']}.png"
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if record["role"] == "normal":
-                image, metrics = transplant_normal(original_map, original_diffuse, localized)
-            else:
-                image, metrics = transplant_gloss(original_map, original_diffuse, localized)
             image.save(destination)
             outputs.append(
                 {
                     "target_id": target.id,
                     "bundle_key": record["bundle_key"],
                     "texture": record["texture"],
-                    "role": record["role"],
-                    "source_png": str(original_map),
+                    "path_id": record["path_id"],
+                    "role": slot["role"],
+                    "policy": policy,
+                    "source_png": str(source_map),
+                    "source_sha256": sha256_file(source_map),
+                    "approved_sha256": approval["candidate_sha256"],
+                    "approval_sha256": sha256_file(approval_path(paths, target.id)),
+                    "review": str(review_path),
+                    "review_sha256": sha256_file(review_path),
+                    "old_text_mask_sha256": masks["old_text"]["sha256"],
                     "derived_png": str(destination),
+                    "derived_sha256": sha256_file(destination),
+                    "consumers": consumers,
                     "metrics": metrics,
                 }
             )
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "collection": profile.id,
         "derived_count": len(outputs),
+        "validated_targets": validated_targets,
         "outputs": outputs,
     }
     paths.derived_manifest.parent.mkdir(parents=True, exist_ok=True)
     paths.derived_manifest.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     return payload

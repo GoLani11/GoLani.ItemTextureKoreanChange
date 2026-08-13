@@ -133,7 +133,9 @@ profile의 `exact_text`가 번역 영역에 모두 있어야 한다. 보이는 �
 마스크 SHA, 마스크 밖 변경 수와 조명 진단 증거를 둔다.
 
 필수 키는 `bindings`, `shared_consumers_resolved`, `text_mask_sha256`, `alignment_passed`,
-`foreign_relief_detected`, `changed_outside_masks`다.
+`foreign_relief_detected`, `changed_outside_masks`, `graph_scope`다. `graph_scope`는 게임
+카탈로그의 역의존성까지 따라 실제 연결을 모두 찾았다는 `resolved`여야 한다. 연결이 없거나
+일부만 확인된 상태를 파일명 추정으로 대신하지 않는다.
 
 `mip_validation`, `bundle_validation`, `runtime_validation`에는 검사한 모든 단계·밉·캡처가
 무엇인지와 누락 수를 기록한다. `release_validation`은 모든 입력과 보고서 SHA를 묶는다.

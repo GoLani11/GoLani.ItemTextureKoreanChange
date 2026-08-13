@@ -16,6 +16,11 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
+ocr = [
+  "paddleocr==3.5.0",
+  "paddlepaddle==3.2.0",
+  "easyocr==1.7.2",
+]
 
 [project.scripts]
 golani-localize = "golani_texture_localizer.cli:main"

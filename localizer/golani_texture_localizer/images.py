@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any
 
@@ -14,6 +15,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .inventory import load_inventory, record_for_target
 from .models import CollectionProfile, TargetSpec
 from .paths import ProjectPaths
+from .review import approval_path, sha256_file, verify_approval, verify_candidate
 
 
 _MIN_STRUCTURE_EDGE_PIXELS = 32
@@ -40,8 +42,6 @@ def stage_candidate(
     paths: ProjectPaths,
     target_id: str,
     candidate_path: Path,
-    *,
-    allow_resize: bool = False,
 ) -> dict[str, Any]:
     inventory = load_inventory(paths.inventory)
     target = profile.target_by_id(target_id)
@@ -52,42 +52,40 @@ def stage_candidate(
     if not source_path.is_file() or not candidate_path.is_file():
         raise FileNotFoundError(source_path if not source_path.is_file() else candidate_path)
 
-    with Image.open(source_path) as source_file:
-        source = source_file.convert("RGBA")
-    with Image.open(candidate_path) as candidate_file:
-        candidate = candidate_file.convert("RGBA")
-    resized = candidate.size != source.size
-    if resized and not allow_resize:
-        raise ValueError(f"후보 크기 {candidate.size}가 원본 {source.size}와 달라요")
-    if resized:
-        candidate = candidate.resize(source.size, Image.Resampling.LANCZOS)
-    candidate.putalpha(source.getchannel("A"))
+    candidate_path = candidate_path.expanduser().resolve()
+    try:
+        strict = verify_candidate(paths, target, source_path, candidate_path)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError(f"{target.id} 후보가 품질 게이트를 통과하지 못했어요: {exc}") from exc
 
     destination = _approved_path(paths, target)
     temporary = _temporary_png(destination.parent, target.id)
     try:
-        candidate.save(temporary)
-        report = validate_image_pair(source_path, temporary)
-        if not report["passed"]:
-            raise ValueError(
-                f"{target.id} 후보가 품질 게이트를 통과하지 못했어요: "
-                f"alpha_equal={report['alpha_equal']}, "
-                f"structure_edge_f1={report['structure_edge_f1']}"
-            )
+        shutil.copyfile(candidate_path, temporary)
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
-    report["edited_sha256"] = _sha256(destination)
-    report["edited"] = str(destination.resolve())
-    report.update(
-        {
-            "target_id": target.id,
-            "name_ko": target.name_ko,
-            "candidate": str(candidate_path.resolve()),
-            "approved": str(destination.resolve()),
-            "resized": resized,
-        }
-    )
+    if sha256_file(destination) != strict["candidate_sha256"]:
+        raise AssertionError("승인본 bytes가 검증한 후보와 달라요")
+    approval = {
+        "schema_version": 2,
+        "target_id": target.id,
+        "source_sha256": strict["source_sha256"],
+        "candidate_sha256": strict["candidate_sha256"],
+        "candidate_review_sha256": strict["candidate_review_sha256"],
+        "mask_sha256": strict["mask_sha256"],
+    }
+    sidecar = approval_path(paths, target.id)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(json.dumps(approval, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report = {
+        **strict,
+        "target_id": target.id,
+        "name_ko": target.name_ko,
+        "candidate": str(candidate_path),
+        "approved": str(destination.resolve()),
+        "approval": str(sidecar.resolve()),
+    }
     report_path = paths.reports / "images" / f"{target.id}.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -96,8 +94,10 @@ def stage_candidate(
 
 def validate_image_pair(source_path: Path, edited_path: Path) -> dict[str, Any]:
     with Image.open(source_path) as source_file:
+        source_mode = source_file.mode
         source = np.asarray(source_file.convert("RGBA"), dtype=np.uint8)
     with Image.open(edited_path) as edited_file:
+        edited_mode = edited_file.mode
         edited = np.asarray(edited_file.convert("RGBA"), dtype=np.uint8)
     if source.shape != edited.shape:
         raise ValueError(f"이미지 shape 불일치: {source.shape} != {edited.shape}")
@@ -115,12 +115,13 @@ def validate_image_pair(source_path: Path, edited_path: Path) -> dict[str, Any]:
         "edited_sha256": _sha256(edited_path),
         "width": int(source.shape[1]),
         "height": int(source.shape[0]),
+        "color_mode_equal": source_mode == edited_mode,
         "alpha_equal": alpha_equal,
         "rgb_changed_fraction": round(changed_fraction, 8),
         "has_rgb_changes": bool(rgb_changed.any()),
         **structure,
         "structure_preserved": structure_preserved,
-        "passed": alpha_equal and bool(rgb_changed.any()) and structure_preserved,
+        "passed": source_mode == edited_mode and alpha_equal and bool(rgb_changed.any()) and structure_preserved,
     }
 
 
@@ -187,11 +188,18 @@ def validate_approved(profile: CollectionProfile, paths: ProjectPaths) -> dict[s
             missing.append(target.id)
             continue
         record = record_for_target(inventory, target)
-        report = validate_image_pair(Path(record["source_png"]), edited)
-        report["target_id"] = target.id
+        try:
+            report = verify_approval(paths, target, Path(record["source_png"]), edited)
+            report["target_id"] = target.id
+        except (FileNotFoundError, ValueError) as exc:
+            report = {
+                "target_id": target.id,
+                "passed": False,
+                "reason": str(exc),
+            }
         reports.append(report)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "collection": profile.id,
         "target_count": len(profile.targets),
         "approved_count": sum(report.get("action") != "preserve" for report in reports),

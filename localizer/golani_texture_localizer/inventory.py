@@ -89,6 +89,148 @@ def _apply_source_overrides(
         record["source_sha256"] = source_sha256
 
 
+def _slot(
+    property_name: str,
+    environment_value: Any,
+    local_textures: dict[int, str],
+    local_bundle_key: str,
+) -> dict[str, Any]:
+    pointer = environment_value.m_Texture
+    file_id = int(pointer.m_FileID)
+    path_id = int(pointer.m_PathID)
+    texture = local_textures.get(path_id) if file_id == 0 else None
+    return {
+        "property": str(property_name),
+        "file_id": file_id,
+        "path_id": path_id,
+        "texture": texture,
+        "texture_bundle_key": local_bundle_key if texture else None,
+        "scale": [float(environment_value.m_Scale.x), float(environment_value.m_Scale.y)],
+        "offset": [float(environment_value.m_Offset.x), float(environment_value.m_Offset.y)],
+    }
+
+
+def _external_materials(
+    profile: CollectionProfile,
+    bundle_root: Path,
+    records: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """게임 카탈로그의 역의존성을 따라 별도 모델 번들의 Material PPtr를 해석해요."""
+
+    import UnityPy
+
+    catalog_path = bundle_root / "Windows.json"
+    if not catalog_path.is_file():
+        raise FileNotFoundError(f"Material 역연결용 게임 카탈로그가 없어요: {catalog_path}")
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    target_by_bundle: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        if record.get("target_id"):
+            target_by_bundle.setdefault(record["bundle_key"], []).append(record)
+    known = {(value["bundle_key"], int(value["path_id"])) for value in existing}
+    discovered: list[dict[str, Any]] = []
+    for texture_bundle_key, target_records in target_by_bundle.items():
+        candidates = sorted(
+            key
+            for key, metadata in catalog.items()
+            if isinstance(metadata, dict)
+            and texture_bundle_key in metadata.get("Dependencies", [])
+            and key != texture_bundle_key
+        )
+        texture_path = bundle_root / Path(texture_bundle_key)
+        all_path_ids = {
+            int(record["path_id"]): record
+            for record in records
+            if record["bundle_key"] == texture_bundle_key
+        }
+        target_path_ids = {int(record["path_id"]) for record in target_records}
+        resolved_target_ids: set[int] = set()
+        for material_bundle_key in candidates:
+            material_path = bundle_root / Path(material_bundle_key)
+            if not material_path.is_file():
+                continue
+            try:
+                environment = UnityPy.load(str(material_path), str(texture_path))
+            except Exception as exc:
+                raise RuntimeError(f"Material 의존 bundle을 읽지 못했어요: {material_bundle_key}") from exc
+            for obj in environment.objects:
+                if obj.type.name != "Material":
+                    continue
+                material = obj.read()
+                slots: list[dict[str, Any]] = []
+                consumes_target = False
+                for property_name, environment_value in material.m_SavedProperties.m_TexEnvs:
+                    pointer = environment_value.m_Texture
+                    file_id = int(pointer.m_FileID)
+                    path_id = int(pointer.m_PathID)
+                    texture = None
+                    resolved_bundle = None
+                    if path_id:
+                        try:
+                            resolved = pointer.deref()
+                            if resolved.type.name == "Texture2D":
+                                texture = str(pointer.read().m_Name)
+                                record = all_path_ids.get(int(resolved.path_id))
+                                if record is not None:
+                                    resolved_bundle = record["bundle_key"]
+                                    if (
+                                        int(resolved.path_id) in target_path_ids
+                                        and property_name in {"_MainTex", "_BaseMap", "_BaseColorMap"}
+                                    ):
+                                        consumes_target = True
+                                        resolved_target_ids.add(int(resolved.path_id))
+                        except (FileNotFoundError, KeyError, ValueError):
+                            pass
+                    slots.append(
+                        {
+                            "property": str(property_name),
+                            "file_id": file_id,
+                            "path_id": path_id,
+                            "texture": texture,
+                            "texture_bundle_key": resolved_bundle,
+                            "scale": [
+                                float(environment_value.m_Scale.x),
+                                float(environment_value.m_Scale.y),
+                            ],
+                            "offset": [
+                                float(environment_value.m_Offset.x),
+                                float(environment_value.m_Offset.y),
+                            ],
+                        }
+                    )
+                identity = (material_bundle_key, int(obj.path_id))
+                if not consumes_target or identity in known:
+                    continue
+                known.add(identity)
+                discovered.append(
+                    {
+                        "bundle_key": material_bundle_key,
+                        "bundle_sha256": sha256_file(material_path),
+                        "path_id": int(obj.path_id),
+                        "material": str(material.m_Name),
+                        "texture_slots": slots,
+                    }
+                )
+        local_target_ids = {
+            int(slot["path_id"])
+            for material in existing
+            if material["bundle_key"] == texture_bundle_key
+            for slot in material["texture_slots"]
+            if slot.get("property") in {"_MainTex", "_BaseMap", "_BaseColorMap"}
+            and slot.get("texture_bundle_key") == texture_bundle_key
+        }
+        unresolved = target_path_ids - resolved_target_ids - local_target_ids
+        if unresolved:
+            names = sorted(
+                record["target_id"]
+                for record in target_records
+                if int(record["path_id"]) in unresolved
+            )
+            raise ValueError(f"실제 Material 연결을 찾지 못한 target이 있어요: {names}")
+    return discovered
+
+
 def scan_collection(
     profile: CollectionProfile,
     bundle_root: Path,
@@ -103,6 +245,7 @@ def scan_collection(
 
     overrides = _load_source_overrides(paths)
     records: list[dict[str, Any]] = []
+    materials: list[dict[str, Any]] = []
     missing: list[str] = []
     for bundle in profile.bundles:
         bundle_path = (bundle_root / Path(bundle.key)).resolve()
@@ -110,6 +253,11 @@ def scan_collection(
             missing.append(bundle.key)
             continue
         environment = UnityPy.load(str(bundle_path))
+        bundle_sha256 = sha256_file(bundle_path)
+        local_textures: dict[int, str] = {}
+        for obj in environment.objects:
+            if obj.type.name == "Texture2D":
+                local_textures[int(obj.path_id)] = str(obj.read().m_Name)
         for obj in environment.objects:
             if obj.type.name != "Texture2D":
                 continue
@@ -129,8 +277,9 @@ def scan_collection(
                 {
                     "bundle_key": bundle.key,
                     "bundle_label": bundle.label,
-                    "bundle_sha256": sha256_file(bundle_path),
+                    "bundle_sha256": bundle_sha256,
                     "path_id": int(obj.path_id),
+                    "assets_file": str(obj.assets_file.name),
                     "texture": name,
                     "family": texture_family(name),
                     "role": role,
@@ -146,15 +295,34 @@ def scan_collection(
                     "ignored": ignored,
                 }
             )
+        for obj in environment.objects:
+            if obj.type.name != "Material":
+                continue
+            material = obj.read()
+            slots = []
+            for property_name, environment_value in material.m_SavedProperties.m_TexEnvs:
+                slots.append(_slot(property_name, environment_value, local_textures, bundle.key))
+            materials.append(
+                {
+                    "bundle_key": bundle.key,
+                    "bundle_sha256": bundle_sha256,
+                    "path_id": int(obj.path_id),
+                    "material": str(material.m_Name),
+                    "texture_slots": slots,
+                }
+            )
+    if not missing:
+        materials.extend(_external_materials(profile, bundle_root, records, materials))
     _apply_source_overrides(records, overrides, paths)
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "collection": profile.id,
         "profile": str(profile.path),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bundle_root": str(bundle_root),
         "missing_bundles": missing,
         "records": records,
+        "materials": materials,
         "source_bundle_overrides": overrides,
     }
     paths.inventory.parent.mkdir(parents=True, exist_ok=True)
@@ -169,8 +337,10 @@ def scan_collection(
 
 def load_inventory(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
-    if data.get("schema_version") != 1 or not isinstance(data.get("records"), list):
+    if data.get("schema_version") not in {1, 2} or not isinstance(data.get("records"), list):
         raise ValueError(f"지원하지 않는 inventory예요: {path}")
+    if data.get("schema_version") == 1:
+        data.setdefault("materials", [])
     return data
 
 

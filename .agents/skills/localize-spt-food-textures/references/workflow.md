@@ -117,8 +117,9 @@ AI 이미지 편집은 `old_text` 안의 배경 복구 초안에만 사용한다
 <python> localize.py stage <target-id> <candidate.png>
 ```
 
-현재 `localize.py stage`의 전역 edge 검사는 전체 재생성을 차단하기에 충분하지 않다.
-위 마스크·픽셀 검사를 별도로 통과하지 못하면 stage 명령이 성공해도 승인하지 않는다.
+`localize.py stage`는 작업 기록과 마스크 SHA를 다시 읽고 위 픽셀 조건을 직접 실측한다.
+기록값과 실측값이 다르거나 후보 OCR·시각 검토가 현재 후보 SHA에 묶이지 않았으면 승인본을
+교체하지 않는다.
 
 ## 8. D/N/G 정렬
 

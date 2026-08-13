@@ -55,6 +55,14 @@ class ProjectPaths:
         return self.workspace / "approved"
 
     @property
+    def reviews(self) -> Path:
+        return self.workspace / "reviews"
+
+    @property
+    def ocr(self) -> Path:
+        return self.workspace / "ocr"
+
+    @property
     def derived(self) -> Path:
         return self.workspace / "derived"
 
@@ -69,6 +77,14 @@ class ProjectPaths:
     @property
     def bundles(self) -> Path:
         return self.workspace / "bundles"
+
+    @property
+    def releases(self) -> Path:
+        return self.workspace / "releases"
+
+    @property
+    def latest_release(self) -> Path:
+        return self.releases / "latest.json"
 
 
 def game_bundle_root(spt_root: Path) -> Path:
