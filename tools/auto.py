@@ -27,6 +27,7 @@ import gzip
 import json
 import math
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -58,9 +59,6 @@ PICKER_DLL = os.path.join(PROJ, "client", "GoLani.AssetPicker", "bin", "Release"
 PICKER_PLUGIN_DIR = os.path.join(SPT_DIR, "BepInEx", "plugins", "GoLani.AssetPicker")
 TEXINDEX_PATH = os.path.join(PROJ, "tools", "texindex.json")
 BC7ENC = os.path.join(PROJ, "tools", "bin", "bc7enc")
-
-BC7 = 25  # TextureFormat.BC7
-DXT5 = 12  # TextureFormat.DXT5 (BC3) 폴백용
 
 # ponytail: hires(inspect 4096 demand-load) 잠시 비활성. BC7 포맷만으로 화질 충분.
 #           한글 고해상도 작업 재개 시 True 로. 코드/플러그인은 그대로 둠.
@@ -116,6 +114,34 @@ def _deployment_manifest(keys, catalog_path=GAME_BUNDLE_CATALOG):
     return {"manifest": manifest}
 
 
+def _ensure_spt_client_bundle_root(spt_dir=SPT_DIR):
+    """SPT 4.1 클라이언트가 기대하는 SPT/ 경로를 SPT_Runtime/에 연결한다."""
+    runtime_root = os.path.abspath(os.path.join(spt_dir, "SPT_Runtime"))
+    client_root = os.path.abspath(os.path.join(spt_dir, "SPT"))
+    if not os.path.isdir(runtime_root):
+        raise FileNotFoundError(f"SPT 런타임 폴더 없음: {runtime_root}")
+
+    if os.path.lexists(client_root):
+        if os.path.isdir(client_root) and os.path.samefile(client_root, runtime_root):
+            return client_root
+        raise FileExistsError(
+            f"{client_root}가 이미 다른 폴더로 존재해 자동 연결할 수 없음"
+        )
+
+    if os.name == "nt":
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", client_root, runtime_root],
+            check=True,
+        )
+    else:
+        os.symlink(runtime_root, client_root, target_is_directory=True)
+
+    if not os.path.isdir(client_root) or not os.path.samefile(client_root, runtime_root):
+        raise OSError(f"SPT 클라이언트 번들 경로 연결 검증 실패: {client_root}")
+    print(f"SPT 클라이언트 번들 경로 연결 완료: {client_root} → {runtime_root}")
+    return client_root
+
+
 def _asset_type(key, manifest_entry=None):
     """번들 key/manifest로 item|map 판별."""
     if manifest_entry and manifest_entry.get("assetType") in ("item", "map"):
@@ -129,11 +155,6 @@ def _asset_type(key, manifest_entry=None):
 def _png_name(key, tex):
     """번들 key + 텍스처 이름 → 충돌 없는 PNG 파일명. ('/'는 키마다 중복되니 인코딩)"""
     return key.replace("/", "@") + "__" + tex + ".png"
-
-
-def _full_mip_count(width, height):
-    """최종 크기 기준 풀 밉 체인 개수."""
-    return int(math.floor(math.log2(max(width, height)))) + 1
 
 
 def extract(flt=None):
@@ -228,45 +249,57 @@ def derive(flt=None):
     print(f"\n완료: {made}개 번들 보조맵 생성 → work/2_edited/  (디버그 마스크: work/_debug/)")
 
 
-def _replace(bundle_path, out_path, replacements, target_size):
-    """원본 번들 로드 → 해당 텍스처를 새 PNG로 교체 → out_path 저장."""
+def _replace(bundle_path, out_path, replacements):
+    """원본 Texture2D 메타데이터는 그대로 두고 stream payload만 교체한다."""
+    localizer_root = os.path.join(PROJ, "localizer")
+    if localizer_root not in sys.path:
+        sys.path.insert(0, localizer_root)
+    from golani_texture_localizer.bundles import patch_bundle_exact
+
     UnityPy = _unitypy()
     Image = _image()
     env = UnityPy.load(bundle_path)
-    changed = False
+    textures = {}
     for obj in env.objects:
         if obj.type.name != "Texture2D":
             continue
         data = obj.read()
-        new_png = replacements.get(data.m_Name)
-        if not new_png:
+        if data.m_Name not in replacements:
             continue
-        img = Image.open(new_png)
-        if target_size is None:
+        if data.m_Name in textures:
+            raise ValueError(f"중복 Texture2D 이름: {data.m_Name}")
+        textures[data.m_Name] = data
+
+    missing = sorted(set(replacements) - set(textures))
+    if missing:
+        raise ValueError("번들에서 Texture2D를 찾지 못함: " + ", ".join(missing))
+    if not textures:
+        return False
+
+    with tempfile.TemporaryDirectory(prefix="golani-default-texture-") as temporary:
+        normalized = {}
+        for index, (name, new_png) in enumerate(sorted(replacements.items())):
+            data = textures[name]
             width, height = data.m_Width, data.m_Height
-        else:
-            width, height = target_size, target_size
-        if (img.width, img.height) != (width, height):
-            img = img.resize((width, height), Image.LANCZOS)
-        if img.mode != "RGBA":
-            img = img.convert("RGBA")
-        mip = _full_mip_count(width, height)
-        fmt = BC7
-        try:
-            data.set_image(img, target_format=fmt, mipmap_count=mip)
-            data.save()
-        except Exception as e:
-            print(f"   포맷({fmt}) 실패 → DXT5 폴백: {e}")
-            fmt = DXT5
-            data.set_image(img, target_format=DXT5, mipmap_count=mip)
-            data.save()
-        changed = True
-        print(f"   교체: {data.m_Name} ({width}x{height}, 밉 {mip}, 포맷 {fmt})")
-    if changed:
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "wb") as f:
-            f.write(env.file.save(packer="lz4"))
-    return changed
+            with Image.open(new_png) as source:
+                image = source.convert("RGBA")
+                if image.size != (width, height):
+                    image = image.resize((width, height), Image.Resampling.LANCZOS)
+                target = Path(temporary) / f"{index}.png"
+                image.save(target)
+            normalized[name] = target
+            stream = data.m_StreamData
+            print(
+                f"   교체: {name} ({width}x{height}, 밉 {data.m_MipCount}, "
+                f"원본 포맷 {int(data.m_TextureFormat)}, stream {stream.size} bytes)"
+            )
+
+        patch_bundle_exact(
+            Path(bundle_path),
+            Path(out_path),
+            normalized,
+        )
+    return True
 
 
 def _wsl_path(path):
@@ -444,10 +477,8 @@ def repack(flt=None):
             continue
 
         typ = _asset_type(key, entry)
-        size = 1024 if typ == "item" else None
-        size_desc = "1024" if size else "원본크기"
-        print(f"[리팩] {key} ({typ}, {size_desc}, 텍스처 {len(replacements)}개)")
-        if _replace(src, out, replacements, size):
+        print(f"[리팩] {key} ({typ}, 원본크기/포맷, 텍스처 {len(replacements)}개)")
+        if _replace(src, out, replacements):
             done += 1
     print(f"\n완료: 번들 {done}개 → {OUT_DIR}")
     print(f"요약: 게임에 없음 {skipped_missing_bundle}개, 소스 PNG 없음 {skipped_no_png}개, 오류 {skipped_errors}개")
@@ -610,6 +641,7 @@ def deploy():
     # 모델/재질이 든 bundle은 shaders/cubemaps 등의 원본 의존성이 없으면 보라색으로 렌더링된다.
     # 설치 폴더를 건드리기 전에 전체 key를 검증해 불완전한 매니페스트 배포를 막는다.
     manifest = _deployment_manifest(keys)
+    _ensure_spt_client_bundle_root()
     os.makedirs(MODS_DIR, exist_ok=True)
     with open(os.path.join(MODS_DIR, "bundles.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=4)

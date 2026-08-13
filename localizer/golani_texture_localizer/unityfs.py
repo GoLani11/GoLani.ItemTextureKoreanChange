@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import re
 from typing import Iterable, Any
 
 
@@ -44,15 +42,6 @@ class PhysicalPatch:
     end: int
     payload_start: int
     payload_end: int
-
-
-@dataclass(frozen=True)
-class CabRebase:
-    source_cab: str
-    output_cab: str
-    blocks_info_occurrences: int
-    data_occurrences: int
-    physical_ranges: tuple[tuple[int, int], ...]
 
 
 def parse_unityfs_layout(bundle_bytes: bytes, bundle: Any) -> UnityFSLayout:
@@ -204,117 +193,6 @@ def patch_uncompressed_logical_range(
     return bytes(patched), tuple(patches)
 
 
-def rebase_unityfs_cab_exact(
-    bundle_bytes: bytes,
-    bundle: Any,
-    layout: UnityFSLayout,
-    *,
-    max_attempts: int = 4096,
-) -> tuple[bytes, CabRebase]:
-    """CAB 식별자를 같은 길이의 고유값으로 바꾸되 UnityFS 물리 레이아웃은 유지해요.
-
-    Unity는 원본과 수정본의 내부 CAB 이름이 같으면 둘 중 두 번째 AssetBundle 로드를
-    거부해요. SPT의 비동기 로더에서는 원본이 먼저 잡힐 수 있으므로 교체 번들은 고유한
-    CAB 이름이 필요해요. 현재 대상처럼 data block이 무압축인 UnityFS만 안전하게
-    지원하고, blocks-info는 원래 압축 크기와 같은 후보가 나올 때까지 결정적으로 찾아요.
-    """
-    from UnityPy.enums import CompressionFlags
-    from UnityPy.helpers import CompressionHelper
-
-    if not isinstance(max_attempts, int) or max_attempts < 1:
-        raise ValueError("max_attempts는 1 이상의 정수여야 해요")
-
-    cab_pattern = re.compile(r"^CAB-[0-9a-fA-F]{32}(?:\.resS)?$")
-    cab_names = {
-        entry.path[:36]
-        for entry in layout.entries
-        if cab_pattern.fullmatch(entry.path)
-    }
-    if len(cab_names) != 1:
-        raise ValueError(f"UnityFS의 CAB 식별자는 하나여야 해요. 현재 {sorted(cab_names)}예요")
-    source_cab = cab_names.pop()
-    source_bytes = source_cab.encode("ascii")
-
-    info_start = layout.blocks_info_offset
-    info_end = info_start + layout.compressed_info_size
-    compressed_info = bundle_bytes[info_start:info_end]
-    info_bytes = bundle.decompress_data(
-        compressed_info,
-        layout.uncompressed_info_size,
-        bundle.dataflags,
-    )
-    info_occurrences = info_bytes.count(source_bytes)
-    if info_occurrences < 1:
-        raise ValueError("UnityFS blocks-info에서 CAB 식별자를 찾지 못했어요")
-
-    info_compression = CompressionFlags(layout.archive_flags & 0x3F)
-    compressor = CompressionHelper.COMPRESSION_MAP.get(info_compression)
-    if compressor is None:
-        raise ValueError(f"지원하지 않는 blocks-info 압축이에요: {info_compression.name}")
-
-    output_cab = None
-    rebased_info = None
-    compressed_rebased_info = None
-    seed = hashlib.sha256(bundle_bytes).digest()
-    for attempt in range(max_attempts):
-        digest = hashlib.sha256(seed + b"\x00golani-cab\x00" + attempt.to_bytes(4, "big")).hexdigest()
-        candidate = f"CAB-{digest[:32]}"
-        if candidate == source_cab:
-            continue
-        candidate_info = info_bytes.replace(source_bytes, candidate.encode("ascii"))
-        candidate_compressed = compressor(candidate_info)
-        if len(candidate_compressed) == layout.compressed_info_size:
-            output_cab = candidate
-            rebased_info = candidate_info
-            compressed_rebased_info = candidate_compressed
-            break
-    if output_cab is None or rebased_info is None or compressed_rebased_info is None:
-        raise ValueError(
-            f"원래 blocks-info 압축 크기 {layout.compressed_info_size}를 유지하는 CAB 후보를 "
-            f"{max_attempts}회 안에 찾지 못했어요"
-        )
-    if rebased_info.count(source_bytes):
-        raise AssertionError("blocks-info에 원본 CAB 식별자가 남았어요")
-
-    output_bytes = output_cab.encode("ascii")
-    patched = bytearray(bundle_bytes)
-    patched[info_start:info_end] = compressed_rebased_info
-    ranges: list[tuple[int, int]] = [(info_start, info_end)]
-    data_occurrences = 0
-    physical_cursor = layout.data_offset
-    for index, block in enumerate(layout.blocks):
-        physical_end = physical_cursor + block.compressed_size
-        compression = CompressionFlags(block.flags & 0x3F)
-        if compression != CompressionFlags.NONE or block.compressed_size != block.uncompressed_size:
-            raise ValueError(
-                f"CAB 재지정은 무압축 UnityFS data block만 지원해요: "
-                f"block {index}({compression.name})"
-            )
-        block_bytes = bytes(patched[physical_cursor:physical_end])
-        cursor = 0
-        while True:
-            relative = block_bytes.find(source_bytes, cursor)
-            if relative < 0:
-                break
-            start = physical_cursor + relative
-            end = start + len(source_bytes)
-            patched[start:end] = output_bytes
-            ranges.append((start, end))
-            data_occurrences += 1
-            cursor = relative + len(source_bytes)
-        physical_cursor = physical_end
-    if data_occurrences < 1:
-        raise ValueError("UnityFS data block에서 CAB 식별자를 찾지 못했어요")
-
-    return bytes(patched), CabRebase(
-        source_cab=source_cab,
-        output_cab=output_cab,
-        blocks_info_occurrences=info_occurrences,
-        data_occurrences=data_occurrences,
-        physical_ranges=tuple(ranges),
-    )
-
-
 def merge_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     merged: list[list[int]] = []
     for start, end in sorted(ranges):
@@ -342,15 +220,7 @@ def bytes_equal_outside_ranges(
     return before[cursor:] == after[cursor:]
 
 
-def layout_signature(
-    layout: UnityFSLayout,
-    path_replacements: dict[str, str] | None = None,
-) -> tuple[Any, ...]:
-    def normalized(path: str) -> str:
-        for source, target in (path_replacements or {}).items():
-            path = path.replace(source, target)
-        return path
-
+def layout_signature(layout: UnityFSLayout) -> tuple[Any, ...]:
     return (
         layout.signature,
         layout.format_version,
@@ -364,13 +234,5 @@ def layout_signature(
         layout.data_offset,
         layout.data_hash,
         layout.blocks,
-        tuple(
-            DirectoryEntry(
-                offset=entry.offset,
-                size=entry.size,
-                flags=entry.flags,
-                path=normalized(entry.path),
-            )
-            for entry in layout.entries
-        ),
+        layout.entries,
     )

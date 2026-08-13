@@ -49,3 +49,22 @@ def test_deployment_manifest_rejects_missing_catalog_entry(tmp_path: Path) -> No
 
     with pytest.raises(ValueError, match="missing.bundle"):
         auto._deployment_manifest(["missing.bundle"], str(catalog))
+
+
+def test_client_bundle_root_rejects_unrelated_existing_directory(tmp_path: Path) -> None:
+    auto = _load_auto_module()
+    (tmp_path / "SPT_Runtime").mkdir()
+    (tmp_path / "SPT").mkdir()
+
+    with pytest.raises(FileExistsError, match="다른 폴더"):
+        auto._ensure_spt_client_bundle_root(str(tmp_path))
+
+
+def test_client_bundle_root_links_to_runtime(tmp_path: Path) -> None:
+    auto = _load_auto_module()
+    runtime_root = tmp_path / "SPT_Runtime"
+    runtime_root.mkdir()
+
+    result = Path(auto._ensure_spt_client_bundle_root(str(tmp_path)))
+
+    assert result.samefile(runtime_root)

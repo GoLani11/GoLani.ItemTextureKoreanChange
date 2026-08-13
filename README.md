@@ -54,5 +54,6 @@ SPT 4.1(C# 서버)용 번들 모드입니다. 텍스처 추출·교체·설치�
 
 - 빌드 요구: .NET 10 SDK (`dotnet`), 파이썬 3 + UnityPy 1.25.0.
 - 게임 경로는 `D:\SPT` 기준. 다르면 환경변수 `SPT_DIR` 로 지정.
+- SPT 4.1의 로컬 번들 경로 호환을 위해 배포 시 `SPT` 폴더를 `SPT_Runtime`에 연결합니다.
 - 적용 후 **런처에서 "임시 파일 삭제"** 필수.
 - 설계·주의사항: [docs/automation-design.md](docs/automation-design.md)

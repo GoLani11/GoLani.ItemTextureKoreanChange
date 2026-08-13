@@ -42,10 +42,7 @@ def _parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("validate", help="승인된 전체 이미지의 크기·알파·변경 여부를 검사해요")
     subparsers.add_parser("derive", help="승인된 diffuse를 기준으로 normal·gloss 인쇄 위치를 이식해요")
-    repack = subparsers.add_parser(
-        "repack",
-        help="승인 이미지를 UnityFS payload에 패치하고 CAB 충돌을 방지해요",
-    )
+    repack = subparsers.add_parser("repack", help="승인된 이미지만 원본 UnityFS payload에 패치해요")
     repack.add_argument("--allow-partial", action="store_true")
     repack.add_argument("--max-mae", type=float, default=6.0)
     subparsers.add_parser("status", help="전체 대상과 승인 진행률을 보여줘요")
