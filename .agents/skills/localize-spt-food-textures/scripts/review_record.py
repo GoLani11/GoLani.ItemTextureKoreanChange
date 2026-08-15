@@ -423,11 +423,35 @@ def _validate_material_metrics(data: Any, project_root: Path) -> list[str]:
                         f"stages.material_validation.data.material_masks.{key}: 현재 파일 SHA-256이 달라요"
                     )
             method = descriptor.get("method")
-            if method != "inpaint":
+            if method not in {"inpaint", "patch"}:
                 errors.append(
                     f"stages.material_validation.data.material_masks.{key}.method: "
-                    "inpaint여야 해요"
+                    "inpaint 또는 patch여야 해요"
                 )
+            if method == "patch":
+                patch_path, patch_errors = _project_file(
+                    project_root,
+                    descriptor.get("patch"),
+                    f"stages.material_validation.data.material_masks.{key}.patch",
+                )
+                errors.extend(patch_errors)
+                patch_checksum = descriptor.get("patch_sha256")
+                if not _valid_sha256(patch_checksum):
+                    errors.append(
+                        f"stages.material_validation.data.material_masks.{key}.patch_sha256: "
+                        "SHA-256 형식이 아니에요"
+                    )
+                elif patch_path is not None:
+                    if not patch_path.is_file():
+                        errors.append(
+                            f"stages.material_validation.data.material_masks.{key}.patch: "
+                            "파일이 없어요"
+                        )
+                    elif _sha256(patch_path) != patch_checksum:
+                        errors.append(
+                            f"stages.material_validation.data.material_masks.{key}.patch: "
+                            "현재 파일 SHA-256이 달라요"
+                        )
     return errors
 
 

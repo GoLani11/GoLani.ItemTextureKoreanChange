@@ -384,6 +384,63 @@ def _iou(left: list[int], right: list[int]) -> float:
     return intersection / max(1, left_area + right_area - intersection)
 
 
+def _intersection_over_smaller(left: list[int], right: list[int]) -> float:
+    x0, y0 = max(left[0], right[0]), max(left[1], right[1])
+    x1, y1 = min(left[2], right[2]), min(left[3], right[3])
+    intersection = max(0, x1 - x0) * max(0, y1 - y0)
+    left_area = max(1, (left[2] - left[0]) * (left[3] - left[1]))
+    right_area = max(1, (right[2] - right[0]) * (right[3] - right[1]))
+    return intersection / min(left_area, right_area)
+
+
+def _same_text_region(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    if _iou(left["bbox"], right["bbox"]) >= 0.55:
+        return True
+    left_text = _normalize(str(left.get("text", "")))
+    right_text = _normalize(str(right.get("text", "")))
+    return (
+        bool(left_text and right_text)
+        and (left_text in right_text or right_text in left_text)
+        and _intersection_over_smaller(left["bbox"], right["bbox"]) >= 0.85
+    )
+
+
+def _consensus_detection(cluster: list[dict[str, Any]]) -> dict[str, Any]:
+    readings: dict[str, list[dict[str, Any]]] = {}
+    for item in cluster:
+        normalized = _normalize(str(item.get("text", "")))
+        if normalized:
+            readings.setdefault(normalized, []).append(item)
+    if not readings:
+        return dict(max(cluster, key=lambda value: value["confidence"]))
+
+    def reading_score(value: tuple[str, list[dict[str, Any]]]) -> tuple[int, int, float, int]:
+        normalized, items = value
+        return (
+            len({item["model_signature"] for item in items}),
+            len({item["engine"] for item in items}),
+            max(float(item["confidence"]) for item in items),
+            len(normalized),
+        )
+
+    _, agreed_items = max(readings.items(), key=reading_score)
+    orientations: dict[int, list[dict[str, Any]]] = {}
+    for item in agreed_items:
+        orientations.setdefault(int(item["rotation_deg"]), []).append(item)
+
+    def orientation_score(value: tuple[int, list[dict[str, Any]]]) -> tuple[int, int, float, int]:
+        rotation, items = value
+        return (
+            len({item["model_signature"] for item in items}),
+            len({item["engine"] for item in items}),
+            max(float(item["confidence"]) for item in items),
+            -rotation,
+        )
+
+    _, oriented_items = max(orientations.items(), key=orientation_score)
+    return dict(max(oriented_items, key=lambda value: value["confidence"]))
+
+
 def _deduplicate(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
     clusters: list[list[dict[str, Any]]] = []
     for detection in sorted(detections, key=lambda value: -value["confidence"]):
@@ -391,7 +448,7 @@ def _deduplicate(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
             (
                 current
                 for current in clusters
-                if any(_iou(item["bbox"], detection["bbox"]) >= 0.55 for item in current)
+                if any(_same_text_region(item, detection) for item in current)
             ),
             None,
         )
@@ -401,7 +458,7 @@ def _deduplicate(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cluster.append(detection)
     chosen: list[dict[str, Any]] = []
     for cluster in clusters:
-        best = dict(max(cluster, key=lambda value: value["confidence"]))
+        best = _consensus_detection(cluster)
         alternatives: dict[tuple[str, str], dict[str, Any]] = {}
         for item in cluster:
             key = (item["model_signature"], _normalize(item["text"]))
@@ -441,6 +498,37 @@ def _deduplicate(detections: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for index, detection in enumerate(chosen, 1):
         detection["region_id"] = f"ocr-{index:03d}"
     return chosen
+
+
+def _store_region_readings(
+    readings: dict[tuple[str, str], dict[str, Any]],
+    values: list[dict[str, Any]],
+) -> None:
+    """Keep tokens and their ordered composite from one OCR model invocation."""
+    valid = [value for value in values if _normalize(str(value.get("text", "")))]
+    candidates = list(valid)
+    if len(valid) > 1:
+        combined_text = " ".join(str(value["text"]).strip() for value in valid)
+        candidates.append(
+            {
+                "text": combined_text,
+                "script": _script(combined_text),
+                "confidence": round(
+                    min(float(value["confidence"]) for value in valid), 6
+                ),
+                "engine": valid[0]["engine"],
+                "model_signature": valid[0]["model_signature"],
+                "variant": valid[0]["variant"],
+                "composite": True,
+                "components": [str(value["text"]) for value in valid],
+            }
+        )
+    for value in candidates:
+        key = (str(value["model_signature"]), _normalize(str(value["text"])))
+        if key not in readings or float(value["confidence"]) > float(
+            readings[key]["confidence"]
+        ):
+            readings[key] = value
 
 
 def run_ocr(
@@ -654,6 +742,7 @@ def _run_ocr_session(
                 try:
                     for result in pipeline.predict(bgr):
                         data = _result_mapping(result)
+                        pass_readings: list[dict[str, Any]] = []
                         for text, score in zip(
                             list(data.get("rec_texts", [])),
                             list(data.get("rec_scores", [])),
@@ -662,23 +751,26 @@ def _run_ocr_session(
                             normalized = _normalize(str(text))
                             if confidence < minimum or not normalized:
                                 continue
-                            key = (f"{config['detector']}+{recognizer}", normalized)
-                            value = {
-                                "text": unicodedata.normalize("NFC", str(text)),
-                                "script": _script(str(text)),
-                                "confidence": round(confidence, 6),
-                                "engine": "paddleocr",
-                                "model_signature": key[0],
-                                "variant": variant_id,
-                            }
-                            if key not in readings or confidence > float(readings[key]["confidence"]):
-                                readings[key] = value
+                            pass_readings.append(
+                                {
+                                    "text": unicodedata.normalize("NFC", str(text)),
+                                    "script": _script(str(text)),
+                                    "confidence": round(confidence, 6),
+                                    "engine": "paddleocr",
+                                    "model_signature": (
+                                        f"{config['detector']}+{recognizer}"
+                                    ),
+                                    "variant": variant_id,
+                                }
+                            )
+                        _store_region_readings(readings, pass_readings)
                 except Exception as exc:
                     region_errors.append(
                         f"paddle/{recognizer}/{variant_id}: {type(exc).__name__}: {exc}"
                     )
             for languages, reader in readers:
                 try:
+                    pass_readings = []
                     for _, text, score in reader.readtext(
                         rgb,
                         detail=1,
@@ -691,17 +783,17 @@ def _run_ocr_session(
                         if confidence < minimum or not normalized:
                             continue
                         signature = f"easyocr-1.7.2:{'+'.join(languages)}"
-                        key = (signature, normalized)
-                        value = {
-                            "text": unicodedata.normalize("NFC", str(text)),
-                            "script": _script(str(text)),
-                            "confidence": round(confidence, 6),
-                            "engine": "easyocr",
-                            "model_signature": signature,
-                            "variant": variant_id,
-                        }
-                        if key not in readings or confidence > float(readings[key]["confidence"]):
-                            readings[key] = value
+                        pass_readings.append(
+                            {
+                                "text": unicodedata.normalize("NFC", str(text)),
+                                "script": _script(str(text)),
+                                "confidence": round(confidence, 6),
+                                "engine": "easyocr",
+                                "model_signature": signature,
+                                "variant": variant_id,
+                            }
+                        )
+                    _store_region_readings(readings, pass_readings)
                 except Exception as exc:
                     region_errors.append(
                         f"easyocr/{'+'.join(languages)}/{variant_id}: {type(exc).__name__}: {exc}"

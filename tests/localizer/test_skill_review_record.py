@@ -238,3 +238,39 @@ def test_candidate_gate_rejects_changes_outside_editable_mask(tmp_path: Path) ->
     record["stages"]["candidate_validation"]["data"]["changed_outside_editable"] = 1
     errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
     assert any("changed_outside_editable" in error for error in errors)
+
+
+def test_material_patch_is_bound_to_current_file_hash(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    mask = _write(tmp_path / "material-mask.png", b"mask")
+    patch = _write(tmp_path / "material-patch.png", b"patch")
+    record["stages"]["material_validation"] = {
+        "status": "pass",
+        "evidence": [_evidence(tmp_path, "material-validation")],
+        "data": {
+            "graph_scope": "resolved",
+            "bindings": [{"material": "item", "property": "_SpecMap"}],
+            "policies": {"item::_SpecMap": "neutralize_old_text"},
+            "material_masks": {
+                "item::_SpecMap": {
+                    "path": mask.relative_to(tmp_path).as_posix(),
+                    "sha256": review_record._sha256(mask),
+                    "method": "patch",
+                    "patch": patch.relative_to(tmp_path).as_posix(),
+                    "patch_sha256": review_record._sha256(patch),
+                }
+            },
+            "shared_consumers_resolved": True,
+            "text_mask_sha256": "a" * 64,
+            "alignment_passed": True,
+            "foreign_relief_detected": False,
+            "changed_outside_masks": 0,
+        },
+    }
+
+    assert review_record.validate_record(record, "material", project_root=tmp_path) == []
+
+    patch.write_bytes(b"changed")
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+    assert any("patch: 현재 파일 SHA-256이 달라요" in error for error in errors)

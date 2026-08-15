@@ -29,6 +29,14 @@ def _json_sha256(value: Any) -> str:
     return hashlib.sha256(packed.encode("utf-8")).hexdigest()
 
 
+def review_stage_sha256(record: dict[str, Any], stage_name: str) -> str:
+    stages = record.get("stages")
+    stage = stages.get(stage_name) if isinstance(stages, dict) else None
+    if not isinstance(stage, dict):
+        raise ValueError(f"작업 기록에 {stage_name} 단계가 없어요")
+    return _json_sha256({"stage": stage_name, "value": stage})
+
+
 def review_path(paths: ProjectPaths, target_id: str) -> Path:
     return paths.reviews / target_id / "review.json"
 

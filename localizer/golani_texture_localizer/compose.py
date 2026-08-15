@@ -72,13 +72,72 @@ def _render_text_layer(
         )
         layer = Image.new("RGBA", size, (0, 0, 0, 0))
         center = ((x0 + x1) / 2, (y0 + y1) / 2)
+        anchor = str(region.get("anchor", "mm"))
+        if anchor not in {"mm", "lm", "rm"}:
+            raise ValueError(f"text_regions[{index}].anchor는 mm, lm 또는 rm이어야 해요")
+        offset = region.get("offset", [0, 0])
+        if (
+            not isinstance(offset, list)
+            or len(offset) != 2
+            or not all(isinstance(value, (int, float)) for value in offset)
+        ):
+            raise ValueError(f"text_regions[{index}].offset은 [x, y] 숫자 배열이어야 해요")
+        base_position = (
+            (float(x0), center[1])
+            if anchor == "lm"
+            else (float(x1), center[1])
+            if anchor == "rm"
+            else center
+        )
+        draw_position = (
+            base_position[0] + float(offset[0]),
+            base_position[1] + float(offset[1]),
+        )
         spacing = int(region.get("spacing", 4))
         tracking = float(region.get("tracking", 0))
         if tracking < 0:
             raise ValueError(f"text_regions[{index}].tracking은 0 이상이어야 해요")
+        segments_value = region.get("segments")
+        segments: list[dict[str, Any]] | None = None
+        if segments_value is not None:
+            if not isinstance(segments_value, list) or not segments_value:
+                raise ValueError(f"text_regions[{index}].segments는 비어 있지 않은 배열이어야 해요")
+            segments = []
+            for segment_index, segment in enumerate(segments_value):
+                if not isinstance(segment, dict) or not isinstance(segment.get("text"), str):
+                    raise ValueError(
+                        f"text_regions[{index}].segments[{segment_index}]가 잘못됐어요"
+                    )
+                segment_fill = (
+                    _color(
+                        segment["fill"],
+                        f"text_regions[{index}].segments[{segment_index}].fill",
+                    )
+                    if "fill" in segment
+                    else fill
+                )
+                segment_stroke = (
+                    _color(
+                        segment["stroke_fill"],
+                        f"text_regions[{index}].segments[{segment_index}].stroke_fill",
+                    )
+                    if "stroke_fill" in segment
+                    else stroke_fill
+                )
+                segments.append(
+                    {
+                        "text": segment["text"],
+                        "fill": segment_fill,
+                        "stroke_fill": segment_stroke,
+                    }
+                )
+            if "".join(segment["text"] for segment in segments) != text:
+                raise ValueError(f"text_regions[{index}].segments 문구 합이 text와 달라요")
         arc = region.get("arc")
         rotation = float(region.get("rotation_deg", 0))
         if arc is not None:
+            if segments is not None:
+                raise ValueError(f"text_regions[{index}] arc와 segments를 함께 쓸 수 없어요")
             if not isinstance(arc, dict):
                 raise ValueError(f"text_regions[{index}].arc가 객체가 아니에요")
             arc_center = arc.get("center")
@@ -137,33 +196,48 @@ def _render_text_layer(
                 )
         else:
             draw = ImageDraw.Draw(layer)
-            if tracking:
+            if tracking or segments is not None:
+                if anchor != "mm":
+                    raise ValueError(
+                        f"text_regions[{index}] tracking/segments는 mm anchor만 지원해요"
+                    )
                 if "\n" in text:
                     raise ValueError(
-                        f"text_regions[{index}] tracking은 한 줄 문구에만 사용할 수 있어요"
+                        f"text_regions[{index}] tracking/segments는 한 줄 문구에만 사용할 수 있어요"
                     )
                 advances = [max(0.0, float(font.getlength(character))) for character in text]
                 total_width = sum(advances) + tracking * max(0, len(text) - 1)
                 cursor = center[0] - total_width / 2
-                for character, advance in zip(text, advances, strict=True):
+                styles: list[tuple[tuple[int, int, int, int], tuple[int, int, int, int]]] = []
+                if segments is None:
+                    styles = [(fill, stroke_fill)] * len(text)
+                else:
+                    for segment in segments:
+                        styles.extend(
+                            [(segment["fill"], segment["stroke_fill"])]
+                            * len(segment["text"])
+                        )
+                for character, advance, (character_fill, character_stroke) in zip(
+                    text, advances, styles, strict=True
+                ):
                     if not character.isspace():
                         draw.text(
                             (cursor + advance / 2, center[1]),
                             character,
                             font=font,
-                            fill=fill,
+                            fill=character_fill,
                             anchor="mm",
                             stroke_width=stroke_width,
-                            stroke_fill=stroke_fill,
+                            stroke_fill=character_stroke,
                         )
                     cursor += advance + tracking
             else:
                 draw.multiline_text(
-                    center,
+                    draw_position,
                     text,
                     font=font,
                     fill=fill,
-                    anchor="mm",
+                    anchor=anchor,
                     align=str(region.get("align", "center")),
                     spacing=spacing,
                     stroke_width=stroke_width,
@@ -202,9 +276,12 @@ def _render_text_layer(
                 "stroke_width": stroke_width,
                 "stroke_fill": list(stroke_fill),
                 "rotation_deg": rotation,
+                "anchor": anchor,
+                "offset": [float(offset[0]), float(offset[1])],
                 "align": str(region.get("align", "center")),
                 "spacing": spacing,
                 "tracking": tracking,
+                "segments": segments,
                 "arc": arc,
             }
         )

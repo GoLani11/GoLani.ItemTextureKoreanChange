@@ -9,11 +9,13 @@ from PIL import Image
 
 from golani_texture_localizer.ocr import (
     OcrSession,
+    _consensus_detection,
     _deduplicate,
     _inverse_points,
     _oriented_region_variants,
     _otsu_threshold,
     _positions,
+    _store_region_readings,
     reusable_ocr_report,
 )
 
@@ -132,3 +134,76 @@ def test_region_ocr_crop_rejects_non_right_angle_rotation() -> None:
             {"bbox": [2, 4, 8, 24], "rotation_deg": 45},
             ["white"],
         )
+
+
+def _detection(
+    text: str,
+    confidence: float,
+    rotation: int,
+    model: str,
+    bbox: list[int],
+    *,
+    engine: str = "paddleocr",
+) -> dict:
+    return {
+        "text": text,
+        "confidence": confidence,
+        "rotation_deg": rotation,
+        "model_signature": model,
+        "engine": engine,
+        "bbox": bbox,
+        "script": "latin",
+    }
+
+
+def test_consensus_detection_prefers_multi_model_orientation() -> None:
+    cluster = [
+        _detection("ICEGREEN", 0.9999, 270, "paddle-en", [10, 10, 100, 30]),
+        _detection("ICEGREEN", 0.9985, 0, "paddle-ru", [10, 10, 100, 30]),
+        _detection(
+            "ICEGREEN",
+            0.92,
+            0,
+            "easy-en",
+            [10, 10, 100, 30],
+            engine="easyocr",
+        ),
+    ]
+
+    assert _consensus_detection(cluster)["rotation_deg"] == 0
+
+
+def test_deduplicate_merges_contained_word_with_full_line() -> None:
+    detections = [
+        _detection("Nutrition Facts", 0.99, 0, "paddle-en", [10, 10, 120, 30]),
+        _detection("Nutrition", 0.999, 0, "paddle-en", [10, 10, 80, 30]),
+        _detection("Nutrition Facts", 0.97, 0, "easy-en", [10, 10, 120, 30], engine="easyocr"),
+    ]
+
+    compact = _deduplicate(detections)
+
+    assert len(compact) == 1
+    assert compact[0]["text"] == "Nutrition Facts"
+
+
+def test_region_readings_combine_tokens_from_one_ocr_pass() -> None:
+    readings: dict[tuple[str, str], dict] = {}
+    shared = {
+        "engine": "paddleocr",
+        "model_signature": "korean",
+        "variant": "rgb:scale4",
+    }
+
+    _store_region_readings(
+        readings,
+        [
+            {**shared, "text": "열량", "script": "korean", "confidence": 0.91},
+            {**shared, "text": "80kcal", "script": "latin", "confidence": 0.98},
+        ],
+    )
+
+    combined = readings[("korean", "열량80kcal")]
+    assert combined["text"] == "열량 80kcal"
+    assert combined["confidence"] == 0.91
+    assert combined["composite"] is True
+    assert combined["components"] == ["열량", "80kcal"]

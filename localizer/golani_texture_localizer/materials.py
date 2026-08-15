@@ -12,7 +12,13 @@ from .inventory import load_inventory, record_for_target
 from .models import CollectionProfile, TargetSpec
 from .names import safe_bundle_name
 from .paths import ProjectPaths
-from .review import approval_path, load_review, sha256_file, verify_approval
+from .review import (
+    approval_path,
+    load_review,
+    review_stage_sha256,
+    sha256_file,
+    verify_approval,
+)
 
 
 DIFFUSE_PROPERTIES = {"_MainTex", "_BaseMap", "_BaseColorMap"}
@@ -54,6 +60,12 @@ def _auxiliary_slots(bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
             elif slot.get("property") in GLOSS_PROPERTIES:
                 role = "gloss"
             else:
+                continue
+            if (
+                not slot.get("path_id")
+                and not slot.get("texture")
+                and not slot.get("texture_bundle_key")
+            ):
                 continue
             if not slot.get("path_id") or not slot.get("texture") or not slot.get("texture_bundle_key"):
                 raise ValueError(
@@ -167,9 +179,21 @@ def _material_mask_descriptor(
     if not isinstance(path, str) or not path or not isinstance(checksum, str) or len(checksum) != 64:
         raise ValueError(f"{key}: 재질 전용 마스크 path/SHA-256이 잘못됐어요")
     method = descriptor.get("method")
-    if method != "inpaint":
-        raise ValueError(f"{key}: 재질 마스크 method는 inpaint여야 해요")
-    return {"path": path, "sha256": checksum, "method": method}
+    if method not in {"inpaint", "patch"}:
+        raise ValueError(f"{key}: 재질 마스크 method는 inpaint 또는 patch여야 해요")
+    result = {"path": path, "sha256": checksum, "method": method}
+    if method == "patch":
+        patch_path = descriptor.get("patch")
+        patch_checksum = descriptor.get("patch_sha256")
+        if (
+            not isinstance(patch_path, str)
+            or not patch_path
+            or not isinstance(patch_checksum, str)
+            or len(patch_checksum) != 64
+        ):
+            raise ValueError(f"{key}: patch path/SHA-256이 잘못됐어요")
+        result.update({"patch": patch_path, "patch_sha256": patch_checksum})
+    return result
 
 
 def _map_record(inventory: dict[str, Any], bundle_key: str, path_id: int) -> dict[str, Any]:
@@ -196,7 +220,13 @@ def _mask(paths: ProjectPaths, descriptor: dict[str, Any], expected_size: tuple[
     return values == 255
 
 
-def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Image, dict[str, Any]]:
+def _neutralize_map(
+    source: Path,
+    mask: np.ndarray,
+    role: str,
+    *,
+    patch: np.ndarray | None = None,
+) -> tuple[Image.Image, dict[str, Any]]:
     with Image.open(source) as source_file:
         mode = source_file.mode
         image = np.asarray(source_file.convert("RGBA"), dtype=np.uint8)
@@ -210,10 +240,18 @@ def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Im
     channels = (1, 3) if role == "normal" else (0, 1, 2, 3)
     if role not in {"normal", "gloss"}:
         raise ValueError(f"지원하지 않는 보조맵 역할이에요: {role}")
-    for channel in channels:
-        output[..., channel] = cv2.inpaint(
-            image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
-        )
+    if patch is not None:
+        if patch.shape != image.shape or patch.dtype != np.uint8:
+            raise ValueError(f"{role} 복원 patch 규격이 원본과 달라요")
+        for channel in channels:
+            output[..., channel][mask] = patch[..., channel][mask]
+        method = "patch"
+    else:
+        for channel in channels:
+            output[..., channel] = cv2.inpaint(
+                image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
+            )
+        method = "inpaint"
     if role == "normal":
         # Tarkov의 DXT5nm packing에서 X=A, Y=G예요. R/B는 원본 그대로 둬요.
         x = output[..., 3].astype(np.float32) / 127.5 - 1.0
@@ -229,7 +267,7 @@ def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Im
         "changed_pixels": int(changed.sum()),
         "changed_outside_mask": int((changed & ~mask).sum()),
         "mode_preserved": mode == "RGBA",
-        "method": "inpaint",
+        "method": method,
     }
 
 
@@ -279,6 +317,7 @@ def derive_approved_materials(
         review_path, review = load_review(paths, target.id, through="material")
         bindings = _target_bindings(inventory, target, diffuse)
         material_data = review["stages"]["material_validation"]["data"]
+        material_review_sha256 = review_stage_sha256(review, "material_validation")
         graph_scope = material_data.get("graph_scope")
         if graph_scope != "resolved":
             raise ValueError(f"{target.id}: material graph_scope 판정이 없어요")
@@ -313,6 +352,7 @@ def derive_approved_materials(
                 "approved_sha256": approval["candidate_sha256"],
                 "approval_sha256": sha256_file(approval_path(paths, target.id)),
                 "review_sha256": sha256_file(review_path),
+                "material_review_sha256": material_review_sha256,
                 "material_bindings": [list(value) for value in actual_signature],
             }
         )
@@ -357,7 +397,21 @@ def derive_approved_materials(
             if material_mask is None:
                 raise AssertionError("neutralize_old_text 재질 마스크가 없어요")
             old_text = _mask(paths, material_mask, size)
-            image, metrics = _neutralize_map(source_map, old_text, slot["role"])
+            patch_values = None
+            if material_mask["method"] == "patch":
+                patch_path = (paths.root / material_mask["patch"]).resolve()
+                if sha256_file(patch_path) != material_mask["patch_sha256"]:
+                    raise ValueError(f"{target.id} {key} 복원 patch SHA-256이 달라요")
+                with Image.open(patch_path) as patch_file:
+                    if patch_file.mode != "RGBA" or patch_file.size != size:
+                        raise ValueError(f"{target.id} {key} 복원 patch 규격이 원본과 달라요")
+                    patch_values = np.asarray(patch_file, dtype=np.uint8)
+            image, metrics = _neutralize_map(
+                source_map,
+                old_text,
+                slot["role"],
+                patch=patch_values,
+            )
             if metrics["changed_outside_mask"] != 0:
                 raise AssertionError(f"{target.id} {key} 마스크 밖 픽셀이 바뀌었어요")
             if not metrics.get("mode_preserved", True):
@@ -379,8 +433,11 @@ def derive_approved_materials(
                     "approval_sha256": sha256_file(approval_path(paths, target.id)),
                     "review": str(review_path),
                     "review_sha256": sha256_file(review_path),
+                    "material_review_sha256": material_review_sha256,
                     "old_text_mask": material_mask["path"],
                     "old_text_mask_sha256": material_mask["sha256"],
+                    "restoration_patch": material_mask.get("patch"),
+                    "restoration_patch_sha256": material_mask.get("patch_sha256"),
                     "derived_png": str(destination),
                     "derived_sha256": sha256_file(destination),
                     "consumers": consumers,

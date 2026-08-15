@@ -16,7 +16,13 @@ from .inventory import load_inventory, record_for_target
 from .models import CollectionProfile
 from .names import safe_bundle_name
 from .paths import ProjectPaths
-from .review import approval_path, sha256_file, verify_approval
+from .review import (
+    approval_path,
+    load_review,
+    review_stage_sha256,
+    sha256_file,
+    verify_approval,
+)
 from .unityfs import (
     bytes_equal_outside_ranges,
     find_directory_entry,
@@ -707,6 +713,7 @@ def repack_collection(
         raise ValueError(
             f"재질 게이트를 통과하지 않은 대상이 있어요: {sorted(missing_material_validation)}"
         )
+    material_review_hashes: dict[str, str] = {}
     for target_id in sorted(expected_targets):
         value = validated[target_id]
         target = profile.target_by_id(target_id)
@@ -715,6 +722,13 @@ def repack_collection(
             raise ValueError(f"{target.id} 재질 검증 뒤 승인본이 변경됐어요")
         if value.get("approval_sha256") != sha256_file(approval_path(paths, target.id)):
             raise ValueError(f"{target.id} 재질 검증 뒤 승인 증거가 변경됐어요")
+        _, current_review = load_review(paths, target.id, through="material")
+        current_material_hash = review_stage_sha256(
+            current_review, "material_validation"
+        )
+        if value.get("material_review_sha256") != current_material_hash:
+            raise ValueError(f"{target.id} 파생 뒤 재질 검증 단계가 변경됐어요")
+        material_review_hashes[target_id] = current_material_hash
     auxiliary_plans = {
         (value.get("texture_bundle_key"), int(value.get("path_id", 0)), value.get("role")): value
         for value in derived.get("auxiliary_plans", [])
@@ -740,6 +754,7 @@ def repack_collection(
         checks = {
             "approved_sha256": sha256_file(approved),
             "approval_sha256": sha256_file(approval_path(paths, target.id)),
+            "material_review_sha256": material_review_hashes[target.id],
             "source_sha256": sha256_file(source_map),
             "derived_sha256": sha256_file(source),
         }

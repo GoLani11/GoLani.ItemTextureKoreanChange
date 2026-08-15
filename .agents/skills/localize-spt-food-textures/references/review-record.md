@@ -132,7 +132,8 @@ profile의 `exact_text`가 번역 영역에 모두 있어야 한다. 보이는 �
 `material_validation.data`에는 실제 Material binding, 공유 소비자, D/N/G별 정책, 공통 글리프
 마스크 SHA, 마스크 밖 변경 수와 조명 진단 증거를 둔다. `neutralize_old_text`인 보조맵은
 `material_masks["material::property"]`에 재질 전용 마스크의 프로젝트 상대 경로, SHA-256과
-`method: "inpaint"`를 반드시 기록한다.
+`method: "inpaint"` 또는 `method: "patch"`를 반드시 기록한다. `patch` 방식에는 복원 이미지의
+프로젝트 상대 `patch` 경로와 `patch_sha256`도 기록한다.
 
 필수 키는 `bindings`, `shared_consumers_resolved`, `text_mask_sha256`, `alignment_passed`,
 `foreign_relief_detected`, `changed_outside_masks`, `graph_scope`다. `graph_scope`는 게임

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import pytest
 
 from golani_texture_localizer.compose import _render_text_layer, compose_candidate
 from golani_texture_localizer.paths import ProjectPaths
@@ -145,6 +146,99 @@ def test_tracking_expands_one_line_without_changing_recorded_text() -> None:
     assert tracked[0]["text"] == "ABC"
     assert tracked[0]["tracking"] == 10
     assert tracked_width > compact_width
+
+
+def test_segments_keep_one_semantic_run_with_multiple_colors() -> None:
+    layer, runs = _render_text_layer(
+        (240, 80),
+        _font_path(),
+        [
+            {
+                "region_id": "brand",
+                "text": "그린 아이스",
+                "bbox": [10, 10, 230, 70],
+                "font_size": 24,
+                "fill": [220, 220, 220, 255],
+                "stroke_width": 0,
+                "segments": [
+                    {"text": "그린 ", "fill": [220, 220, 220, 255]},
+                    {"text": "아이스", "fill": [20, 180, 80, 255]},
+                ],
+            }
+        ],
+    )
+
+    values = np.asarray(layer)
+    visible = values[..., 3] > 0
+    colors = {tuple(value) for value in values[..., :3][visible]}
+    assert runs[0]["text"] == "그린 아이스"
+    assert runs[0]["segments"][0]["text"] == "그린 "
+    assert (220, 220, 220) in colors
+    assert (20, 180, 80) in colors
+
+
+def test_segments_must_concatenate_to_text() -> None:
+    with pytest.raises(ValueError, match="문구 합"):
+        _render_text_layer(
+            (240, 80),
+            _font_path(),
+            [
+                {
+                    "region_id": "brand",
+                    "text": "그린 아이스",
+                    "bbox": [10, 10, 230, 70],
+                    "font_size": 24,
+                    "fill": [220, 220, 220, 255],
+                    "stroke_width": 0,
+                    "segments": [{"text": "그린", "fill": [220, 220, 220, 255]}],
+                }
+            ],
+        )
+
+
+def test_left_middle_anchor_places_text_at_bbox_left_edge() -> None:
+    _, runs = _render_text_layer(
+        (240, 80),
+        _font_path(),
+        [
+            {
+                "region_id": "label",
+                "text": "Label",
+                "bbox": [30, 10, 220, 70],
+                "font_size": 24,
+                "fill": [220, 220, 220, 255],
+                "stroke_width": 0,
+                "anchor": "lm",
+                "align": "left",
+            }
+        ],
+    )
+
+    assert runs[0]["anchor"] == "lm"
+    assert runs[0]["rendered_bbox"][0] >= 30
+    assert runs[0]["rendered_bbox"][0] <= 32
+
+
+def test_anchor_offset_is_recorded_and_moves_glyph_inside_bbox() -> None:
+    _, runs = _render_text_layer(
+        (240, 80),
+        _font_path(),
+        [
+            {
+                "region_id": "label",
+                "text": "Italic",
+                "bbox": [30, 10, 220, 70],
+                "font_size": 24,
+                "fill": [220, 220, 220, 255],
+                "stroke_width": 0,
+                "anchor": "lm",
+                "offset": [3, 0],
+            }
+        ],
+    )
+
+    assert runs[0]["offset"] == [3.0, 0.0]
+    assert runs[0]["rendered_bbox"][0] >= 32
 
 
 def test_compose_uses_hash_pinned_restoration_only_inside_old_text(tmp_path: Path) -> None:

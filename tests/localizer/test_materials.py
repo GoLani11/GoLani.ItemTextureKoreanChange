@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from PIL import Image
 
 from golani_texture_localizer.materials import (
     _all_consumers,
     _auxiliary_slots,
     _material_mask_descriptor,
+    _neutralize_map,
     _packed_normal_lighting,
     _register_auxiliary_plan,
     _slot_consumers,
@@ -73,6 +75,34 @@ def test_actual_material_binding_keeps_shared_ratcola_maps() -> None:
         ("normal", "tar_nrm"),
         ("gloss", "tar_gloss"),
     }
+
+
+def test_unassigned_optional_auxiliary_slots_are_ignored() -> None:
+    bindings = [
+        {
+            "bundle_key": "items.bundle",
+            "material": "flat",
+            "path_id": 10,
+            "texture_slots": [
+                {
+                    "property": "_BumpMap",
+                    "file_id": 0,
+                    "path_id": 0,
+                    "texture": None,
+                    "texture_bundle_key": None,
+                },
+                {
+                    "property": "_MetallicGlossMap",
+                    "file_id": 0,
+                    "path_id": 0,
+                    "texture": None,
+                    "texture_bundle_key": None,
+                },
+            ],
+        }
+    ]
+
+    assert _auxiliary_slots(bindings) == []
 
 
 def test_shared_consumers_are_not_hidden_by_family_name() -> None:
@@ -174,3 +204,54 @@ def test_neutralize_policy_requires_explicit_material_mask() -> None:
     )
 
     assert descriptor["method"] == "inpaint"
+
+
+def test_patch_policy_requires_hash_pinned_patch() -> None:
+    with pytest.raises(ValueError, match="patch path"):
+        _material_mask_descriptor(
+            {
+                "material_masks": {
+                    "material::_SpecMap": {
+                        "path": "workspace/reviews/item/material-mask.png",
+                        "sha256": "a" * 64,
+                        "method": "patch",
+                    }
+                }
+            },
+            "material::_SpecMap",
+        )
+
+    descriptor = _material_mask_descriptor(
+        {
+            "material_masks": {
+                "material::_SpecMap": {
+                    "path": "workspace/reviews/item/material-mask.png",
+                    "sha256": "a" * 64,
+                    "method": "patch",
+                    "patch": "workspace/reviews/item/material-patch.png",
+                    "patch_sha256": "b" * 64,
+                }
+            }
+        },
+        "material::_SpecMap",
+    )
+
+    assert descriptor["patch_sha256"] == "b" * 64
+
+
+def test_neutralize_map_applies_patch_only_inside_mask(tmp_path) -> None:
+    source = np.full((4, 4, 4), 100, dtype=np.uint8)
+    source[..., 3] = 255
+    source_path = tmp_path / "source.png"
+    Image.fromarray(source, "RGBA").save(source_path)
+    patch = np.full((4, 4, 4), 200, dtype=np.uint8)
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1:3, 1:3] = True
+
+    result, metrics = _neutralize_map(source_path, mask, "gloss", patch=patch)
+    values = np.asarray(result)
+
+    assert np.all(values[mask] == 200)
+    assert np.array_equal(values[~mask], source[~mask])
+    assert metrics["changed_outside_mask"] == 0
+    assert metrics["method"] == "patch"

@@ -34,8 +34,11 @@ def test_direction_sensitive_targets_document_natural_korean_layout() -> None:
     assert profile.target_by_id("ratcola").exact_text == ("랫콜라", "샘 아저씨 특제")
     assert profile.target_by_id("herring").exact_text[0] == "태평양 청어"
     assert "자간" in profile.target_by_id("milk").notes
-    assert profile.target_by_id("green-ice").exact_text == ("그린 아이스", "녹차")
-    assert "자연스러운 어순" in profile.target_by_id("green-ice").notes
+    green_ice = profile.target_by_id("green-ice")
+    assert green_ice.exact_text[:3] == ("그린 아이스", "녹차", "영양정보")
+    assert "열량 80kcal" in green_ice.exact_text
+    assert "칼슘 2% · 철분 0%" in green_ice.exact_text
+    assert "자연스러운 어순" in green_ice.notes
     assert profile.target_by_id("peas").exact_text[-1] == "완두콩"
     assert "그린피스" in profile.target_by_id("peas").notes
 
