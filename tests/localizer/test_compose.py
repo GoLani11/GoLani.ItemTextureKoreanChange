@@ -109,6 +109,44 @@ def test_arc_text_is_rendered_deterministically_inside_approved_box() -> None:
     assert runs[0]["rendered_bbox"][2] <= 113
 
 
+def test_tracking_expands_one_line_without_changing_recorded_text() -> None:
+    _, compact = _render_text_layer(
+        (240, 80),
+        _font_path(),
+        [
+            {
+                "region_id": "compact",
+                "text": "ABC",
+                "bbox": [10, 10, 230, 70],
+                "font_size": 24,
+                "fill": [10, 20, 30, 255],
+                "stroke_width": 0,
+            }
+        ],
+    )
+    _, tracked = _render_text_layer(
+        (240, 80),
+        _font_path(),
+        [
+            {
+                "region_id": "tracked",
+                "text": "ABC",
+                "bbox": [10, 10, 230, 70],
+                "font_size": 24,
+                "fill": [10, 20, 30, 255],
+                "stroke_width": 0,
+                "tracking": 10,
+            }
+        ],
+    )
+
+    compact_width = compact[0]["rendered_bbox"][2] - compact[0]["rendered_bbox"][0]
+    tracked_width = tracked[0]["rendered_bbox"][2] - tracked[0]["rendered_bbox"][0]
+    assert tracked[0]["text"] == "ABC"
+    assert tracked[0]["tracking"] == 10
+    assert tracked_width > compact_width
+
+
 def test_compose_uses_hash_pinned_restoration_only_inside_old_text(tmp_path: Path) -> None:
     root = tmp_path / "project"
     root.mkdir()

@@ -5,11 +5,14 @@ import json
 
 import pytest
 import numpy as np
+from PIL import Image
 
 from golani_texture_localizer.ocr import (
     OcrSession,
     _deduplicate,
     _inverse_points,
+    _oriented_region_variants,
+    _otsu_threshold,
     _positions,
     reusable_ocr_report,
 )
@@ -86,6 +89,7 @@ def test_completed_ocr_report_is_reused_only_for_same_input_and_engine(tmp_path)
         "phase": "source",
         "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
         "engine_signature": Session.engine_signature,
+        "region_plan_sha256": None,
         "status": "completed",
         "errors": [],
     }
@@ -94,3 +98,37 @@ def test_completed_ocr_report_is_reused_only_for_same_input_and_engine(tmp_path)
     assert reusable_ocr_report(Session(), image, report_path) == report
     image.write_bytes(b"changed image")
     assert reusable_ocr_report(Session(), image, report_path) is None
+
+
+def test_region_ocr_crop_is_rotated_back_and_small_text_is_upscaled() -> None:
+    rgba = Image.new("RGBA", (20, 40), (40, 80, 120, 255))
+    rgba.putpixel((4, 10), (220, 220, 220, 255))
+
+    variants = _oriented_region_variants(
+        rgba,
+        {"bbox": [2, 4, 8, 24], "rotation_deg": 90},
+        ["white", "black"],
+        alpha_semantics="material",
+    )
+
+    assert [name.split(":", 1)[0] for name, _ in variants] == ["rgb", "rgb"]
+    assert variants[0][1].shape == (24, 80, 3)
+    assert variants[1][1].shape == (24, 80, 3)
+
+
+def test_otsu_threshold_separates_dark_text_from_light_background() -> None:
+    grayscale = np.full((20, 20), 210, dtype=np.uint8)
+    grayscale[5:15, 8:12] = 45
+
+    threshold = _otsu_threshold(grayscale)
+
+    assert 45 <= threshold < 210
+
+
+def test_region_ocr_crop_rejects_non_right_angle_rotation() -> None:
+    with pytest.raises(ValueError, match="90도"):
+        _oriented_region_variants(
+            Image.new("RGBA", (20, 40), "white"),
+            {"bbox": [2, 4, 8, 24], "rotation_deg": 45},
+            ["white"],
+        )

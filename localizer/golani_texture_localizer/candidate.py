@@ -18,6 +18,7 @@ from .bundles import (
 )
 from .inventory import load_inventory, record_for_target
 from .models import TargetSpec
+from .ocr import _region_plan_sha256
 from .paths import ProjectPaths
 from .review import load_review, sha256_file
 
@@ -89,6 +90,31 @@ def _bbox_overlap(mask: np.ndarray, bbox: Any) -> float:
     return float(mask[y0:y1, x0:x1].mean())
 
 
+def _ocr_requirement_counts(
+    translations: list[dict[str, Any]],
+    glyph_ocr_capable: dict[str, bool],
+) -> tuple[dict[str, int], dict[str, int]]:
+    expected_counts: dict[str, int] = {}
+    explicit_occurrences: dict[str, int] = {}
+    explicit_required: dict[str, int] = {}
+    for region in translations:
+        text = str(region.get("final_text_ko", ""))
+        occurrences = int(region.get("occurrences", 0))
+        expected_counts[text] = expected_counts.get(text, 0) + occurrences
+        required = region.get("ocr_required")
+        if isinstance(required, bool):
+            explicit_occurrences[text] = explicit_occurrences.get(text, 0) + occurrences
+            if required:
+                explicit_required[text] = explicit_required.get(text, 0) + occurrences
+    required_counts = {}
+    for text, expected in expected_counts.items():
+        unspecified = expected - explicit_occurrences.get(text, 0)
+        required_counts[text] = explicit_required.get(text, 0) + (
+            unspecified if glyph_ocr_capable.get(text, False) else 0
+        )
+    return expected_counts, required_counts
+
+
 def _comparison_sheet(
     source: np.ndarray,
     candidate: np.ndarray,
@@ -119,6 +145,71 @@ def _comparison_sheet(
         sheet.paste(panel, (index * width, label_height))
         draw.text((index * width + 12, 12), label, font=font, fill="white")
     draw.text((sheet.width - 12, 12), target_id, font=font, fill="#9aa0a6", anchor="ra")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output, format="PNG", optimize=False)
+
+
+def _region_comparison_sheet(
+    source: np.ndarray,
+    candidate: np.ndarray,
+    regions: list[dict[str, Any]],
+    output: Path,
+) -> None:
+    source_image = Image.fromarray(source[..., :3], "RGB")
+    candidate_image = Image.fromarray(candidate[..., :3], "RGB")
+    rows: list[tuple[str, Image.Image, Image.Image]] = []
+    for index, region in enumerate(regions):
+        bbox = region.get("bbox")
+        if (
+            not isinstance(bbox, list)
+            or len(bbox) != 4
+            or not all(isinstance(value, int) for value in bbox)
+        ):
+            continue
+        x0, y0, x1, y1 = bbox
+        if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0 or x1 > source_image.width or y1 > source_image.height:
+            continue
+        source_crop = source_image.crop((x0, y0, x1, y1))
+        candidate_crop = candidate_image.crop((x0, y0, x1, y1))
+        rotation = float(region.get("rotation_deg", 0))
+        if rotation:
+            source_crop = source_crop.rotate(
+                rotation,
+                expand=True,
+                resample=Image.Resampling.BICUBIC,
+            )
+            candidate_crop = candidate_crop.rotate(
+                rotation,
+                expand=True,
+                resample=Image.Resampling.BICUBIC,
+            )
+        scale = max(1, min(5, math.ceil(144 / max(1, candidate_crop.height))))
+        if scale > 1:
+            size = (candidate_crop.width * scale, candidate_crop.height * scale)
+            source_crop = source_crop.resize(size, Image.Resampling.LANCZOS)
+            candidate_crop = candidate_crop.resize(size, Image.Resampling.LANCZOS)
+        rows.append(
+            (
+                str(region.get("region_id", f"region-{index + 1:03d}")),
+                source_crop,
+                candidate_crop,
+            )
+        )
+    if not rows:
+        raise ValueError("후보 영역 비교 시트에 넣을 번역 bbox가 없어요")
+    label_height = 26
+    gap = 12
+    width = max(left.width + gap + right.width for _, left, right in rows)
+    height = sum(max(left.height, right.height) + label_height + gap for _, left, right in rows)
+    sheet = Image.new("RGB", (width, height), "#202124")
+    draw = ImageDraw.Draw(sheet)
+    y = 0
+    for label, left, right in rows:
+        draw.text((6, y + 5), f"{label} | source / candidate", fill="#f1f3f4")
+        row_y = y + label_height
+        sheet.paste(left, (0, row_y))
+        sheet.paste(right, (left.width + gap, row_y))
+        y += max(left.height, right.height) + label_height + gap
     output.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(output, format="PNG", optimize=False)
 
@@ -269,15 +360,6 @@ def audit_candidate(
         **mip_metrics,
     }
     translations = review["stages"]["translation"]["data"].get("regions", [])
-    expected_counts: dict[str, int] = {}
-    explicit_ocr_required: dict[str, bool | None] = {}
-    for region in translations:
-        text = str(region.get("final_text_ko", ""))
-        expected_counts[text] = expected_counts.get(text, 0) + int(region.get("occurrences", 0))
-        required_value = region.get("ocr_required")
-        explicit_ocr_required[text] = (
-            required_value if isinstance(required_value, bool) else explicit_ocr_required.get(text)
-        )
     glyph_counts: dict[str, int] = {}
     glyph_ocr_capable: dict[str, bool] = {}
     for run in glyph.get("glyph_runs", []):
@@ -286,28 +368,36 @@ def audit_candidate(
         glyph_ocr_capable[text] = glyph_ocr_capable.get(text, False) or (
             int(run.get("font_size", 0)) >= 12 and run.get("arc") is None
         )
-    ocr_required = {
-        text: (
-            explicit_ocr_required[text]
-            if explicit_ocr_required.get(text) is not None
-            else glyph_ocr_capable.get(text, False)
-        )
-        for text in expected_counts
-    }
+    expected_counts, ocr_required_counts = _ocr_requirement_counts(
+        translations, glyph_ocr_capable
+    )
+    required_translation_regions = [
+        region
+        for region in translations
+        if isinstance(region, dict) and region.get("ocr_required") is True
+    ]
+    expected_region_plan_sha256 = (
+        _region_plan_sha256(required_translation_regions)
+        if required_translation_regions
+        else None
+    )
+    if ocr.get("region_plan_sha256") != expected_region_plan_sha256:
+        raise ValueError("후보 OCR의 방향별 영역 계획이 현재 번역 기록과 달라요")
+    ocr_required = {text: count > 0 for text, count in ocr_required_counts.items()}
     recipe_matched = glyph_counts == expected_counts
     detections = [value for value in ocr.get("detections", []) if isinstance(value, dict)]
     recognized_tokens = [_normalize_text(value.get("text", "")) for value in detections]
     recognized = "".join(recognized_tokens)
-    ocr_counts = {
+    full_image_ocr_counts = {
         text: recognized.count(_normalize_text(text)) if _normalize_text(text) else 0
         for text in expected_counts
     }
-    for text, count in list(ocr_counts.items()):
+    for text, count in list(full_image_ocr_counts.items()):
         normalized = _normalize_text(text)
         if count:
             continue
         minimum = max(3, math.ceil(len(normalized) * 0.75))
-        ocr_counts[text] = sum(
+        full_image_ocr_counts[text] = sum(
             1
             for token in recognized_tokens
             if len(token) >= minimum
@@ -318,19 +408,36 @@ def audit_candidate(
                 or token.endswith(normalized)
             )
         )
+    region_results = {
+        str(value.get("region_id")): value
+        for value in ocr.get("region_ocr", [])
+        if isinstance(value, dict)
+    }
+    region_ocr_complete = bool(required_translation_regions) and all(
+        str(region.get("region_id")) in region_results
+        for region in required_translation_regions
+    )
+    if region_ocr_complete:
+        ocr_counts = {text: 0 for text in expected_counts}
+        for region in required_translation_regions:
+            result = region_results[str(region["region_id"])]
+            if result.get("matched") is True:
+                text = str(region.get("final_text_ko", ""))
+                ocr_counts[text] += int(region.get("occurrences", 0))
+    else:
+        ocr_counts = full_image_ocr_counts
     ocr_expected_matched = all(
-        ocr_counts[text] >= count
-        for text, count in expected_counts.items()
-        if ocr_required[text]
+        ocr_counts[text] >= count for text, count in ocr_required_counts.items()
     )
     ocr_deferred_to_visual = [
         {
             "text": text,
             "expected_count": count,
+            "ocr_required_count": ocr_required_counts[text],
             "ocr_count": ocr_counts[text],
         }
         for text, count in expected_counts.items()
-        if not ocr_required[text] and ocr_counts[text] < count
+        if ocr_required_counts[text] < count and ocr_counts[text] < count
     ]
     expected_with_latin = [
         _normalize_text(text)
@@ -387,10 +494,18 @@ def audit_candidate(
         "recipe_expected_text_matched": recipe_matched,
         "ocr_expected_text_matched": ocr_expected_matched,
         "ocr_required": ocr_required,
+        "ocr_required_counts": ocr_required_counts,
         "ocr_deferred_to_visual": ocr_deferred_to_visual,
         "expected_counts": expected_counts,
         "glyph_counts": glyph_counts,
         "ocr_counts": ocr_counts,
+        "full_image_ocr_counts": full_image_ocr_counts,
+        "oriented_region_ocr_complete": region_ocr_complete,
+        "oriented_region_ocr": [
+            region_results[str(region["region_id"])]
+            for region in required_translation_regions
+            if str(region.get("region_id")) in region_results
+        ],
         "foreign_detections_in_editable": foreign_detections,
         "ambiguous_foreign_detections": ambiguous_foreign_detections,
         "allowed_foreign_detections": allowed_foreign_detections,
@@ -419,6 +534,8 @@ def audit_candidate(
     }
     comparison_path = target_dir / "candidate-comparison.png"
     _comparison_sheet(source, candidate, masks["editable"], comparison_path, target.id)
+    region_comparison_path = target_dir / "candidate-region-comparison.png"
+    _region_comparison_sheet(source, candidate, translations, region_comparison_path)
     outputs = {
         "edit_plan": target_dir / "edit-plan-data.json",
         "candidate_validation": target_dir / "candidate-validation-data.json",
@@ -451,6 +568,7 @@ def audit_candidate(
         "passed": passed,
         "requires_codex_visual_review": True,
         "comparison_sheet": str(comparison_path),
+        "region_comparison_sheet": str(region_comparison_path),
         "reports": {key: str(value) for key, value in outputs.items()},
         "candidate_validation": candidate_data,
         "post_ocr": post_ocr_data,

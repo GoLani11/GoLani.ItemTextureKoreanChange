@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .paths import ProjectPaths
 from .review import sha256_file
@@ -71,9 +71,66 @@ def _shape_mask(size: tuple[int, int], shape: dict[str, Any], index: int) -> np.
         else:
             angle_selected = (angle >= start) | (angle <= end)
         return (distance >= inner) & (distance <= outer) & angle_selected
+    elif kind == "text":
+        bbox = shape.get("bbox")
+        text = shape.get("text")
+        font_value = shape.get("font")
+        font_size = int(shape.get("font_size", 0))
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            raise ValueError(f"regions[{index}].bbox가 [x0,y0,x1,y1]이 아니에요")
+        x0, y0, x1, y1 = [int(value) for value in bbox]
+        if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0 or x1 > size[0] or y1 > size[1]:
+            raise ValueError(f"regions[{index}].bbox가 원본 밖이에요")
+        if not isinstance(text, str) or not text or not isinstance(font_value, str) or font_size < 1:
+            raise ValueError(f"regions[{index}] text/font/font_size가 잘못됐어요")
+        font_path = Path(font_value).expanduser().resolve()
+        if not font_path.is_file():
+            raise FileNotFoundError(font_path)
+        if sha256_file(font_path) != shape.get("font_sha256"):
+            raise ValueError(f"regions[{index}] 글꼴 SHA-256이 달라요")
+        stroke_width = int(shape.get("stroke_width", 0))
+        spacing = int(shape.get("spacing", 4))
+        if stroke_width < 0 or spacing < 0:
+            raise ValueError(f"regions[{index}] stroke_width/spacing이 잘못됐어요")
+        font = ImageFont.truetype(str(font_path), font_size)
+        center = ((x0 + x1) / 2, (y0 + y1) / 2)
+        draw.multiline_text(
+            center,
+            text,
+            font=font,
+            fill=255,
+            anchor="mm",
+            align=str(shape.get("align", "center")),
+            spacing=spacing,
+            stroke_width=stroke_width,
+            stroke_fill=255,
+        )
+        rotation = float(shape.get("rotation_deg", 0))
+        if rotation:
+            image = image.rotate(
+                -rotation,
+                resample=Image.Resampling.BICUBIC,
+                expand=False,
+                center=center,
+            )
+        values = np.asarray(image, dtype=np.uint8) > 0
+        ys, xs = np.nonzero(values)
+        if not len(xs):
+            raise ValueError(f"regions[{index}] text 글리프가 렌더되지 않았어요")
+        rendered_bbox = [int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)]
+        if (
+            rendered_bbox[0] < x0
+            or rendered_bbox[1] < y0
+            or rendered_bbox[2] > x1
+            or rendered_bbox[3] > y1
+        ):
+            raise ValueError(
+                f"regions[{index}] text 글리프 {rendered_bbox}가 승인 bbox {bbox}를 벗어났어요"
+            )
+        return values
     else:
         raise ValueError(
-            f"regions[{index}].kind는 rectangle, polygon 또는 annulus_sector여야 해요"
+            f"regions[{index}].kind는 rectangle, polygon, annulus_sector 또는 text여야 해요"
         )
     return np.asarray(image, dtype=np.uint8) == 255
 
@@ -100,6 +157,28 @@ def _color_selection(rgb: np.ndarray, condition: Any, index: int) -> np.ndarray:
             for target in targets
         ]
         selected &= np.minimum.reduce(distances) <= tolerance
+    if "rgb_reference" in condition:
+        reference = condition["rgb_reference"]
+        minimum = condition.get("rgb_distance_min")
+        maximum = condition.get("rgb_distance_max")
+        if (
+            not isinstance(reference, list)
+            or len(reference) != 3
+            or any(not isinstance(value, (int, float)) for value in reference)
+            or any(float(value) < 0 or float(value) > 255 for value in reference)
+            or (minimum is None and maximum is None)
+            or (minimum is not None and float(minimum) < 0)
+            or (maximum is not None and float(maximum) < 0)
+        ):
+            raise ValueError(f"regions[{index}] RGB 기준 거리 조건이 잘못됐어요")
+        distance = np.linalg.norm(
+            rgb.astype(np.float32) - np.asarray(reference, dtype=np.float32),
+            axis=2,
+        )
+        if minimum is not None:
+            selected &= distance >= float(minimum)
+        if maximum is not None:
+            selected &= distance <= float(maximum)
     luminance = (
         rgb[..., 0].astype(np.float32) * 0.2126
         + rgb[..., 1].astype(np.float32) * 0.7152
@@ -109,7 +188,10 @@ def _color_selection(rgb: np.ndarray, condition: Any, index: int) -> np.ndarray:
         selected &= luminance >= float(condition["luminance_min"])
     if "luminance_max" in condition:
         selected &= luminance <= float(condition["luminance_max"])
-    if not any(key in condition for key in ("rgb_targets", "luminance_min", "luminance_max")):
+    if not any(
+        key in condition
+        for key in ("rgb_targets", "rgb_reference", "luminance_min", "luminance_max")
+    ):
         raise ValueError(f"regions[{index}]에 지원하는 색 조건이 없어요")
     return selected
 
@@ -141,11 +223,27 @@ def create_old_text_mask(
         raise ValueError("regions가 비어 있어요")
     combined = np.zeros((size[1], size[0]), dtype=bool)
     region_reports = []
+    selection_sources: dict[Path, np.ndarray] = {source_path: rgb}
     for index, region in enumerate(regions):
         if not isinstance(region, dict):
             raise ValueError(f"regions[{index}]가 객체가 아니에요")
         shape = _shape_mask(size, region, index)
-        selected = shape & _color_selection(rgb, region.get("condition"), index)
+        selection_value = region.get("selection_source")
+        selection_path = source_path
+        if selection_value is not None:
+            selection_path = _read_path(selection_value, f"regions[{index}] 선택 원본")
+            if sha256_file(selection_path) != region.get("selection_source_sha256"):
+                raise ValueError(f"regions[{index}] 선택 원본 SHA-256이 달라요")
+            if selection_path not in selection_sources:
+                with Image.open(selection_path) as selection_file:
+                    if selection_file.size != size:
+                        raise ValueError(f"regions[{index}] 선택 원본 규격이 원본과 달라요")
+                    selection_sources[selection_path] = np.asarray(
+                        selection_file.convert("RGB"), dtype=np.uint8
+                    )
+        selected = shape & _color_selection(
+            selection_sources[selection_path], region.get("condition"), index
+        )
         dilation = int(region.get("dilate", 0))
         if dilation < 0:
             raise ValueError(f"regions[{index}].dilate는 0 이상이어야 해요")
@@ -157,6 +255,11 @@ def create_old_text_mask(
                 dtype=np.uint8,
             ) == 255
             selected &= shape
+        exclude_seam_guard = region.get("exclude_seam_guard", False)
+        if not isinstance(exclude_seam_guard, bool):
+            raise ValueError(f"regions[{index}].exclude_seam_guard가 bool이 아니에요")
+        if exclude_seam_guard:
+            selected &= ~seam
         if not selected.any():
             raise ValueError(f"regions[{index}] 색 조건에 선택된 픽셀이 없어요")
         if np.any(selected & seam):
@@ -166,6 +269,9 @@ def create_old_text_mask(
             {
                 "region_id": str(region.get("region_id", f"mask-{index + 1:03d}")),
                 "selected_pixels": int(selected.sum()),
+                "excluded_seam_guard": exclude_seam_guard,
+                "selection_source": str(selection_path),
+                "selection_source_sha256": sha256_file(selection_path),
             }
         )
     output_stem = recipe.get("output_stem", "old-text-mask")

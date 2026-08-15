@@ -15,6 +15,7 @@
     "candidate": [["ko", "en"], ["ru", "en"]]
   },
   "rotations_clockwise": [0, 90, 180, 270],
+  "alpha_semantics": "material",
   "alpha_backgrounds": ["white", "black"],
   "tile_size": 1536,
   "tile_overlap": 192,

@@ -5,6 +5,7 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import sys
 
 from .bundles import repack_collection
 from .candidate import audit_candidate
@@ -110,9 +111,13 @@ def _parser() -> argparse.ArgumentParser:
     legacy_sheets.add_argument("--target", action="append", dest="target_ids")
 
     subparsers.add_parser("validate", help="승인된 전체 이미지의 크기·알파·변경 여부를 검사해요")
-    subparsers.add_parser("derive", help="승인된 diffuse를 기준으로 normal·gloss 인쇄 위치를 이식해요")
+    derive = subparsers.add_parser(
+        "derive", help="승인된 diffuse를 기준으로 normal·gloss 인쇄 위치를 이식해요"
+    )
+    derive.add_argument("--target", action="append", dest="target_ids")
     repack = subparsers.add_parser("repack", help="승인된 이미지만 원본 UnityFS payload에 패치해요")
     repack.add_argument("--max-mae", type=float, default=6.0)
+    repack.add_argument("--target", action="append", dest="target_ids")
     subparsers.add_parser("release", help="모든 렌더·밉·번들 검증을 통과한 해시 고정본을 만들어요")
     deploy = subparsers.add_parser("deploy", help="검증된 release만 설치 계획 또는 실제 설치로 적용해요")
     deploy.add_argument("--release", default="latest")
@@ -129,7 +134,27 @@ def _context(args: argparse.Namespace):
     return profile, paths
 
 
+def _candidate_ocr_regions(paths: ProjectPaths, target_id: str) -> list[dict] | None:
+    path = paths.reviews / target_id / "review.json"
+    if not path.is_file():
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    translation = record.get("stages", {}).get("translation", {})
+    regions = translation.get("data", {}).get("regions", [])
+    if translation.get("status") != "pass" or not isinstance(regions, list):
+        return None
+    selected = [
+        region
+        for region in regions
+        if isinstance(region, dict) and region.get("ocr_required") is True
+    ]
+    return selected or None
+
+
 def _print(value) -> None:
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if callable(reconfigure):
+        reconfigure(encoding="utf-8", errors="strict")
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
@@ -194,8 +219,17 @@ def main(argv: list[str] | None = None) -> None:
                     )
                     continue
                 output = paths.reviews / target.id / report_name
-                cached = None if args.force else reusable_ocr_report(session, image, output)
-                result = cached or session.run(image, output)
+                regions = (
+                    _candidate_ocr_regions(paths, target.id)
+                    if args.phase == "candidate"
+                    else None
+                )
+                cached = (
+                    None
+                    if args.force
+                    else reusable_ocr_report(session, image, output, regions=regions)
+                )
+                result = cached or session.run(image, output, regions=regions)
                 reports.append(
                     {
                         "target_id": target.id,
@@ -238,7 +272,12 @@ def main(argv: list[str] | None = None) -> None:
             if args.output
             else paths.reviews / target.id / f"{args.phase}-ocr.json"
         )
-        result = run_ocr(paths.root, image, output, phase=args.phase)
+        regions = (
+            _candidate_ocr_regions(paths, target.id)
+            if args.phase == "candidate"
+            else None
+        )
+        result = run_ocr(paths.root, image, output, phase=args.phase, regions=regions)
         _print(
             {
                 "target_id": target.id,
@@ -376,10 +415,16 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "derive":
-        _print(derive_approved_materials(profile, paths))
+        if args.target_ids:
+            for target_id in args.target_ids:
+                profile.target_by_id(target_id)
+        _print(derive_approved_materials(profile, paths, target_ids=args.target_ids))
         return
 
     if args.command == "repack":
+        if args.target_ids:
+            for target_id in args.target_ids:
+                profile.target_by_id(target_id)
         bundle_root = game_bundle_root(args.spt_root)
         _print(
             repack_collection(
@@ -387,6 +432,7 @@ def main(argv: list[str] | None = None) -> None:
                 paths,
                 bundle_root,
                 max_mae=args.max_mae,
+                target_ids=args.target_ids,
             )
         )
         return

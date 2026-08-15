@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from golani_texture_localizer.candidate import _bbox_overlap, _mip_seam_metrics, _normalize_text
+from golani_texture_localizer.candidate import (
+    _bbox_overlap,
+    _mip_seam_metrics,
+    _normalize_text,
+    _ocr_requirement_counts,
+)
 
 
 def test_text_normalization_keeps_hangul_and_removes_spacing() -> None:
@@ -50,3 +55,21 @@ def test_mip_seam_metrics_accepts_distant_change() -> None:
     report = _mip_seam_metrics(source, candidate, seam, 2)
 
     assert report["mip_seam_changed_pixels"] == 0
+
+
+def test_ocr_requirements_can_mix_printed_and_embossed_occurrences() -> None:
+    translations = [
+        {"final_text_ko": "아쿠아마리", "occurrences": 1, "ocr_required": True},
+        {"final_text_ko": "아쿠아마리", "occurrences": 1, "ocr_required": True},
+        {"final_text_ko": "아쿠아마리", "occurrences": 1, "ocr_required": False},
+        {"final_text_ko": "아쿠아마리", "occurrences": 1, "ocr_required": False},
+        {"final_text_ko": "정수 기술", "occurrences": 2},
+    ]
+
+    expected, required = _ocr_requirement_counts(
+        translations,
+        {"아쿠아마리": True, "정수 기술": True},
+    )
+
+    assert expected == {"아쿠아마리": 4, "정수 기술": 2}
+    assert required == {"아쿠아마리": 2, "정수 기술": 2}

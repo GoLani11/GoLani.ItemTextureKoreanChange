@@ -233,12 +233,43 @@ def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Im
     }
 
 
-def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -> dict[str, Any]:
+def _packed_normal_lighting(
+    image: np.ndarray,
+    light: tuple[float, float, float],
+) -> np.ndarray:
+    if image.ndim != 3 or image.shape[2] != 4:
+        raise ValueError("normal 조명 진단 입력은 RGBA여야 해요")
+    light_vector = np.asarray(light, dtype=np.float32)
+    length = float(np.linalg.norm(light_vector))
+    if length == 0:
+        raise ValueError("normal 조명 방향 벡터가 0이에요")
+    light_vector /= length
+    x = image[..., 3].astype(np.float32) / 127.5 - 1.0
+    y = image[..., 1].astype(np.float32) / 127.5 - 1.0
+    z = np.sqrt(np.maximum(0.0, 1.0 - x * x - y * y))
+    normal_length = np.maximum(1e-6, np.sqrt(x * x + y * y + z * z))
+    shade = (
+        x / normal_length * light_vector[0]
+        + y / normal_length * light_vector[1]
+        + z / normal_length * light_vector[2]
+    )
+    value = np.clip(np.round((shade * 0.5 + 0.5) * 255.0), 0, 255).astype(np.uint8)
+    return np.repeat(value[..., None], 3, axis=2)
+
+
+def derive_approved_materials(
+    profile: CollectionProfile,
+    paths: ProjectPaths,
+    *,
+    target_ids: list[str] | None = None,
+) -> dict[str, Any]:
     inventory = load_inventory(paths.inventory)
     outputs: list[dict[str, Any]] = []
     validated_targets: list[dict[str, Any]] = []
     auxiliary_plans: dict[tuple[str, int, str], dict[str, Any]] = {}
     for target in profile.targets:
+        if target_ids is not None and target.id not in target_ids:
+            continue
         approved = paths.approved / f"{target.id}.png"
         if target.action != "localize" or not approved.is_file():
             continue
@@ -359,6 +390,8 @@ def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -
     payload = {
         "schema_version": 2,
         "collection": profile.id,
+        "partial": target_ids is not None,
+        "target_ids": sorted(set(target_ids)) if target_ids is not None else None,
         "derived_count": len(outputs),
         "validated_targets": validated_targets,
         "auxiliary_plans": [

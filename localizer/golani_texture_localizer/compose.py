@@ -73,6 +73,9 @@ def _render_text_layer(
         layer = Image.new("RGBA", size, (0, 0, 0, 0))
         center = ((x0 + x1) / 2, (y0 + y1) / 2)
         spacing = int(region.get("spacing", 4))
+        tracking = float(region.get("tracking", 0))
+        if tracking < 0:
+            raise ValueError(f"text_regions[{index}].tracking은 0 이상이어야 해요")
         arc = region.get("arc")
         rotation = float(region.get("rotation_deg", 0))
         if arc is not None:
@@ -134,17 +137,38 @@ def _render_text_layer(
                 )
         else:
             draw = ImageDraw.Draw(layer)
-            draw.multiline_text(
-                center,
-                text,
-                font=font,
-                fill=fill,
-                anchor="mm",
-                align=str(region.get("align", "center")),
-                spacing=spacing,
-                stroke_width=stroke_width,
-                stroke_fill=stroke_fill,
-            )
+            if tracking:
+                if "\n" in text:
+                    raise ValueError(
+                        f"text_regions[{index}] tracking은 한 줄 문구에만 사용할 수 있어요"
+                    )
+                advances = [max(0.0, float(font.getlength(character))) for character in text]
+                total_width = sum(advances) + tracking * max(0, len(text) - 1)
+                cursor = center[0] - total_width / 2
+                for character, advance in zip(text, advances, strict=True):
+                    if not character.isspace():
+                        draw.text(
+                            (cursor + advance / 2, center[1]),
+                            character,
+                            font=font,
+                            fill=fill,
+                            anchor="mm",
+                            stroke_width=stroke_width,
+                            stroke_fill=stroke_fill,
+                        )
+                    cursor += advance + tracking
+            else:
+                draw.multiline_text(
+                    center,
+                    text,
+                    font=font,
+                    fill=fill,
+                    anchor="mm",
+                    align=str(region.get("align", "center")),
+                    spacing=spacing,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_fill,
+                )
             if rotation:
                 layer = layer.rotate(
                     -rotation,
@@ -180,6 +204,7 @@ def _render_text_layer(
                 "rotation_deg": rotation,
                 "align": str(region.get("align", "center")),
                 "spacing": spacing,
+                "tracking": tracking,
                 "arc": arc,
             }
         )

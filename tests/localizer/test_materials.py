@@ -1,14 +1,36 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from golani_texture_localizer.materials import (
     _all_consumers,
     _auxiliary_slots,
     _material_mask_descriptor,
+    _packed_normal_lighting,
     _register_auxiliary_plan,
     _slot_consumers,
 )
+
+
+def test_packed_normal_lighting_uses_alpha_and_green_channels() -> None:
+    flat = np.full((2, 2, 4), 128, dtype=np.uint8)
+    flat[..., 0] = 3
+    flat[..., 2] = 250
+    tilted = flat.copy()
+    tilted[0, 0, 3] = 220
+
+    flat_lighting = _packed_normal_lighting(flat, (1.0, 0.0, 1.0))
+    tilted_lighting = _packed_normal_lighting(tilted, (1.0, 0.0, 1.0))
+
+    assert np.all(flat_lighting[..., 0] == flat_lighting[..., 1])
+    assert tilted_lighting[0, 0, 0] != flat_lighting[0, 0, 0]
+    assert np.array_equal(tilted_lighting[1, 1], flat_lighting[1, 1])
+
+
+def test_packed_normal_lighting_rejects_zero_light() -> None:
+    with pytest.raises(ValueError, match="0"):
+        _packed_normal_lighting(np.zeros((1, 1, 4), dtype=np.uint8), (0.0, 0.0, 0.0))
 
 
 def test_actual_material_binding_keeps_shared_ratcola_maps() -> None:

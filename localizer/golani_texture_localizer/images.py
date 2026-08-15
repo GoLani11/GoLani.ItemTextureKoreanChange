@@ -168,11 +168,18 @@ def _structure_overlap(source_rgb: np.ndarray, edited_rgb: np.ndarray) -> dict[s
     return report
 
 
-def validate_approved(profile: CollectionProfile, paths: ProjectPaths) -> dict[str, Any]:
+def validate_approved(
+    profile: CollectionProfile,
+    paths: ProjectPaths,
+    *,
+    target_ids: list[str] | None = None,
+) -> dict[str, Any]:
     inventory = load_inventory(paths.inventory)
     reports = []
     missing = []
     for target in profile.targets:
+        if target_ids is not None and target.id not in target_ids:
+            continue
         if target.action == "preserve":
             reports.append(
                 {
@@ -201,14 +208,17 @@ def validate_approved(profile: CollectionProfile, paths: ProjectPaths) -> dict[s
     payload = {
         "schema_version": 2,
         "collection": profile.id,
-        "target_count": len(profile.targets),
+        "target_count": len(reports) + len(missing),
+        "partial": target_ids is not None,
+        "target_ids": sorted(target_ids) if target_ids is not None else None,
         "approved_count": sum(report.get("action") != "preserve" for report in reports),
         "preserved_count": sum(report.get("action") == "preserve" for report in reports),
         "missing": missing,
         "passed": not missing and all(report["passed"] for report in reports),
         "reports": reports,
     }
-    destination = paths.reports / "approved.json"
+    suffix = "" if target_ids is None else "." + "+".join(sorted(target_ids))
+    destination = paths.reports / f"approved{suffix}.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return payload

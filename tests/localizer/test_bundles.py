@@ -6,9 +6,22 @@ from PIL import Image
 
 from golani_texture_localizer.bundles import (
     _coverage_values,
+    _roundtrip_limits,
     _sha256_file,
     _verified_source_bundle,
 )
+
+
+def test_gloss_8px_roundtrip_limit_uses_noop_calibration() -> None:
+    mae, p99, maximum = _roundtrip_limits("gloss", 8, 8, 6.0)
+
+    assert mae == 8.0
+    assert p99 == 64.0
+    assert maximum == 128.0
+
+
+def test_gloss_16px_roundtrip_limit_keeps_default() -> None:
+    assert _roundtrip_limits("gloss", 16, 16, 6.0)[0] == 6.0
 
 
 def test_source_bundle_must_match_inventory_hash(tmp_path: Path) -> None:

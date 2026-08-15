@@ -198,9 +198,15 @@ def _variants(path: Path, config: Mapping[str, Any]) -> Iterable[Variant]:
     with Image.open(path) as loaded:
         rgba = loaded.convert("RGBA")
         alpha = rgba.getchannel("A")
-        backgrounds = ["opaque"] if alpha.getextrema() == (255, 255) else config["alpha_backgrounds"]
+        backgrounds = (
+            ["rgb"]
+            if config.get("alpha_semantics") == "material"
+            else ["opaque"]
+            if alpha.getextrema() == (255, 255)
+            else config["alpha_backgrounds"]
+        )
         for background in backgrounds:
-            if background == "opaque":
+            if background in {"opaque", "rgb"}:
                 rgb_image = rgba.convert("RGB")
             else:
                 value = 255 if background == "white" else 0
@@ -259,6 +265,112 @@ def _bbox(polygon: list[list[float]], image_size: tuple[int, int]) -> list[int]:
 
 def _normalize(text: str) -> str:
     return "".join(char.casefold() for char in unicodedata.normalize("NFC", text) if char.isalnum())
+
+
+def _region_plan_sha256(regions: Iterable[Mapping[str, Any]] | None) -> str | None:
+    if regions is None:
+        return None
+    packed = json.dumps(
+        list(regions),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(packed.encode("utf-8")).hexdigest()
+
+
+def _otsu_threshold(grayscale: np.ndarray) -> int:
+    histogram = np.bincount(grayscale.reshape(-1), minlength=256).astype(np.float64)
+    total = float(histogram.sum())
+    if total == 0:
+        return 127
+    weighted_total = float(np.dot(np.arange(256, dtype=np.float64), histogram))
+    background_weight = 0.0
+    background_sum = 0.0
+    best_variance = -1.0
+    best_threshold = 127
+    for threshold in range(255):
+        background_weight += histogram[threshold]
+        if background_weight == 0:
+            continue
+        foreground_weight = total - background_weight
+        if foreground_weight == 0:
+            break
+        background_sum += threshold * histogram[threshold]
+        background_mean = background_sum / background_weight
+        foreground_mean = (weighted_total - background_sum) / foreground_weight
+        variance = background_weight * foreground_weight * (background_mean - foreground_mean) ** 2
+        if variance > best_variance:
+            best_variance = variance
+            best_threshold = threshold
+    return best_threshold
+
+
+def _oriented_region_variants(
+    rgba: Image.Image,
+    region: Mapping[str, Any],
+    backgrounds: Iterable[str],
+    *,
+    alpha_semantics: str = "opacity",
+) -> list[tuple[str, np.ndarray]]:
+    bbox = region.get("bbox")
+    rotation = region.get("rotation_deg", 0)
+    if (
+        not isinstance(bbox, list)
+        or len(bbox) != 4
+        or not all(isinstance(value, int) for value in bbox)
+        or not isinstance(rotation, (int, float))
+    ):
+        raise ValueError("OCR 영역의 bbox/rotation_deg가 잘못됐어요")
+    x0, y0, x1, y1 = bbox
+    if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0 or x1 > rgba.width or y1 > rgba.height:
+        raise ValueError("OCR 영역 bbox가 이미지 밖이에요")
+    if float(rotation) % 90:
+        raise ValueError("OCR 영역 회전은 90도 단위여야 해요")
+
+    crop = rgba.crop((x0, y0, x1, y1))
+    if float(rotation) % 360:
+        crop = crop.rotate(
+            float(rotation),
+            expand=True,
+            resample=Image.Resampling.BICUBIC,
+        )
+    scale = max(1, min(4, math.ceil(72 / max(1, crop.height))))
+    if scale > 1:
+        crop = crop.resize(
+            (crop.width * scale, crop.height * scale),
+            Image.Resampling.LANCZOS,
+        )
+
+    variants: list[tuple[str, np.ndarray]] = []
+    alpha = crop.getchannel("A")
+    selected_backgrounds = (
+        ["rgb"]
+        if alpha_semantics == "material"
+        else ["opaque"]
+        if alpha.getextrema() == (255, 255)
+        else list(backgrounds)
+    )
+    for background in selected_backgrounds:
+        if background in {"opaque", "rgb"}:
+            rgb = crop.convert("RGB")
+        else:
+            value = 255 if background == "white" else 0
+            canvas = Image.new("RGBA", crop.size, (value, value, value, 255))
+            rgb = Image.alpha_composite(canvas, crop).convert("RGB")
+        rgb_values = np.asarray(rgb, dtype=np.uint8)
+        variants.append((f"{background}:scale{scale}", rgb_values))
+        grayscale = np.asarray(rgb.convert("L"), dtype=np.uint8)
+        if int(grayscale.max()) > int(grayscale.min()):
+            threshold = _otsu_threshold(grayscale)
+            binary = np.where(grayscale <= threshold, 0, 255).astype(np.uint8)
+            variants.append(
+                (
+                    f"{background}:otsu{threshold}:scale{scale}",
+                    np.repeat(binary[..., None], 3, axis=2),
+                )
+            )
+    return variants
 
 
 def _iou(left: list[int], right: list[int]) -> float:
@@ -337,9 +449,10 @@ def run_ocr(
     output_path: Path,
     *,
     phase: str,
+    regions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     session = OcrSession(project_root, phase=phase)
-    return session.run(image_path, output_path)
+    return session.run(image_path, output_path, regions=regions)
 
 
 class OcrSession:
@@ -389,16 +502,27 @@ class OcrSession:
             "torch": _package_version("torch"),
             "detector": self.config["detector"],
             "recognizers": self.recognizers,
+            "config_sha256": _sha256(
+                self.project_root / "profiles" / "food" / "ocr.json"
+            ),
         }
 
-    def run(self, image_path: Path, output_path: Path) -> dict[str, Any]:
-        return _run_ocr_session(self, image_path, output_path)
+    def run(
+        self,
+        image_path: Path,
+        output_path: Path,
+        *,
+        regions: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return _run_ocr_session(self, image_path, output_path, regions=regions)
 
 
 def reusable_ocr_report(
     session: OcrSession,
     image_path: Path,
     output_path: Path,
+    *,
+    regions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if not output_path.is_file():
         return None
@@ -411,6 +535,7 @@ def reusable_ocr_report(
         "phase": session.phase,
         "image_sha256": _sha256(image_path),
         "engine_signature": session.engine_signature,
+        "region_plan_sha256": _region_plan_sha256(regions),
         "status": "completed",
         "errors": [],
     }
@@ -423,6 +548,8 @@ def _run_ocr_session(
     session: OcrSession,
     image_path: Path,
     output_path: Path,
+    *,
+    regions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     phase = session.phase
     config = session.config
@@ -430,7 +557,8 @@ def _run_ocr_session(
     pipelines = session.pipelines
     readers = session.readers
     with Image.open(image_path) as source_file:
-        image_size = source_file.size
+        rgba = source_file.convert("RGBA")
+        image_size = rgba.size
     minimum = float(config["minimum_confidence"])
     detections: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -504,6 +632,98 @@ def _run_ocr_session(
             except Exception as exc:
                 errors.append(f"easyocr/{'+'.join(languages)}/{variant.id}: {type(exc).__name__}: {exc}")
     compact = _deduplicate(detections)
+    region_ocr: list[dict[str, Any]] = []
+    for index, region in enumerate(regions or []):
+        region_id = str(region.get("region_id", f"region-{index + 1:03d}"))
+        expected_text = unicodedata.normalize("NFC", str(region.get("final_text_ko", "")))
+        readings: dict[tuple[str, str], dict[str, Any]] = {}
+        region_errors: list[str] = []
+        try:
+            variants = _oriented_region_variants(
+                rgba,
+                region,
+                config.get("alpha_backgrounds", ["white", "black"]),
+                alpha_semantics=str(config.get("alpha_semantics", "opacity")),
+            )
+        except Exception as exc:
+            variants = []
+            region_errors.append(f"prepare: {type(exc).__name__}: {exc}")
+        for variant_id, rgb in variants:
+            bgr = rgb[..., ::-1].copy()
+            for recognizer, pipeline in pipelines:
+                try:
+                    for result in pipeline.predict(bgr):
+                        data = _result_mapping(result)
+                        for text, score in zip(
+                            list(data.get("rec_texts", [])),
+                            list(data.get("rec_scores", [])),
+                        ):
+                            confidence = float(score)
+                            normalized = _normalize(str(text))
+                            if confidence < minimum or not normalized:
+                                continue
+                            key = (f"{config['detector']}+{recognizer}", normalized)
+                            value = {
+                                "text": unicodedata.normalize("NFC", str(text)),
+                                "script": _script(str(text)),
+                                "confidence": round(confidence, 6),
+                                "engine": "paddleocr",
+                                "model_signature": key[0],
+                                "variant": variant_id,
+                            }
+                            if key not in readings or confidence > float(readings[key]["confidence"]):
+                                readings[key] = value
+                except Exception as exc:
+                    region_errors.append(
+                        f"paddle/{recognizer}/{variant_id}: {type(exc).__name__}: {exc}"
+                    )
+            for languages, reader in readers:
+                try:
+                    for _, text, score in reader.readtext(
+                        rgb,
+                        detail=1,
+                        paragraph=False,
+                        min_size=8,
+                        workers=0,
+                    ):
+                        confidence = float(score)
+                        normalized = _normalize(str(text))
+                        if confidence < minimum or not normalized:
+                            continue
+                        signature = f"easyocr-1.7.2:{'+'.join(languages)}"
+                        key = (signature, normalized)
+                        value = {
+                            "text": unicodedata.normalize("NFC", str(text)),
+                            "script": _script(str(text)),
+                            "confidence": round(confidence, 6),
+                            "engine": "easyocr",
+                            "model_signature": signature,
+                            "variant": variant_id,
+                        }
+                        if key not in readings or confidence > float(readings[key]["confidence"]):
+                            readings[key] = value
+                except Exception as exc:
+                    region_errors.append(
+                        f"easyocr/{'+'.join(languages)}/{variant_id}: {type(exc).__name__}: {exc}"
+                    )
+        ordered = sorted(readings.values(), key=lambda value: -float(value["confidence"]))
+        expected_normalized = _normalize(expected_text)
+        matching = [
+            value for value in ordered if _normalize(value["text"]) == expected_normalized
+        ]
+        region_ocr.append(
+            {
+                "region_id": region_id,
+                "expected_text": expected_text,
+                "bbox": region.get("bbox"),
+                "rotation_deg": region.get("rotation_deg", 0),
+                "matched": bool(matching),
+                "matching_engines": sorted({value["engine"] for value in matching}),
+                "readings": ordered[:16],
+                "errors": region_errors,
+            }
+        )
+        errors.extend(f"region/{region_id}/{error}" for error in region_errors)
     if not compact and errors:
         raise RuntimeError("모든 OCR 호출이 실패했어요: " + " | ".join(errors[:3]))
     report = {
@@ -515,8 +735,10 @@ def _run_ocr_session(
         "width": image_size[0],
         "height": image_size[1],
         "engine_signature": session.engine_signature,
+        "region_plan_sha256": _region_plan_sha256(regions),
         "variant_count": variant_count,
         "detections": compact,
+        "region_ocr": region_ocr,
         "errors": errors,
         "requires_independent_visual_review": True,
         "status": "error" if errors else "completed",

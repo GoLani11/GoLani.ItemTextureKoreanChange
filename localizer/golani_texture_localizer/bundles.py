@@ -126,6 +126,10 @@ def _roundtrip_limits(
             mae_limit = max(mae_limit, 8.0)
         if minimum <= 32:
             p99_limit = max(p99_limit, 80.0)
+    elif role == "gloss" and minimum == 8:
+        # Aquamari 원본 Gloss의 정상 BC 왕복에서 8x8 mip channel MAE가
+        # 7.125였어요. p99/max 한계는 유지한 채 MAE만 원본 교정값으로 올려요.
+        mae_limit = max(mae_limit, 8.0)
     return mae_limit, p99_limit, _ROUNDTRIP_MAX_FLOOR
 
 
@@ -651,8 +655,9 @@ def repack_collection(
     bundle_root: Path,
     *,
     max_mae: float = 6.0,
+    target_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    image_report = validate_approved(profile, paths)
+    image_report = validate_approved(profile, paths, target_ids=target_ids)
     if not image_report["passed"]:
         failed = [report["target_id"] for report in image_report["reports"] if not report["passed"]]
         raise ValueError(
@@ -664,6 +669,8 @@ def repack_collection(
     roles: dict[str, dict[str, str]] = {}
     coverage_masks: dict[str, dict[str, list[Path]]] = {}
     for target in profile.targets:
+        if target_ids is not None and target.id not in target_ids:
+            continue
         approved = paths.approved / f"{target.id}.png"
         if target.action != "localize" or not approved.is_file():
             continue
@@ -679,18 +686,29 @@ def repack_collection(
     derived = json.loads(paths.derived_manifest.read_text(encoding="utf-8"))
     if derived.get("schema_version") != 2:
         raise ValueError("예전 derived manifest는 재사용할 수 없어요. derive를 다시 실행해 주세요")
-    expected_targets = {target.id for target in profile.targets if target.action == "localize"}
+    expected_targets = {
+        target.id
+        for target in profile.targets
+        if target.action == "localize" and (target_ids is None or target.id in target_ids)
+    }
     validated = {
         value.get("target_id"): value
         for value in derived.get("validated_targets", [])
         if isinstance(value, dict)
     }
+    profile_target_ids = {target.id for target in profile.targets}
+    unknown_validated = set(validated) - profile_target_ids
+    if unknown_validated:
+        raise ValueError(
+            f"derived manifest에 profile 밖 검증 대상이 있어요: {sorted(unknown_validated)}"
+        )
     missing_material_validation = expected_targets - set(validated)
     if missing_material_validation:
         raise ValueError(
             f"재질 게이트를 통과하지 않은 대상이 있어요: {sorted(missing_material_validation)}"
         )
-    for target_id, value in validated.items():
+    for target_id in sorted(expected_targets):
+        value = validated[target_id]
         target = profile.target_by_id(target_id)
         approved = paths.approved / f"{target.id}.png"
         if value.get("approved_sha256") != sha256_file(approved):
@@ -702,11 +720,17 @@ def repack_collection(
         for value in derived.get("auxiliary_plans", [])
         if isinstance(value, dict)
     }
-    output_targets = {output.get("target_id") for output in derived.get("outputs", [])}
-    unknown = output_targets - expected_targets
+    manifest_outputs = [
+        output for output in derived.get("outputs", []) if isinstance(output, dict)
+    ]
+    output_targets = {output.get("target_id") for output in manifest_outputs}
+    unknown = output_targets - profile_target_ids
     if unknown:
         raise ValueError(f"derived manifest에 profile 밖 대상이 있어요: {sorted(unknown)}")
-    for output in derived.get("outputs", []):
+    selected_outputs = [
+        output for output in manifest_outputs if output.get("target_id") in expected_targets
+    ]
+    for output in selected_outputs:
         target = profile.target_by_id(output["target_id"])
         approved = paths.approved / f"{target.id}.png"
         source_record = record_for_target(inventory, target)
@@ -770,13 +794,15 @@ def repack_collection(
     payload = {
         "schema_version": 1,
         "collection": profile.id,
-        "partial": False,
+        "partial": target_ids is not None,
+        "target_ids": sorted(target_ids) if target_ids is not None else None,
         "bundle_count": len(reports),
         "texture_count": sum(len(report["textures"]) for report in reports),
         "passed": all(report["passed"] for report in reports),
         "bundles": reports,
     }
-    summary = paths.reports / "repack.json"
+    suffix = "" if target_ids is None else "." + "+".join(sorted(target_ids))
+    summary = paths.reports / f"repack{suffix}.json"
     summary.parent.mkdir(parents=True, exist_ok=True)
     summary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return payload
