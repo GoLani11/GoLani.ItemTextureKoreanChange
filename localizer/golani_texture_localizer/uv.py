@@ -20,14 +20,40 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _boundary_edges(triangles: np.ndarray) -> np.ndarray:
+def _boundary_edges(
+    triangles: np.ndarray,
+    *,
+    vertices: np.ndarray | None = None,
+    uv0: np.ndarray | None = None,
+    tolerance: float = 1e-5,
+) -> np.ndarray:
     if triangles.ndim != 2 or triangles.shape[1] != 3:
         raise ValueError("triangle 배열은 Nx3이어야 해요")
     directed = np.concatenate(
         (triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]),
         axis=0,
     )
-    normalized = np.sort(directed, axis=1)
+    canonical = directed
+    if vertices is not None or uv0 is not None:
+        if (
+            vertices is None
+            or uv0 is None
+            or vertices.ndim != 2
+            or vertices.shape[1] != 3
+            or uv0.ndim != 2
+            or uv0.shape[1] != 2
+            or len(vertices) != len(uv0)
+            or tolerance <= 0
+        ):
+            raise ValueError("중복 정점 병합용 vertices/uv0 규격이 잘못됐어요")
+        # Unity mesh는 normal/tangent 경계 때문에 같은 위치·UV 정점을 여러 index로
+        # 저장할 수 있어요. index만 비교하면 그 사이의 내부 삼각형 모서리까지 UV
+        # seam으로 오인하므로, 3D 위치와 UV가 모두 같은 정점을 먼저 합쳐요.
+        signature = np.concatenate((vertices, uv0), axis=1).astype(np.float64)
+        quantized = np.rint(signature / tolerance).astype(np.int64)
+        _, canonical_vertex = np.unique(quantized, axis=0, return_inverse=True)
+        canonical = canonical_vertex[directed]
+    normalized = np.sort(canonical, axis=1)
     _, inverse, counts = np.unique(normalized, axis=0, return_inverse=True, return_counts=True)
     return directed[counts[inverse] == 1]
 
@@ -133,13 +159,14 @@ def generate_uv_review(
             raise FileNotFoundError(mesh_path)
         mesh_hashes[str(mesh_path)] = _sha256(mesh_path)
         with np.load(mesh_path) as mesh:
+            vertices = np.asarray(mesh["vertices"], dtype=np.float32)
             uv0 = np.asarray(mesh["uv0"], dtype=np.float32)
             for submesh_index in renderer.get("target_submeshes", {}).get(target_id, []):
                 key = f"triangles_{submesh_index}"
                 if key not in mesh:
                     raise ValueError(f"{mesh_path}에 {key}가 없어요")
                 triangles = np.asarray(mesh[key], dtype=np.int32)
-                edges = _boundary_edges(triangles)
+                edges = _boundary_edges(triangles, vertices=vertices, uv0=uv0)
                 checked_submeshes += 1
                 boundary_edge_count += len(edges)
                 for first, second in edges:
