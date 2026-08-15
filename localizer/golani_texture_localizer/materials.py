@@ -110,6 +110,68 @@ def _all_consumers(inventory: dict[str, Any], bundle_key: str, path_id: int) -> 
     return consumers
 
 
+def _slot_consumers(inventory: dict[str, Any], slot: dict[str, Any]) -> list[dict[str, Any]]:
+    return _all_consumers(
+        inventory,
+        str(slot["texture_bundle_key"]),
+        int(slot["path_id"]),
+    )
+
+
+def _register_auxiliary_plan(
+    plans: dict[tuple[str, int, str], dict[str, Any]],
+    slot: dict[str, Any],
+    *,
+    target_id: str,
+    policy: str,
+    old_text_mask_sha256: str,
+    operation_signature: str = "",
+) -> bool:
+    key = (str(slot["texture_bundle_key"]), int(slot["path_id"]), str(slot["role"]))
+    existing = plans.get(key)
+    signature = (policy, old_text_mask_sha256, operation_signature)
+    if existing is None:
+        plans[key] = {
+            "policy": policy,
+            "old_text_mask_sha256": old_text_mask_sha256,
+            "operation_signature": operation_signature,
+            "target_ids": [target_id],
+        }
+        return True
+    current = (
+        existing["policy"],
+        existing["old_text_mask_sha256"],
+        existing.get("operation_signature", ""),
+    )
+    if current != signature:
+        raise ValueError(
+            f"공유 보조맵 {key[0]}::{key[1]} 정책/마스크가 target마다 달라요: "
+            f"{existing['target_ids']}={current}, {target_id}={signature}"
+        )
+    existing["target_ids"].append(target_id)
+    return False
+
+
+def _material_mask_descriptor(
+    material_data: dict[str, Any],
+    key: str,
+) -> dict[str, Any]:
+    descriptors = material_data.get("material_masks")
+    if not isinstance(descriptors, dict):
+        raise ValueError("neutralize_old_text 정책에는 material_masks가 필요해요")
+    descriptor = descriptors.get(key)
+    if not isinstance(descriptor, dict):
+        raise ValueError(f"{key}: 재질 전용 old-text 마스크를 명시해야 해요")
+    path = descriptor.get("path")
+    checksum = descriptor.get("sha256")
+    if not isinstance(path, str) or not path or not isinstance(checksum, str) or len(checksum) != 64:
+        raise ValueError(f"{key}: 재질 전용 마스크 path/SHA-256이 잘못됐어요")
+    method = descriptor.get("method")
+    if method != "inpaint":
+        raise ValueError(f"{key}: 재질 마스크 method는 inpaint여야 해요")
+    return {"path": path, "sha256": checksum, "method": method}
+
+
 def _map_record(inventory: dict[str, Any], bundle_key: str, path_id: int) -> dict[str, Any]:
     matches = [
         record
@@ -145,12 +207,15 @@ def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Im
     if not mask.any():
         return Image.fromarray(output, "RGBA"), {"changed_pixels": 0, "changed_outside_mask": 0}
     radius = max(1, round(min(mask.shape) / 512 * 3))
+    channels = (1, 3) if role == "normal" else (0, 1, 2, 3)
+    if role not in {"normal", "gloss"}:
+        raise ValueError(f"지원하지 않는 보조맵 역할이에요: {role}")
+    for channel in channels:
+        output[..., channel] = cv2.inpaint(
+            image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
+        )
     if role == "normal":
         # Tarkov의 DXT5nm packing에서 X=A, Y=G예요. R/B는 원본 그대로 둬요.
-        for channel in (1, 3):
-            output[..., channel] = cv2.inpaint(
-                image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
-            )
         x = output[..., 3].astype(np.float32) / 127.5 - 1.0
         y = output[..., 1].astype(np.float32) / 127.5 - 1.0
         length = np.maximum(1.0, np.sqrt(x * x + y * y))
@@ -158,19 +223,13 @@ def _neutralize_map(source: Path, mask: np.ndarray, role: str) -> tuple[Image.Im
         normalized_y = np.clip((y / length + 1.0) * 127.5, 0, 255).astype(np.uint8)
         output[..., 3][mask] = normalized_x[mask]
         output[..., 1][mask] = normalized_y[mask]
-    elif role == "gloss":
-        # 채널 레이아웃을 추측해 회색맵으로 재작성하지 않고 기존 네 채널을 각각 복원해요.
-        for channel in range(4):
-            output[..., channel] = cv2.inpaint(
-                image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
-            )
-    else:
-        raise ValueError(f"지원하지 않는 보조맵 역할이에요: {role}")
+    # gloss는 채널 레이아웃을 추측해 회색맵으로 재작성하지 않고 네 채널을 각각 복원해요.
     changed = np.any(output != image, axis=2)
     return Image.fromarray(output, "RGBA"), {
         "changed_pixels": int(changed.sum()),
         "changed_outside_mask": int((changed & ~mask).sum()),
         "mode_preserved": mode == "RGBA",
+        "method": "inpaint",
     }
 
 
@@ -178,6 +237,7 @@ def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -
     inventory = load_inventory(paths.inventory)
     outputs: list[dict[str, Any]] = []
     validated_targets: list[dict[str, Any]] = []
+    auxiliary_plans: dict[tuple[str, int, str], dict[str, Any]] = {}
     for target in profile.targets:
         approved = paths.approved / f"{target.id}.png"
         if target.action != "localize" or not approved.is_file():
@@ -230,19 +290,42 @@ def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -
             policy = policies.get(key)
             if policy not in {"preserve", "neutralize_old_text"}:
                 raise ValueError(f"{target.id}: {key} 정책을 명시해야 해요")
-            consumers = _all_consumers(inventory, diffuse["bundle_key"], slot["path_id"])
+            consumers = _slot_consumers(inventory, slot)
             reviewed_consumers = material_data.get("shared_consumers", {}).get(key)
             if reviewed_consumers != consumers:
                 raise ValueError(f"{target.id}: {key} 공유 소비자 검토가 현재 graph와 달라요")
+            material_mask = (
+                _material_mask_descriptor(material_data, key)
+                if policy == "neutralize_old_text"
+                else None
+            )
+            first_operation = _register_auxiliary_plan(
+                auxiliary_plans,
+                slot,
+                target_id=target.id,
+                policy=policy,
+                old_text_mask_sha256=(
+                    material_mask["sha256"] if material_mask is not None else "preserve"
+                ),
+                operation_signature=(
+                    json.dumps(material_mask, ensure_ascii=False, sort_keys=True)
+                    if material_mask is not None
+                    else "preserve"
+                ),
+            )
             if policy == "preserve":
                 continue
             if len(consumers) > 1 and not material_data.get("shared_consumers_resolved"):
                 raise ValueError(f"{target.id}: 공유 보조맵 {key} 충돌이 해결되지 않았어요")
+            if not first_operation:
+                continue
             record = _map_record(inventory, slot["texture_bundle_key"], slot["path_id"])
             source_map = Path(record["source_png"])
             with Image.open(source_map) as map_file:
                 size = map_file.size
-            old_text = _mask(paths, masks["old_text"], size)
+            if material_mask is None:
+                raise AssertionError("neutralize_old_text 재질 마스크가 없어요")
+            old_text = _mask(paths, material_mask, size)
             image, metrics = _neutralize_map(source_map, old_text, slot["role"])
             if metrics["changed_outside_mask"] != 0:
                 raise AssertionError(f"{target.id} {key} 마스크 밖 픽셀이 바뀌었어요")
@@ -265,7 +348,8 @@ def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -
                     "approval_sha256": sha256_file(approval_path(paths, target.id)),
                     "review": str(review_path),
                     "review_sha256": sha256_file(review_path),
-                    "old_text_mask_sha256": masks["old_text"]["sha256"],
+                    "old_text_mask": material_mask["path"],
+                    "old_text_mask_sha256": material_mask["sha256"],
                     "derived_png": str(destination),
                     "derived_sha256": sha256_file(destination),
                     "consumers": consumers,
@@ -277,6 +361,15 @@ def derive_approved_materials(profile: CollectionProfile, paths: ProjectPaths) -
         "collection": profile.id,
         "derived_count": len(outputs),
         "validated_targets": validated_targets,
+        "auxiliary_plans": [
+            {
+                "texture_bundle_key": bundle_key,
+                "path_id": path_id,
+                "role": role,
+                **plan,
+            }
+            for (bundle_key, path_id, role), plan in sorted(auxiliary_plans.items())
+        ],
         "outputs": outputs,
     }
     paths.derived_manifest.parent.mkdir(parents=True, exist_ok=True)

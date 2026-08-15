@@ -59,6 +59,7 @@ def test_candidate_mask_relationships_are_measured_not_trusted(tmp_path: Path, m
     review = {
         "target_id": "sample",
         "action": "localize",
+        "expected_text": ["샘플"],
         "source": {"texture": "sample_D", "bundle_key": "sample.bundle", "sha256": "0" * 64},
     }
     monkeypatch.setattr(

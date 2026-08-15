@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 import numpy as np
 
-from golani_texture_localizer.ocr import _deduplicate, _inverse_points, _positions
+from golani_texture_localizer.ocr import (
+    OcrSession,
+    _deduplicate,
+    _inverse_points,
+    _positions,
+    reusable_ocr_report,
+)
 
 
 @pytest.mark.parametrize(
@@ -56,3 +65,32 @@ def test_weak_rotated_noise_does_not_create_a_false_conflict() -> None:
     )
 
     assert result[0]["conflicting_readings"] is False
+
+
+def test_ocr_session_rejects_unknown_phase(tmp_path) -> None:
+    with pytest.raises(ValueError, match="phase"):
+        OcrSession(tmp_path, phase="unknown")
+
+
+def test_completed_ocr_report_is_reused_only_for_same_input_and_engine(tmp_path) -> None:
+    image = tmp_path / "image.png"
+    image.write_bytes(b"same image")
+    report_path = tmp_path / "report.json"
+
+    class Session:
+        phase = "source"
+        engine_signature = {"detector": "fixed"}
+
+    report = {
+        "schema_version": 1,
+        "phase": "source",
+        "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
+        "engine_signature": Session.engine_signature,
+        "status": "completed",
+        "errors": [],
+    }
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    assert reusable_ocr_report(Session(), image, report_path) == report
+    image.write_bytes(b"changed image")
+    assert reusable_ocr_report(Session(), image, report_path) is None

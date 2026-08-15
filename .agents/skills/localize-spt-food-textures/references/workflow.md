@@ -7,6 +7,7 @@
 ```bash
 <python> localize.py --spt-root <SPT 경로> inventory
 <python> localize.py --spt-root <SPT 경로> extract
+<python> localize.py uv-review
 <python> localize.py status
 ```
 
@@ -24,7 +25,9 @@
 
 ## 2. OCR 1차 판독
 
-원본을 원본 해상도에서 검사한다. OCR 도구가 제공되면 회전·타일·복수 배경과 최소 두
+원본을 원본 해상도에서 검사한다. 전체 배치는 `localize.py ocr batch --phase source`로
+실행하며 입력 SHA와 엔진 서명이 같은 오류 없는 완료 보고서만 재사용한다. OCR 도구가
+제공되면 회전·타일·복수 배경과 최소 두
 엔진을 사용한다. 도구가 없거나 실행 오류가 나면 `source_ocr=error`로 기록하고 멈춘다.
 
 각 검출에 다음 정보를 남긴다.
@@ -41,7 +44,12 @@ detector-only와 엔진 간 불일치는 삭제하지 말고 검토 대상으로
 
 ## 3. Codex 2차 독립 판독
 
-OCR 결과의 문자열을 정답으로 옮기지 말고 원본 이미지를 다시 확대해 직접 판독한다.
+OCR 결과의 문자열을 정답으로 옮기지 말고 `localize.py visual-sheets`로 OCR 문자열이 숨겨진
+원본 확대 crop을 만든 뒤 직접 판독한다.
+
+과거 한글본이 있으면 `ocr batch --phase candidate --reference-approved`와
+`legacy-layout-sheets`로 별도 참고 보고서를 만들 수 있다. 이 보고서는 번역·위치 제안만
+교차검증하며 과거 한글본의 픽셀을 후보나 배경 복구에 복사하면 안 된다.
 다음을 OCR과 별도로 `source_visual.data.regions`에 기록한다.
 
 - 실제 보이는 문자열 또는 읽을 수 없음 표시
@@ -99,6 +107,11 @@ AI 이미지 편집은 `old_text` 안의 배경 복구 초안에만 사용한다
 
 폰트 파일 SHA, shaping 엔진·버전, 글리프, 크기, 자간, 색, 회전과 합성 좌표를 기록한다.
 원본 전체 재생성, 자동 리사이즈, 잘못된 크기의 후보를 LANCZOS로 맞추는 처리를 금지한다.
+확정된 해시 고정 recipe는 다음처럼 실행한다.
+
+```bash
+<python> localize.py compose <target-id> <compose-recipe.json>
+```
 
 ## 7. 생성 후 이중 검증
 
@@ -107,6 +120,10 @@ AI 이미지 편집은 `old_text` 안의 배경 복구 초안에만 사용한다
 1. 후보 OCR: 금지된 라틴·키릴 잔상, 한글 누락·중복·오자를 탐지한다.
 2. Codex 시각 비교: 원본과 후보를 같은 배율로 비교하고 글자·그림 방향, 색, 질감, 흐림,
    seam·절취선, 로고와 비문자 구조를 확인한다.
+
+`localize.py candidate-check <target-id>`는 현재 조판 보고서·마스크·후보 OCR SHA를 다시
+검사하고 변경 범위와 외국어 잔상·누락·중복 보고서, 원본/후보/변경 비교 시트를 만든다.
+이 명령의 통과는 Codex 시각 비교를 대신하지 않는다.
 
 픽셀 검사에서는 크기·알파 동일, 리사이즈 없음, editable 밖 변경 0, protected와 seam
 변경 0을 요구한다. OCR 무검출만으로 통과시키지 않는다.
@@ -126,7 +143,9 @@ AI 이미지 편집은 `old_text` 안의 배경 복구 초안에만 사용한다
 실제 Material graph에서 연결된 맵을 대상으로 한다.
 
 - 평면 인쇄는 normal/gloss 원본을 그대로 보존한다.
-- 기존 외국어 relief나 광택이 있을 때만 각 보조맵의 명시적 `old_text` 영역을 중립화한다.
+- 기존 외국어 relief나 광택이 있을 때만 각 보조맵의 명시적 재질 전용 `old_text` 영역을
+  중립화한다. Diffuse에서 배경을 복원한 넓은 패널 마스크는 N/G 구조를 손상시킬 수 있으므로
+  자동 재사용하지 않는다. `material_masks`에는 맵별 경로·SHA-256·`inpaint` 방식을 기록한다.
 - 새 한글 효과가 필요한 경우 diffuse와 같은 `new_text` 마스크·좌표·회전을 사용한다.
 - normal은 packing을 해석한 의미 공간에서 벡터를 재정규화한다.
 - gloss는 실제 사용 채널만 변경하고 영역 밖 byte를 보존한다.

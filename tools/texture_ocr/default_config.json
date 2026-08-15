@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "cache_schema": 1,
+  "input": {
+    "extensions": [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"],
+    "include_unmanifested": false
+  },
+  "filter": {
+    "skip_non_color": true,
+    "color_tokens": ["d", "diff", "diffuse", "albedo", "basecolor", "base", "color", "colour"],
+    "non_color_tokens": ["n", "nrm", "normal", "g", "gloss", "spec", "specular", "mask", "metallic", "rough", "roughness", "ao", "height"]
+  },
+  "preprocess": {
+    "rotations": [0, 90, 180, 270],
+    "tile_size": 1536,
+    "tile_overlap": 192,
+    "include_overview": true,
+    "max_overview_side": 2048,
+    "upscale_min_side": 640,
+    "upscale_factor": 2.0,
+    "alpha_backgrounds": ["white", "black"],
+    "include_autocontrast": false,
+    "max_variants": 0
+  },
+  "classification": {
+    "confirmed_score": 0.80,
+    "probable_score": 0.45,
+    "review_score": 0.15,
+    "agreement_score": 0.45,
+    "agreement_text_similarity": 0.80,
+    "confirmed_min_letters": 3,
+    "probable_min_letters": 2
+  },
+  "engines": {
+    "primary": {
+      "name": "paddleocr",
+      "enabled": true,
+      "package_version": "3.5.0",
+      "device": "cpu",
+      "inference_engine": "paddle_static",
+      "detector_model": "PP-OCRv5_mobile_det",
+      "recognizer_model": "eslav_PP-OCRv5_mobile_rec",
+      "model_revision": "official-ppocrv5",
+      "detector_dir": "work/ocr_selection/models/paddle/PP-OCRv5_mobile_det_infer",
+      "recognizer_dir": "work/ocr_selection/models/paddle/eslav_PP-OCRv5_mobile_rec_infer",
+      "text_det_thresh": 0.20,
+      "text_det_box_thresh": 0.35,
+      "text_rec_score_thresh": 0.0
+    },
+    "fallback": {
+      "name": "easyocr",
+      "enabled": true,
+      "package_version": "1.7.2",
+      "gpu": false,
+      "model_dir": "work/ocr-models/easyocr",
+      "detector_file": "craft_mlt_25k.pth",
+      "recognizer_file": "cyrillic_g2.pth",
+      "model_revision": "official-easyocr-1.7.2",
+      "min_size": 8,
+      "text_threshold": 0.45,
+      "low_text": 0.25,
+      "link_threshold": 0.25
+    }
+  },
+  "runtime": {
+    "early_stop_on_confirmed": true,
+    "preview_max_side": 720
+  }
+}

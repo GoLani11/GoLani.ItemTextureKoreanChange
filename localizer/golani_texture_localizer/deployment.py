@@ -27,6 +27,10 @@ def _sha256(path: Path) -> str:
 
 
 def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str, Any]:
+    profile_path = paths.root / "profiles" / "food" / "collection.json"
+    if not profile_path.is_file():
+        raise FileNotFoundError(f"현지화 profile이 없어요: {profile_path}")
+    profile_sha256 = _sha256(profile_path)
     repack_path = paths.reports / "repack.json"
     if not repack_path.is_file():
         raise FileNotFoundError("repack 보고서가 없어요")
@@ -63,7 +67,13 @@ def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str,
         reviews[target.id] = sha256_file(review_path)
     release_id = hashlib.sha256(
         json.dumps(
-            {"bundles": bundles, "reviews": reviews, "server_files": server_files},
+            {
+                "profile_sha256": profile_sha256,
+                "repack_report_sha256": _sha256(repack_path),
+                "bundles": bundles,
+                "reviews": reviews,
+                "server_files": server_files,
+            },
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -79,6 +89,8 @@ def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str,
             existing.get("bundles") != bundles
             or existing.get("review_hashes") != reviews
             or existing.get("server_files") != server_files
+            or existing.get("profile_sha256") != profile_sha256
+            or existing.get("repack_report_sha256") != _sha256(repack_path)
         ):
             raise ValueError(f"같은 release ID의 내용이 달라요: {release_root}")
         return existing
@@ -99,9 +111,11 @@ def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str,
             if _sha256(destination) != expected:
                 raise AssertionError(f"release 서버 파일 SHA가 달라요: {name}")
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
             "release_id": release_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "profile": str(profile_path),
+            "profile_sha256": profile_sha256,
             "repack_report": str(repack_path),
             "repack_report_sha256": _sha256(repack_path),
             "bundle_count": len(bundles),
@@ -138,8 +152,26 @@ def _load_release(paths: ProjectPaths, release_id: str) -> tuple[Path, dict[str,
     if not manifest_path.is_file():
         raise FileNotFoundError(f"release를 찾지 못했어요: {release_id}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("passed") is not True or manifest.get("release_id") != release_id:
+    if (
+        manifest.get("schema_version") != 2
+        or manifest.get("passed") is not True
+        or manifest.get("release_id") != release_id
+    ):
         raise ValueError("유효한 release manifest가 아니에요")
+    current_inputs = {
+        "profile_sha256": paths.root / "profiles" / "food" / "collection.json",
+        "repack_report_sha256": paths.reports / "repack.json",
+    }
+    for field, path in current_inputs.items():
+        if not path.is_file() or manifest.get(field) != _sha256(path):
+            raise ValueError(f"현재 작업과 다른 오래된 release예요: {field}")
+    review_hashes = manifest.get("review_hashes")
+    if not isinstance(review_hashes, dict) or not review_hashes:
+        raise ValueError("release의 review 해시가 비어 있어요")
+    for target_id, expected in review_hashes.items():
+        current = paths.reviews / str(target_id) / "review.json"
+        if not current.is_file() or not isinstance(expected, str) or _sha256(current) != expected:
+            raise ValueError(f"현재 작업과 다른 오래된 release예요: review {target_id}")
     for key, expected in manifest.get("bundles", {}).items():
         source = root / "bundles" / Path(key)
         if not source.is_file() or _sha256(source) != expected:

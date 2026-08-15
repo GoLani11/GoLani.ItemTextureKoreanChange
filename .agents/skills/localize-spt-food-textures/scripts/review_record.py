@@ -34,6 +34,7 @@ THROUGH = {
     "release": STAGES,
 }
 DIRECTIONS = {"left-to-right", "right-to-left", "top-to-bottom", "bottom-to-top"}
+CROSS_RESOLUTIONS = {"matched", "visual_only", "ocr_only_resolved"}
 
 
 def _project_root(start: Path) -> Path:
@@ -192,11 +193,32 @@ def _validate_cross_region(region: Any, location: str) -> list[str]:
     errors: list[str] = []
     if not isinstance(region, dict):
         return [f"{location}: 객체가 아니에요"]
-    for field in ("region_id", "ocr_region_id", "visual_region_id", "agreed_text"):
+    for field in ("region_id", "agreed_text"):
         if not _nonempty_string(region.get(field)):
             errors.append(f"{location}.{field}: 비어 있어요")
-    if region.get("matched") is not True:
-        errors.append(f"{location}.matched: true여야 해요")
+    resolution = region.get("resolution", "matched")
+    if resolution not in CROSS_RESOLUTIONS:
+        errors.append(f"{location}.resolution: 지원하는 해소 방식이 아니에요")
+    if resolution == "matched":
+        for field in ("ocr_region_id", "visual_region_id"):
+            if not _nonempty_string(region.get(field)):
+                errors.append(f"{location}.{field}: 비어 있어요")
+        if region.get("matched") is not True:
+            errors.append(f"{location}.matched: true여야 해요")
+    elif resolution == "visual_only":
+        if not _nonempty_string(region.get("visual_region_id")):
+            errors.append(f"{location}.visual_region_id: 비어 있어요")
+        if region.get("ocr_region_id") not in {None, ""}:
+            errors.append(f"{location}.ocr_region_id: visual_only에서는 비어 있어야 해요")
+        if region.get("matched") is not False or region.get("resolved") is not True:
+            errors.append(f"{location}: visual_only는 matched=false, resolved=true여야 해요")
+    elif resolution == "ocr_only_resolved":
+        if not _nonempty_string(region.get("ocr_region_id")):
+            errors.append(f"{location}.ocr_region_id: 비어 있어요")
+        if region.get("visual_region_id") not in {None, ""}:
+            errors.append(f"{location}.visual_region_id: ocr_only_resolved에서는 비어 있어야 해요")
+        if region.get("matched") is not False or region.get("resolved") is not True:
+            errors.append(f"{location}: ocr_only_resolved는 matched=false, resolved=true여야 해요")
     normalized = {
         **region,
         "text": region.get("agreed_text", ""),
@@ -327,6 +349,12 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
     ):
         if post_visual.get(field) != wanted:
             errors.append(f"stages.post_visual.data.{field}: {wanted!r}여야 해요")
+    if post_ocr.get("requires_visual_resolution") is True and post_visual.get(
+        "ocr_ambiguities_resolved"
+    ) is not True:
+        errors.append(
+            "stages.post_visual.data.ocr_ambiguities_resolved: OCR 보류 항목을 시각 확인해야 해요"
+        )
     if not _valid_sha256(post_visual.get("candidate_sha256")):
         errors.append("stages.post_visual.data.candidate_sha256: SHA-256 형식이 아니에요")
     if (
@@ -338,7 +366,7 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _validate_material_metrics(data: Any) -> list[str]:
+def _validate_material_metrics(data: Any, project_root: Path) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
         return ["stages.material_validation.data: 객체가 아니에요"]
@@ -359,6 +387,47 @@ def _validate_material_metrics(data: Any) -> list[str]:
             errors.append(f"stages.material_validation.data.{field}: {wanted!r}여야 해요")
     if not _valid_sha256(data.get("text_mask_sha256")):
         errors.append("stages.material_validation.data.text_mask_sha256: SHA-256 형식이 아니에요")
+    policies = data.get("policies")
+    material_masks = data.get("material_masks")
+    if not isinstance(policies, dict) or not policies:
+        errors.append("stages.material_validation.data.policies: 비어 있지 않은 객체여야 해요")
+    else:
+        for key, policy in policies.items():
+            if policy not in {"preserve", "neutralize_old_text"}:
+                errors.append(f"stages.material_validation.data.policies.{key}: 지원하지 않는 정책이에요")
+                continue
+            if policy != "neutralize_old_text":
+                continue
+            descriptor = material_masks.get(key) if isinstance(material_masks, dict) else None
+            if not isinstance(descriptor, dict):
+                errors.append(f"stages.material_validation.data.material_masks.{key}: 마스크가 없어요")
+                continue
+            mask_path, path_errors = _project_file(
+                project_root,
+                descriptor.get("path"),
+                f"stages.material_validation.data.material_masks.{key}.path",
+            )
+            errors.extend(path_errors)
+            checksum = descriptor.get("sha256")
+            if not _valid_sha256(checksum):
+                errors.append(
+                    f"stages.material_validation.data.material_masks.{key}.sha256: SHA-256 형식이 아니에요"
+                )
+            elif mask_path is not None:
+                if not mask_path.is_file():
+                    errors.append(
+                        f"stages.material_validation.data.material_masks.{key}.path: 파일이 없어요"
+                    )
+                elif _sha256(mask_path) != checksum:
+                    errors.append(
+                        f"stages.material_validation.data.material_masks.{key}: 현재 파일 SHA-256이 달라요"
+                    )
+            method = descriptor.get("method")
+            if method != "inpaint":
+                errors.append(
+                    f"stages.material_validation.data.material_masks.{key}.method: "
+                    "inpaint여야 해요"
+                )
     return errors
 
 
@@ -528,12 +597,12 @@ def validate_record(
             cross_ocr_ids = {
                 str(region.get("ocr_region_id"))
                 for region in cross_regions
-                if isinstance(region, dict) and region.get("ocr_region_id")
+                if isinstance(region, dict) and _nonempty_string(region.get("ocr_region_id"))
             }
             cross_visual_ids = {
                 str(region.get("visual_region_id"))
                 for region in cross_regions
-                if isinstance(region, dict) and region.get("visual_region_id")
+                if isinstance(region, dict) and _nonempty_string(region.get("visual_region_id"))
             }
             ocr_ids = {
                 str(region.get("region_id"))
@@ -562,7 +631,11 @@ def validate_record(
         errors.extend(_validate_candidate_metrics(stages.get("candidate_validation", {}).get("data")))
         errors.extend(_validate_post_checks(stages))
     if through in {"material", "release"}:
-        errors.extend(_validate_material_metrics(stages.get("material_validation", {}).get("data")))
+        errors.extend(
+            _validate_material_metrics(
+                stages.get("material_validation", {}).get("data"), project_root
+            )
+        )
     if through == "release":
         errors.extend(_validate_release_metrics(stages))
 

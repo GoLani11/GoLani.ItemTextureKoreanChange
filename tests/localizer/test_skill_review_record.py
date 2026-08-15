@@ -182,7 +182,9 @@ def test_init_record_uses_profile_and_never_overwrites(tmp_path: Path) -> None:
     record = json.loads(created.read_text(encoding="utf-8"))
 
     assert record["target_id"] == "mayo"
-    assert record["expected_text"] == ["마요네즈"]
+    profile = json.loads((PROJECT_ROOT / "profiles" / "food" / "collection.json").read_text(encoding="utf-8"))
+    expected = next(target["exact_text"] for target in profile["targets"] if target["id"] == "mayo")
+    assert record["expected_text"] == expected
     assert set(record["stages"]) == set(review_record.STAGES)
     with pytest.raises(FileExistsError):
         review_record.init_record(PROJECT_ROOT, "mayo", destination)
@@ -196,6 +198,35 @@ def test_analysis_gate_is_fail_closed_and_binds_evidence_hash(tmp_path: Path) ->
     (tmp_path / "source_ocr.json").write_bytes(b"changed-after-review")
     errors = review_record.validate_record(record, "analysis", project_root=tmp_path)
     assert any("현재 파일 SHA가 기록과 달라요" in error for error in errors)
+
+
+def test_cross_validation_accepts_resolved_visual_only_region(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    visual_only = {
+        **_region(),
+        "region_id": "lid-arc",
+        "text": "DEVILDOG'S FINEST MAYO",
+        "bbox": [5, 5, 60, 18],
+    }
+    record["stages"]["source_visual"]["data"]["regions"].append(visual_only)
+    record["stages"]["cross_validation"]["data"]["regions"].append(
+        {
+            "region_id": "lid-arc",
+            "ocr_region_id": None,
+            "visual_region_id": "lid-arc",
+            "agreed_text": "DEVILDOG'S FINEST MAYO",
+            "resolution": "visual_only",
+            "matched": False,
+            "resolved": True,
+            "bbox": [5, 5, 60, 18],
+            "rotation_deg": 0,
+            "direction": "left-to-right",
+            "face": "lid",
+            "artwork_direction": "뚜껑 원호를 따름",
+        }
+    )
+
+    assert review_record.validate_record(record, "analysis", project_root=tmp_path) == []
 
 
 def test_candidate_gate_rejects_changes_outside_editable_mask(tmp_path: Path) -> None:

@@ -25,13 +25,20 @@ mod/                                 향후 C# 게임 적용 코드를 이관할
 
 ## 작업 흐름
 
-1. `python localize.py --spt-root D:/SPT inventory`: Texture2D와 실제 Material PPtr를 읽는다.
-2. `python localize.py --spt-root D:/SPT extract`: 원본을 `workspace/source/`에 추출한다.
+1. `python localize.py --spt-root D:/SPT inventory`: Texture2D와 실제
+   Renderer→Material→Mesh PPtr, UV0와 submesh 연결을 읽는다.
+2. `python localize.py --spt-root D:/SPT extract`: 원본과 검증용 mesh를
+   `workspace/source/`, `workspace/meshes/`에 추출한다.
 3. OCR·Codex 독립 판독·교차검증: 모든 보이는 문구의 뜻·좌표·방향을 확정한다.
-4. 편집 명세: 영역별 원문·뜻·번역·좌표·방향과 편집·보호·seam 마스크를 확정한다.
-5. 이미지 편집: 원본 위의 허용 영역만 복구하고 확정 한글을 결정적으로 조판한다.
+   `ocr batch`는 입력 SHA와 엔진 서명이 같은 완료 보고서만 재사용하고, `visual-sheets`는
+   OCR 문자열을 숨긴 확대 crop을 만들어 시각 판독의 독립성을 유지한다.
+4. 편집 명세: 영역별 원문·뜻·번역·좌표·방향을 기록하고 `uv-review`가 실제 target submesh의
+   UV island 경계에서 만든 seam guard와 편집·보호 마스크를 확정한다.
+5. 이미지 편집: `compose`가 원본 위의 해시 고정 old-text 영역만 복구하고 확정 문자열·글꼴·
+   좌표 recipe로 한글을 결정적으로 조판한다.
 6. 생성 후 검증: OCR과 별도 시각 비교로 누락·오자·중복·잔상과 구조 변화를 확인한다.
-7. 보조맵 생성: 실제 Material 연결을 따라 D/N/G를 정렬하고 공유 충돌을 차단한다.
+7. 보조맵 생성: 실제 Material 연결을 따라 D/N/G를 정렬하고, 맵별 재질 전용 마스크와 공유
+   소비자 정책이 모두 고정된 경우에만 외국어 효과를 제거한다.
 8. 밉·재패킹: 맵 역할별 밉과 원본 포맷을 유지해 동일 크기 payload만 교체한다.
 9. 검증: 모든 밉, 압축 왕복, 번들 레이아웃과 실제 조명 렌더를 확인한다.
 10. 설치: 모든 해시 고정 게이트 통과 후 별도 사용자 승인과 백업을 거쳐 적용한다.

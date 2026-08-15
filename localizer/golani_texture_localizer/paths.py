@@ -39,6 +39,10 @@ class ProjectPaths:
         return self.workspace / "source"
 
     @property
+    def meshes(self) -> Path:
+        return self.workspace / "meshes"
+
+    @property
     def source_overrides(self) -> Path:
         return self.workspace / "source-overrides"
 

@@ -110,6 +110,302 @@ def _slot(
     }
 
 
+_MAIN_TEXTURE_PROPERTIES = {"_MainTex", "_BaseMap", "_BaseColorMap"}
+
+
+def _material_targets(
+    records: list[dict[str, Any]],
+    materials: list[dict[str, Any]],
+) -> dict[tuple[str, int], list[str]]:
+    """실제 주 텍스처 슬롯을 기준으로 Material과 현지화 target을 연결해요."""
+
+    target_by_texture = {
+        (record["bundle_key"], int(record["path_id"])): str(record["target_id"])
+        for record in records
+        if record.get("target_id")
+    }
+    result: dict[tuple[str, int], list[str]] = {}
+    for material in materials:
+        target_ids = {
+            target_by_texture[(slot["texture_bundle_key"], int(slot["path_id"]))]
+            for slot in material.get("texture_slots", [])
+            if slot.get("property") in _MAIN_TEXTURE_PROPERTIES
+            and (slot.get("texture_bundle_key"), int(slot.get("path_id", 0))) in target_by_texture
+        }
+        if target_ids:
+            result[(material["bundle_key"], int(material["path_id"]))] = sorted(target_ids)
+    return result
+
+
+def _mesh_pointer(renderer: Any) -> Any | None:
+    pointer = getattr(renderer, "m_Mesh", None)
+    if pointer is not None and int(pointer.m_PathID):
+        return pointer
+    game_object_pointer = getattr(renderer, "m_GameObject", None)
+    if game_object_pointer is None or not int(game_object_pointer.m_PathID):
+        return None
+    game_object = game_object_pointer.read()
+    for component in game_object.m_Component:
+        candidate = component.component
+        try:
+            if candidate.deref().type.name == "MeshFilter":
+                mesh_filter = candidate.read()
+                if int(mesh_filter.m_Mesh.m_PathID):
+                    return mesh_filter.m_Mesh
+        except (FileNotFoundError, KeyError, ValueError):
+            continue
+    return None
+
+
+def _renderer_meshes(
+    bundle_root: Path,
+    records: list[dict[str, Any]],
+    materials: list[dict[str, Any]],
+    paths: ProjectPaths,
+    *,
+    extract: bool,
+) -> list[dict[str, Any]]:
+    """target을 소비하는 Renderer와 실제 UV mesh를 찾아 검증 자료로 저장해요."""
+
+    import numpy as np
+    import UnityPy
+    from UnityPy.helpers.MeshHelper import MeshHandler
+
+    target_materials = _material_targets(records, materials)
+    by_bundle: dict[str, dict[int, list[str]]] = {}
+    texture_dependencies: dict[str, set[str]] = {}
+    for (bundle_key, path_id), target_ids in target_materials.items():
+        by_bundle.setdefault(bundle_key, {})[path_id] = target_ids
+    for material in materials:
+        identity = (material["bundle_key"], int(material["path_id"]))
+        if identity not in target_materials:
+            continue
+        for slot in material.get("texture_slots", []):
+            if slot.get("property") in _MAIN_TEXTURE_PROPERTIES and slot.get("texture_bundle_key"):
+                texture_dependencies.setdefault(material["bundle_key"], set()).add(
+                    str(slot["texture_bundle_key"])
+                )
+
+    catalog_path = bundle_root / "Windows.json"
+    if not catalog_path.is_file():
+        raise FileNotFoundError(f"Renderer/UV 의존성용 게임 카탈로그가 없어요: {catalog_path}")
+    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+
+    def dependency_paths(bundle_key: str) -> list[Path]:
+        metadata = catalog.get(bundle_key)
+        dependencies = metadata.get("Dependencies", []) if isinstance(metadata, dict) else []
+        bundle_parts = Path(bundle_key).parts
+        product_token = ""
+        if "usable_items" in bundle_parts:
+            index = bundle_parts.index("usable_items")
+            if index + 1 < len(bundle_parts):
+                product_token = Path(bundle_parts[index + 1]).stem.removesuffix("_container")
+        preferred = [
+            value
+            for value in dependencies
+            if value.endswith("client_assets.bundle")
+            and "/textures/" not in value
+            and (not product_token or f"/{product_token}/" in value)
+        ]
+        if not preferred:
+            preferred = [
+                value
+                for value in dependencies
+                if value.endswith("client_assets.bundle") and "/textures/" not in value
+            ]
+        result = []
+        for dependency in preferred:
+            candidate = (bundle_root / Path(dependency)).resolve()
+            if candidate.is_file():
+                result.append(candidate)
+        return result
+
+    renderers: list[dict[str, Any]] = []
+    resolved_targets: set[str] = set()
+    mesh_files: dict[tuple[str, int], tuple[Path, dict[str, Any]]] = {}
+    for bundle_key, local_materials in sorted(by_bundle.items()):
+        bundle_path = (bundle_root / Path(bundle_key)).resolve()
+        if not bundle_path.is_file():
+            raise FileNotFoundError(f"Renderer/UV 추출용 bundle이 없어요: {bundle_path}")
+        primary_environment = UnityPy.load(str(bundle_path))
+        primary_asset_names = {str(obj.assets_file.name) for obj in primary_environment.objects}
+        texture_paths = [
+            (bundle_root / Path(value)).resolve()
+            for value in sorted(texture_dependencies.get(bundle_key, set()))
+            if value != bundle_key and (bundle_root / Path(value)).is_file()
+        ]
+        base_environment = (
+            UnityPy.load(str(bundle_path), *(str(value) for value in texture_paths))
+            if texture_paths
+            else primary_environment
+        )
+
+        def pointer_targets(pointer: Any) -> list[str]:
+            if not int(pointer.m_PathID):
+                return []
+            if int(pointer.m_FileID) == 0:
+                return local_materials.get(int(pointer.m_PathID), [])
+            try:
+                resolved = pointer.deref()
+            except (FileNotFoundError, KeyError, ValueError):
+                return []
+            if resolved.type.name != "Material":
+                return []
+            return local_materials.get(int(resolved.path_id), [])
+
+        needs_external_mesh = False
+        for candidate in base_environment.objects:
+            if candidate.type.name not in {"MeshRenderer", "SkinnedMeshRenderer"}:
+                continue
+            if str(candidate.assets_file.name) not in primary_asset_names:
+                continue
+            candidate_renderer = candidate.read()
+            uses_target = any(pointer_targets(pointer) for pointer in candidate_renderer.m_Materials)
+            mesh_candidate = _mesh_pointer(candidate_renderer) if uses_target else None
+            if mesh_candidate is not None and int(mesh_candidate.m_FileID) != 0:
+                needs_external_mesh = True
+                break
+        dependencies = dependency_paths(bundle_key) if needs_external_mesh else []
+        environment = (
+            UnityPy.load(
+                str(bundle_path),
+                *(str(value) for value in [*texture_paths, *dependencies]),
+            )
+            if dependencies
+            else base_environment
+        )
+        for obj in environment.objects:
+            if obj.type.name not in {"MeshRenderer", "SkinnedMeshRenderer"}:
+                continue
+            if str(obj.assets_file.name) not in primary_asset_names:
+                continue
+            renderer = obj.read()
+            material_slots = []
+            for index, pointer in enumerate(renderer.m_Materials):
+                path_id = int(pointer.m_PathID)
+                target_ids = pointer_targets(pointer)
+                material_slots.append(
+                    {
+                        "index": index,
+                        "file_id": int(pointer.m_FileID),
+                        "path_id": path_id,
+                        "target_ids": target_ids,
+                    }
+                )
+            renderer_targets = sorted(
+                {target_id for slot in material_slots for target_id in slot["target_ids"]}
+            )
+            if not renderer_targets:
+                continue
+
+            pointer = _mesh_pointer(renderer)
+            if pointer is None:
+                continue
+            try:
+                mesh_obj = pointer.deref()
+                mesh = pointer.read()
+            except (FileNotFoundError, KeyError, ValueError):
+                continue
+            if mesh_obj.type.name != "Mesh":
+                continue
+
+            mesh_key = (bundle_key, int(mesh_obj.path_id))
+            cached = mesh_files.get(mesh_key)
+            if cached is None:
+                handler = MeshHandler(mesh)
+                handler.process()
+                vertices = np.asarray(handler.m_Vertices, dtype=np.float32)
+                uv0 = (
+                    np.asarray(handler.m_UV0, dtype=np.float32)
+                    if handler.m_UV0 is not None
+                    else np.empty((0, 2), dtype=np.float32)
+                )
+                normals = (
+                    np.asarray(handler.m_Normals, dtype=np.float32)
+                    if handler.m_Normals is not None
+                    else np.empty((0, 3), dtype=np.float32)
+                )
+                tangents = (
+                    np.asarray(handler.m_Tangents, dtype=np.float32)
+                    if handler.m_Tangents is not None
+                    else np.empty((0, 4), dtype=np.float32)
+                )
+                triangles = [np.asarray(value, dtype=np.int32) for value in handler.get_triangles()]
+                if vertices.ndim != 2 or vertices.shape[1] < 3 or len(vertices) == 0:
+                    continue
+                if uv0.ndim != 2 or len(uv0) != len(vertices) or uv0.shape[1] < 2:
+                    continue
+                uv0 = uv0[:, :2]
+                if not triangles or any(value.ndim != 2 or value.shape[1] != 3 for value in triangles):
+                    continue
+                uv_bounds = {
+                    "min": [float(value) for value in uv0.min(axis=0)],
+                    "max": [float(value) for value in uv0.max(axis=0)],
+                }
+                mesh_path = paths.meshes / safe_bundle_name(bundle_key) / f"{mesh_obj.path_id}.npz"
+                if extract:
+                    mesh_path.parent.mkdir(parents=True, exist_ok=True)
+                    arrays: dict[str, Any] = {
+                        "vertices": vertices[:, :3],
+                        "uv0": uv0,
+                        "normals": normals,
+                        "tangents": tangents,
+                    }
+                    arrays.update({f"triangles_{index}": value for index, value in enumerate(triangles)})
+                    np.savez_compressed(mesh_path, **arrays)
+                mesh_metadata = {
+                    "mesh_path_id": int(mesh_obj.path_id),
+                    "mesh": str(mesh.m_Name),
+                    "vertex_count": int(len(vertices)),
+                    "submesh_count": len(triangles),
+                    "triangle_count": int(sum(len(value) for value in triangles)),
+                    "uv0_bounds": uv_bounds,
+                }
+                cached = (mesh_path, mesh_metadata)
+                mesh_files[mesh_key] = cached
+
+            mesh_path, mesh_metadata = cached
+            target_submeshes: dict[str, list[int]] = {target_id: [] for target_id in renderer_targets}
+            if material_slots:
+                for submesh_index in range(int(mesh_metadata["submesh_count"])):
+                    slot = material_slots[min(submesh_index, len(material_slots) - 1)]
+                    for target_id in slot["target_ids"]:
+                        target_submeshes.setdefault(target_id, []).append(submesh_index)
+            target_submeshes = {
+                target_id: submeshes
+                for target_id, submeshes in target_submeshes.items()
+                if submeshes
+            }
+            if not target_submeshes:
+                continue
+            renderer_targets = sorted(target_submeshes)
+            game_object = getattr(renderer, "m_GameObject", None)
+            game_object_name = None
+            if game_object is not None and int(game_object.m_PathID):
+                game_object_name = str(game_object.read().m_Name)
+            resolved_targets.update(renderer_targets)
+            renderers.append(
+                {
+                    "bundle_key": bundle_key,
+                    "bundle_sha256": sha256_file(bundle_path),
+                    "path_id": int(obj.path_id),
+                    "renderer_type": obj.type.name,
+                    "game_object": game_object_name,
+                    "target_ids": renderer_targets,
+                    "target_submeshes": target_submeshes,
+                    "material_slots": material_slots,
+                    "mesh_file": str(mesh_path.resolve()) if extract else None,
+                    **mesh_metadata,
+                }
+            )
+
+    expected_targets = {str(record["target_id"]) for record in records if record.get("target_id")}
+    missing_targets = sorted(expected_targets - resolved_targets)
+    if missing_targets:
+        raise ValueError(f"실제 Renderer/UV Mesh 연결을 찾지 못한 target이 있어요: {missing_targets}")
+    return renderers
+
+
 def _external_materials(
     profile: CollectionProfile,
     bundle_root: Path,
@@ -273,6 +569,7 @@ def scan_collection(
                 source_png.parent.mkdir(parents=True, exist_ok=True)
                 texture.image.save(source_png)
             stream = getattr(texture, "m_StreamData", None)
+            settings = texture.m_TextureSettings
             records.append(
                 {
                     "bundle_key": bundle.key,
@@ -287,6 +584,12 @@ def scan_collection(
                     "height": int(texture.m_Height),
                     "format": int(texture.m_TextureFormat),
                     "mip_count": int(texture.m_MipCount),
+                    "filter_mode": int(settings.m_FilterMode),
+                    "aniso": int(settings.m_Aniso),
+                    "mip_bias": float(settings.m_MipBias),
+                    "wrap_u": int(settings.m_WrapU),
+                    "wrap_v": int(settings.m_WrapV),
+                    "wrap_w": int(settings.m_WrapW),
                     "stream_path": str(getattr(stream, "path", "")),
                     "stream_offset": int(getattr(stream, "offset", 0)),
                     "stream_size": int(getattr(stream, "size", 0)),
@@ -314,6 +617,11 @@ def scan_collection(
     if not missing:
         materials.extend(_external_materials(profile, bundle_root, records, materials))
     _apply_source_overrides(records, overrides, paths)
+    renderers = (
+        _renderer_meshes(bundle_root, records, materials, paths, extract=extract)
+        if not missing
+        else []
+    )
     payload = {
         "schema_version": 2,
         "collection": profile.id,
@@ -323,6 +631,7 @@ def scan_collection(
         "missing_bundles": missing,
         "records": records,
         "materials": materials,
+        "renderers": renderers,
         "source_bundle_overrides": overrides,
     }
     paths.inventory.parent.mkdir(parents=True, exist_ok=True)
@@ -339,8 +648,8 @@ def load_inventory(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema_version") not in {1, 2} or not isinstance(data.get("records"), list):
         raise ValueError(f"지원하지 않는 inventory예요: {path}")
-    if data.get("schema_version") == 1:
-        data.setdefault("materials", [])
+    data.setdefault("materials", [])
+    data.setdefault("renderers", [])
     return data
 
 

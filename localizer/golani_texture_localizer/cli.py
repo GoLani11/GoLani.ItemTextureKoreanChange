@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
 
 from .bundles import repack_collection
+from .candidate import audit_candidate
+from .compose import compose_candidate
 from .deployment import create_release, deploy_release
 from .images import create_review_sheets, stage_candidate, validate_approved
 from .inventory import load_inventory, register_source_override, scan_collection
+from .legacy import create_legacy_layout_sheet
+from .masking import create_old_text_mask
 from .materials import derive_approved_materials
-from .ocr import ocr_doctor, run_ocr, setup_ocr_models
+from .ocr import OcrSession, ocr_doctor, reusable_ocr_report, run_ocr, setup_ocr_models
 from .paths import ProjectPaths, discover_project_root, game_bundle_root
 from .profile import load_profile
+from .uv import generate_uv_review
+from .visual import create_visual_transcription_sheet
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -39,6 +46,21 @@ def _parser() -> argparse.ArgumentParser:
     ocr_run.add_argument("--phase", choices=("source", "candidate"), required=True)
     ocr_run.add_argument("--image", type=Path)
     ocr_run.add_argument("--output", type=Path)
+    ocr_batch = ocr_subparsers.add_parser(
+        "batch", help="모델을 한 번만 올려 여러 품목을 연속 판독해요"
+    )
+    ocr_batch.add_argument("--phase", choices=("source", "candidate"), required=True)
+    ocr_batch.add_argument("--target", action="append", dest="target_ids")
+    ocr_batch.add_argument(
+        "--reference-approved",
+        action="store_true",
+        help="과거 승인본을 조판 참고용으로 판독하며 실제 후보 보고서와 분리해요",
+    )
+    ocr_batch.add_argument(
+        "--force",
+        action="store_true",
+        help="입력 SHA와 OCR 엔진 서명이 같은 완료 보고서도 다시 판독해요",
+    )
 
     source_override = subparsers.add_parser(
         "source-override",
@@ -50,6 +72,42 @@ def _parser() -> argparse.ArgumentParser:
 
     sheets = subparsers.add_parser("review-sheets", help="원본 또는 승인본 검수 시트를 만들어요")
     sheets.add_argument("--approved", action="store_true")
+
+    uv_review = subparsers.add_parser(
+        "uv-review", help="실제 Renderer Mesh에서 절취선·UV 경계 보호 마스크를 만들어요"
+    )
+    uv_review.add_argument("--target", action="append", dest="target_ids")
+    uv_review.add_argument("--padding", type=int, default=4)
+
+    visual_sheets = subparsers.add_parser(
+        "visual-sheets", help="OCR 문자열을 숨긴 독립 시각 판독용 확대 시트를 만들어요"
+    )
+    visual_sheets.add_argument("--target", action="append", dest="target_ids")
+
+    compose = subparsers.add_parser(
+        "compose", help="해시 고정 마스크·글꼴 recipe로 한글 후보를 결정적으로 조판해요"
+    )
+    compose.add_argument("target_id")
+    compose.add_argument("recipe", type=Path)
+
+    mask = subparsers.add_parser(
+        "mask",
+        help="좌표·색 조건과 실제 UV seam으로 원문 글자 마스크를 결정적으로 만들어요",
+    )
+    mask.add_argument("target_id")
+    mask.add_argument("recipe", type=Path)
+
+    candidate_check = subparsers.add_parser(
+        "candidate-check",
+        help="조판·마스크·후보 OCR을 해시로 묶고 시각 비교 시트를 만들어요",
+    )
+    candidate_check.add_argument("target_id")
+
+    legacy_sheets = subparsers.add_parser(
+        "legacy-layout-sheets",
+        help="과거 한글본은 픽셀 재사용 없이 번역·배치 참고 시트로만 만들어요",
+    )
+    legacy_sheets.add_argument("--target", action="append", dest="target_ids")
 
     subparsers.add_parser("validate", help="승인된 전체 이미지의 크기·알파·변경 여부를 검사해요")
     subparsers.add_parser("derive", help="승인된 diffuse를 기준으로 normal·gloss 인쇄 위치를 이식해요")
@@ -107,6 +165,64 @@ def main(argv: list[str] | None = None) -> None:
         if args.ocr_command == "setup":
             _print(setup_ocr_models(paths.root))
             return
+        if args.ocr_command == "batch":
+            inventory = load_inventory(paths.inventory)
+            selected = (
+                [profile.target_by_id(target_id) for target_id in args.target_ids]
+                if args.target_ids
+                else [target for target in profile.targets if target.action == "localize"]
+            )
+            session = OcrSession(paths.root, phase=args.phase)
+            reports = []
+            from .inventory import record_for_target
+
+            for target in selected:
+                if args.reference_approved:
+                    if args.phase != "candidate":
+                        raise ValueError("--reference-approved는 candidate phase에서만 사용할 수 있어요")
+                    image = paths.approved / f"{target.id}.png"
+                    report_name = "legacy-approved-ocr.json"
+                elif args.phase == "source":
+                    image = Path(record_for_target(inventory, target)["source_png"])
+                    report_name = "source-ocr.json"
+                else:
+                    image = paths.drafts / target.id / "candidate.png"
+                    report_name = "candidate-ocr.json"
+                if not image.is_file():
+                    reports.append(
+                        {"target_id": target.id, "passed": False, "reason": f"이미지가 없어요: {image}"}
+                    )
+                    continue
+                output = paths.reviews / target.id / report_name
+                cached = None if args.force else reusable_ocr_report(session, image, output)
+                result = cached or session.run(image, output)
+                reports.append(
+                    {
+                        "target_id": target.id,
+                        "passed": not result["errors"],
+                        "report": str(output),
+                        "reused": cached is not None,
+                        "image_sha256": result["image_sha256"],
+                        "detections": len(result["detections"]),
+                        "conflicting_regions": sum(
+                            bool(detection.get("conflicting_readings"))
+                            for detection in result["detections"]
+                        ),
+                        "errors": len(result["errors"]),
+                    }
+                )
+            _print(
+                {
+                    "phase": args.phase,
+                    "target_count": len(selected),
+                    "passed": all(report["passed"] for report in reports),
+                    "reports": reports,
+                    "requires_independent_visual_review": True,
+                }
+            )
+            if not all(report["passed"] for report in reports):
+                raise SystemExit(2)
+            return
         target = profile.target_by_id(args.target_id)
         if args.image:
             image = args.image.expanduser().resolve()
@@ -116,7 +232,7 @@ def main(argv: list[str] | None = None) -> None:
 
             image = Path(record_for_target(inventory, target)["source_png"])
         else:
-            image = paths.drafts / f"{target.id}.png"
+            image = paths.drafts / target.id / "candidate.png"
         output = (
             args.output.expanduser().resolve()
             if args.output
@@ -155,6 +271,101 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "review-sheets":
         outputs = create_review_sheets(profile, paths, approved=args.approved)
         _print({"sheets": [str(path) for path in outputs]})
+        return
+
+    if args.command == "uv-review":
+        inventory = load_inventory(paths.inventory)
+        target_ids = args.target_ids or [target.id for target in profile.targets]
+        reports = [
+            generate_uv_review(paths, inventory, target_id, padding=args.padding)
+            for target_id in target_ids
+        ]
+        _print(
+            {
+                "target_count": len(reports),
+                "passed": all(report["passed"] for report in reports),
+                "reports": reports,
+            }
+        )
+        return
+
+    if args.command == "visual-sheets":
+        inventory = load_inventory(paths.inventory)
+        from .inventory import record_for_target
+
+        selected = (
+            [profile.target_by_id(target_id) for target_id in args.target_ids]
+            if args.target_ids
+            else [target for target in profile.targets if target.action == "localize"]
+        )
+        reports = []
+        for target in selected:
+            source = Path(record_for_target(inventory, target)["source_png"])
+            reports.append(
+                create_visual_transcription_sheet(
+                    paths,
+                    target.id,
+                    source,
+                    paths.reviews / target.id / "source-ocr.json",
+                )
+            )
+        _print({"target_count": len(reports), "passed": True, "reports": reports})
+        return
+
+    if args.command == "compose":
+        _print(compose_candidate(paths, args.target_id, args.recipe.expanduser().resolve()))
+        return
+
+    if args.command == "mask":
+        _print(create_old_text_mask(paths, args.target_id, args.recipe.expanduser().resolve()))
+        return
+
+    if args.command == "candidate-check":
+        target = profile.target_by_id(args.target_id)
+        result = audit_candidate(target, paths)
+        _print(result)
+        if not result["passed"]:
+            raise SystemExit(2)
+        return
+
+    if args.command == "legacy-layout-sheets":
+        inventory = load_inventory(paths.inventory)
+        from .inventory import record_for_target
+
+        selected = (
+            [profile.target_by_id(target_id) for target_id in args.target_ids]
+            if args.target_ids
+            else [target for target in profile.targets if target.action == "localize"]
+        )
+        reports = []
+        missing = []
+        for target in selected:
+            ocr_report = paths.reviews / target.id / "legacy-approved-ocr.json"
+            legacy = paths.approved / f"{target.id}.png"
+            if not ocr_report.is_file() or not legacy.is_file():
+                missing.append(target.id)
+                continue
+            source = Path(record_for_target(inventory, target)["source_png"])
+            reports.append(
+                create_legacy_layout_sheet(
+                    paths,
+                    target.id,
+                    source,
+                    legacy,
+                    ocr_report,
+                )
+            )
+        _print(
+            {
+                "target_count": len(selected),
+                "created": len(reports),
+                "missing": missing,
+                "passed": not missing,
+                "reports": reports,
+            }
+        )
+        if missing:
+            raise SystemExit(2)
         return
 
     if args.command == "validate":
@@ -197,7 +408,21 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "status":
         inventory = load_inventory(paths.inventory)
-        approved = {path.stem for path in paths.approved.glob("*.png")} if paths.approved.is_dir() else set()
+        localized = {target.id for target in profile.targets if target.action == "localize"}
+        approved = {
+            path.name.removesuffix(".approval.json")
+            for path in paths.approved.glob("*.approval.json")
+            if (paths.approved / path.name.removesuffix(".approval.json")).with_suffix(".png").is_file()
+        } if paths.approved.is_dir() else set()
+        stage_counts: dict[str, Counter[str]] = {}
+        for target in profile.targets:
+            review_file = paths.reviews / target.id / "review.json"
+            if not review_file.is_file():
+                continue
+            review = json.loads(review_file.read_text(encoding="utf-8"))
+            for name, stage in review.get("stages", {}).items():
+                if isinstance(stage, dict):
+                    stage_counts.setdefault(name, Counter())[str(stage.get("status", "missing"))] += 1
         _print(
             {
                 "collection": profile.id,
@@ -206,9 +431,19 @@ def main(argv: list[str] | None = None) -> None:
                 "target_count": len(profile.targets),
                 "localization_count": sum(target.action == "localize" for target in profile.targets),
                 "preserved_count": sum(target.action == "preserve" for target in profile.targets),
-                "approved_count": len(
-                    approved & {target.id for target in profile.targets if target.action == "localize"}
+                "approved_count": len(approved & localized),
+                "source_ocr_reports": len(list(paths.reviews.glob("*/source-ocr.json"))),
+                "independent_visual_sheets": len(
+                    list(paths.reviews.glob("*/visual-source-index.json"))
                 ),
+                "uv_mesh_reviews": len(list(paths.reviews.glob("*/uv-report.json"))),
+                "legacy_layout_references": len(
+                    list(paths.reviews.glob("*/legacy-layout-index.json"))
+                ),
+                "review_stage_status": {
+                    name: dict(sorted(counts.items()))
+                    for name, counts in sorted(stage_counts.items())
+                },
                 "pending": [
                     target.id
                     for target in profile.targets

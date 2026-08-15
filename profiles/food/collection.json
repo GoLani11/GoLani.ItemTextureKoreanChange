@@ -47,7 +47,7 @@
     {"label": "문샤인 보조맵", "key": "assets/content/weapons/usable_items/item_alcohol_moonshine/textures/client_assets.bundle"}
   ],
   "targets": [
-    {"id": "mayo", "texture": "item_food_mayo_D", "bundle_key": "assets/content/items/food/item_food_mayo/item_food_mayo.bundle", "name_ko": "마요네즈", "category": "food", "exact_text": ["마요네즈"]},
+    {"id": "mayo", "texture": "item_food_mayo_D", "bundle_key": "assets/content/items/food/item_food_mayo/item_food_mayo.bundle", "name_ko": "마요네즈", "category": "food", "exact_text": ["1큰술당", "90\nkcal", "포화\n1.5g", "나트륨\n90mg", "당류\n0g", "887mL", "데빌독", "최고급\n마요네즈", "더\n맛있게", "영양정보\n1큰술(15g)당\n90 kcal\n총지방 10g\n포화지방 1.5g\n나트륨 90mg\n탄수화물 0g\n당류 0g\n단백질 0g", "최고급\n품질", "원재료: 대두유, 물, 전란, 난황,\n식초, 소금, 설탕, 레몬즙,\n천연향료, 이디티에이칼슘이나트륨\n(품질 유지용)", "천연\n재료", "데빌독 최고급 마요네즈"], "notes": "PPG는 브랜드 로고, PET는 재질 코드이므로 번역하지 않고 보존한다. 뚜껑 원호 문구는 같은 한글을 위·아래 2회 배치하며 Nutrition Facts와 ingredients를 포함한 확인 가능한 설명 문구를 모두 번역한다."},
     {"id": "sausage", "texture": "item_food_sausage_LOD0_diff", "bundle_key": "assets/content/weapons/usable_items/item_food_sausage/client_assets.bundle", "name_ko": "소시지", "category": "food", "exact_text": ["소시지"]},
     {"id": "vodka", "texture": "item_food_vodka_D", "bundle_key": "assets/content/items/food/bottles_with_alcohol/item_food_vodka.bundle", "name_ko": "보드카", "category": "drink", "exact_text": ["보드카"]},
     {"id": "jack", "texture": "item_food_jack_D", "bundle_key": "assets/content/items/food/bottles_with_alcohol/item_food_jack.bundle", "name_ko": "댄 재키엘", "category": "drink", "exact_text": ["댄 재키엘"]},

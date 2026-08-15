@@ -27,6 +27,12 @@ from .unityfs import (
 )
 
 
+# BC 계열의 4x4 블록이 하위 mip 전체를 차지할 때 정상 no-op 왕복에서도
+# 경계 p99가 48을 넘을 수 있어요. 실제 BC7 원본 왕복으로 교정한 하한이에요.
+_ROUNDTRIP_P99_FLOOR = 64.0
+_ROUNDTRIP_MAX_FLOOR = 128.0
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -91,6 +97,94 @@ def _resize_float(values: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return cv2.resize(values, size, interpolation=cv2.INTER_AREA)
 
 
+def _roundtrip_limits(
+    role: str,
+    width: int,
+    height: int,
+    max_mae: float,
+) -> tuple[float, float, float]:
+    """역할·밉 크기별 정상 블록 압축 왕복 한계를 돌려줘요."""
+
+    minimum = min(width, height)
+    mae_limit = max_mae
+    p99_limit = max(_ROUNDTRIP_P99_FLOOR, max_mae * 8.0)
+    if role == "diffuse":
+        # 4x4는 BC7 한 블록이 mip 전체라 UV padding 뒤의 유효한 색 분포에서도
+        # Mayo 원본 no-op 왕복 최대 channel MAE 20.875가 측정됐어요.
+        if minimum == 4:
+            mae_limit = max(mae_limit, 24.0)
+        elif minimum <= 2:
+            mae_limit = max(mae_limit, 16.0)
+        elif minimum <= 32:
+            mae_limit = max(mae_limit, 12.0)
+        elif minimum <= 64:
+            mae_limit = max(mae_limit, 8.0)
+        if minimum <= 32:
+            p99_limit = max(p99_limit, 80.0)
+    return mae_limit, p99_limit, _ROUNDTRIP_MAX_FLOOR
+
+
+def _coverage_values(coverage: Image.Image, size: tuple[int, int]) -> np.ndarray:
+    if coverage.size != size or coverage.mode not in {"1", "L"}:
+        raise ValueError("UV coverage 규격이 텍스처와 달라요")
+    values = np.asarray(coverage.convert("L"), dtype=np.uint8)
+    if not set(int(value) for value in np.unique(values)).issubset({0, 255}):
+        raise ValueError("UV coverage는 0/255만 사용해야 해요")
+    result = values == 255
+    if not result.any():
+        raise ValueError("UV coverage가 비어 있어요")
+    return result
+
+
+def _pad_uv_outside(image: Image.Image, coverage: np.ndarray) -> Image.Image:
+    """UV island 밖을 가장 가까운 island texel로 채워 하위 mip의 atlas bleed를 막아요."""
+
+    import cv2
+
+    rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+    if coverage.shape != rgba.shape[:2]:
+        raise ValueError("UV coverage 크기가 mip과 달라요")
+    if not coverage.any():
+        raise ValueError("UV coverage가 비어 있어요")
+    if coverage.all():
+        return Image.fromarray(rgba.copy(), "RGBA")
+
+    # distanceTransformWithLabels의 PIXEL label은 각 0 픽셀(coverage)에 대응해요.
+    outside = np.where(coverage, 0, 255).astype(np.uint8)
+    _, labels = cv2.distanceTransformWithLabels(
+        outside,
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    covered_flat = np.flatnonzero(coverage)
+    covered_labels = labels.reshape(-1)[covered_flat]
+    maximum_label = int(labels.max())
+    nearest = np.full(maximum_label + 1, -1, dtype=np.int64)
+    nearest[covered_labels] = covered_flat
+    source_indices = nearest[labels]
+    if np.any(source_indices < 0):
+        raise AssertionError("UV coverage의 최근접 texel을 찾지 못했어요")
+    output = rgba.copy().reshape(-1, 4)
+    outside_flat = ~coverage.reshape(-1)
+    output[outside_flat] = rgba.reshape(-1, 4)[source_indices.reshape(-1)[outside_flat]]
+    return Image.fromarray(output.reshape(rgba.shape), "RGBA")
+
+
+def _resize_coverage(coverage: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    import cv2
+
+    resized = cv2.resize(
+        coverage.astype(np.uint8) * 255,
+        size,
+        interpolation=cv2.INTER_AREA,
+    )
+    result = resized > 0
+    if not result.any():
+        raise AssertionError("하위 mip에서 UV coverage가 사라졌어요")
+    return result
+
+
 def _next_mip(image: Image.Image, role: str) -> Image.Image:
     size = (max(1, image.width // 2), max(1, image.height // 2))
     rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
@@ -118,12 +212,41 @@ def _next_mip(image: Image.Image, role: str) -> Image.Image:
     raise ValueError(f"지원하지 않는 텍스처 역할이에요: {role}")
 
 
-def _encode_mip_chain(obj: Any, texture: Any, image: Image.Image, role: str) -> bytes:
+def _mip_chain(
+    image: Image.Image,
+    role: str,
+    count: int,
+    *,
+    coverage: Image.Image | None = None,
+) -> list[Image.Image]:
+    if count < 1:
+        raise ValueError("mip 수는 1 이상이어야 해요")
+    levels = [image.convert("RGBA")]
+    coverage_values = _coverage_values(coverage, image.size) if coverage is not None else None
+    while len(levels) < count:
+        current = levels[-1]
+        if coverage_values is not None:
+            current = _pad_uv_outside(current, coverage_values)
+        next_level = _next_mip(current, role)
+        if coverage_values is not None:
+            coverage_values = _resize_coverage(coverage_values, next_level.size)
+            next_level = _pad_uv_outside(next_level, coverage_values)
+        levels.append(next_level)
+    return levels
+
+
+def _encode_mip_parts(
+    obj: Any,
+    texture: Any,
+    image: Image.Image,
+    role: str,
+    coverage: Image.Image | None = None,
+) -> tuple[list[bytes], list[Image.Image]]:
     from UnityPy.export import Texture2DConverter
 
     parts: list[bytes] = []
-    level = image
-    for index in range(texture.m_MipCount):
+    levels = _mip_chain(image, role, texture.m_MipCount, coverage=coverage)
+    for index, level in enumerate(levels):
         encoded, actual_format = Texture2DConverter.image_to_texture2d(
             level,
             texture.m_TextureFormat,
@@ -133,9 +256,53 @@ def _encode_mip_chain(obj: Any, texture: Any, image: Image.Image, role: str) -> 
         if actual_format != texture.m_TextureFormat:
             raise ValueError(f"mip {index} 포맷이 {actual_format}으로 바뀌었어요")
         parts.append(encoded)
-        if index + 1 < texture.m_MipCount:
-            level = _next_mip(level, role)
+    return parts, levels
+
+
+def _encode_mip_chain(
+    obj: Any,
+    texture: Any,
+    image: Image.Image,
+    role: str,
+    coverage: Image.Image | None = None,
+) -> bytes:
+    parts, _ = _encode_mip_parts(obj, texture, image, role, coverage)
     return b"".join(parts)
+
+
+def _decode_mip_parts(
+    obj: Any,
+    texture: Any,
+    payload: bytes,
+    part_lengths: list[int],
+) -> list[Image.Image]:
+    from UnityPy.export import Texture2DConverter
+
+    if len(part_lengths) != texture.m_MipCount or sum(part_lengths) != len(payload):
+        raise ValueError("mip payload 길이 명세가 실제 데이터와 달라요")
+    levels: list[Image.Image] = []
+    width, height = texture.m_Width, texture.m_Height
+    offset = 0
+    version = getattr(obj, "version", (0, 0, 0, 0))
+    for index, length in enumerate(part_lengths):
+        part = payload[offset : offset + length]
+        offset += length
+        try:
+            level = Texture2DConverter.parse_image_data(
+                part,
+                width,
+                height,
+                texture.m_TextureFormat,
+                version,
+                obj.platform,
+                texture.m_PlatformBlob,
+                flip=True,
+            ).convert("RGBA")
+        except Exception as exc:
+            raise ValueError(f"mip {index} 디코딩에 실패했어요: {exc}") from exc
+        levels.append(level)
+        width, height = max(1, width // 2), max(1, height // 2)
+    return levels
 
 
 def _atomic_write(path: Path, value: bytes) -> None:
@@ -194,6 +361,56 @@ def _verified_source_bundle(
     return source
 
 
+def _verified_uv_coverage(
+    paths: ProjectPaths,
+    inventory: dict[str, Any],
+    target_id: str,
+) -> Path:
+    records = [record for record in inventory["records"] if record.get("target_id") == target_id]
+    if len(records) != 1:
+        raise ValueError(f"{target_id} 원본 record는 정확히 하나여야 해요")
+    source = Path(records[0]["source_png"])
+    report_path = paths.reviews / target_id / "uv-report.json"
+    if not report_path.is_file():
+        raise FileNotFoundError(f"{target_id} UV 검토 보고서가 없어요: {report_path}")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if (
+        report.get("schema_version") != 1
+        or report.get("target_id") != target_id
+        or report.get("passed") is not True
+    ):
+        raise ValueError(f"{target_id} UV 검토 보고서가 통과 상태가 아니에요")
+    if not source.is_file() or report.get("source_sha256") != _sha256_file(source):
+        raise ValueError(f"{target_id} UV 검토 뒤 원본이 변경됐어요")
+    for mesh_value, expected_sha256 in report.get("mesh_sha256", {}).items():
+        mesh = Path(mesh_value)
+        if not mesh.is_file() or _sha256_file(mesh) != expected_sha256:
+            raise ValueError(f"{target_id} UV 검토 뒤 mesh가 변경됐어요: {mesh}")
+    coverage = Path(str(report.get("coverage", "")))
+    if not coverage.is_file() or report.get("coverage_sha256") != _sha256_file(coverage):
+        raise ValueError(f"{target_id} UV coverage가 없거나 SHA가 달라요")
+    with Image.open(coverage) as coverage_file:
+        expected_size = (int(records[0]["width"]), int(records[0]["height"]))
+        _coverage_values(coverage_file, expected_size)
+    return coverage
+
+
+def _combined_uv_coverage(
+    paths: list[Path],
+    size: tuple[int, int],
+) -> tuple[Image.Image, list[dict[str, str]]]:
+    if not paths:
+        raise ValueError("Texture2D의 UV coverage가 명시되지 않았어요")
+    combined = np.zeros((size[1], size[0]), dtype=bool)
+    sources = []
+    for path in dict.fromkeys(value.expanduser().resolve() for value in paths):
+        with Image.open(path) as coverage_file:
+            values = _coverage_values(coverage_file, size)
+        combined |= values
+        sources.append({"path": str(path), "sha256": _sha256_file(path)})
+    return Image.fromarray(combined.astype(np.uint8) * 255, "L"), sources
+
+
 def patch_bundle_exact(
     source_bundle: Path,
     output_bundle: Path,
@@ -202,6 +419,7 @@ def patch_bundle_exact(
     roundtrip_dir: Path | None = None,
     max_mae: float = 6.0,
     roles: Mapping[str, str] | None = None,
+    coverage_masks: Mapping[str, list[Path]] | None = None,
 ) -> dict[str, Any]:
     import UnityPy
 
@@ -237,7 +455,18 @@ def patch_bundle_exact(
         role = (roles or {}).get(texture_name)
         if role not in {"diffuse", "normal", "gloss"}:
             raise ValueError(f"{texture_name}의 diffuse/normal/gloss 역할이 명시되지 않았어요")
-        payload = _encode_mip_chain(obj, texture, image, role)
+        coverage, coverage_sources = _combined_uv_coverage(
+            list((coverage_masks or {}).get(texture_name, [])),
+            image.size,
+        )
+        mip_parts, intended_mips = _encode_mip_parts(
+            obj,
+            texture,
+            image,
+            role,
+            coverage,
+        )
+        payload = b"".join(mip_parts)
         if len(payload) != stream.size:
             raise ValueError(f"{texture_name} payload {len(payload)} != stream size {stream.size}")
         resource_name = stream.path.rsplit("/", 1)[-1]
@@ -255,11 +484,13 @@ def patch_bundle_exact(
         physical_ranges.extend((patch.start, patch.end) for patch in patches)
         expected[texture_name] = {
             "metadata": metadata,
-            "image": image,
+            "mips": intended_mips,
+            "mip_part_lengths": [len(part) for part in mip_parts],
             "image_path": image_path,
             "payload_size": len(payload),
             "resource": resource_name,
             "role": role,
+            "coverage_sources": coverage_sources,
         }
 
     merged_ranges = merge_ranges(physical_ranges)
@@ -275,49 +506,97 @@ def patch_bundle_exact(
 
     texture_reports = []
     for texture_name, info in expected.items():
-        _, texture = _find_texture(rebuilt, texture_name)
+        rebuilt_obj, texture = _find_texture(rebuilt, texture_name)
         if _texture_metadata(texture) != info["metadata"]:
             raise AssertionError(f"{texture_name} metadata가 변경됐어요")
-        roundtrip = texture.image.convert("RGBA")
-        intended = np.asarray(info["image"], dtype=np.int16)
-        actual = np.asarray(roundtrip, dtype=np.int16)
-        if intended.shape != actual.shape:
-            raise AssertionError(f"{texture_name} 왕복 이미지 shape가 달라요")
-        channel_mae = np.abs(intended - actual).mean(axis=(0, 1))
-        absolute = np.abs(intended - actual)
-        p95 = np.percentile(absolute, 95, axis=(0, 1))
-        p99 = np.percentile(absolute, 99, axis=(0, 1))
-        maximum = absolute.max(axis=(0, 1))
-        localized_p99_limit = max(32.0, max_mae * 8.0)
-        if np.any(channel_mae > max_mae):
-            raise AssertionError(
-                f"{texture_name} 왕복 MAE {channel_mae.tolist()}가 제한 {max_mae}를 넘었어요"
+        roundtrip_mips = _decode_mip_parts(
+            rebuilt_obj,
+            texture,
+            bytes(texture.get_image_data()),
+            info["mip_part_lengths"],
+        )
+        if len(roundtrip_mips) != len(info["mips"]):
+            raise AssertionError(f"{texture_name} 왕복 mip 수가 달라요")
+        mip_reports = []
+        for index, (intended_image, roundtrip) in enumerate(
+            zip(info["mips"], roundtrip_mips, strict=True)
+        ):
+            intended = np.asarray(intended_image, dtype=np.int16)
+            actual = np.asarray(roundtrip, dtype=np.int16)
+            if intended.shape != actual.shape:
+                raise AssertionError(f"{texture_name} mip {index} 왕복 이미지 shape가 달라요")
+            absolute = np.abs(intended - actual)
+            channel_mae = absolute.mean(axis=(0, 1))
+            p95 = np.percentile(absolute, 95, axis=(0, 1))
+            p99 = np.percentile(absolute, 99, axis=(0, 1))
+            maximum = absolute.max(axis=(0, 1))
+            mae_limit, localized_p99_limit, maximum_limit = _roundtrip_limits(
+                info["role"],
+                intended_image.width,
+                intended_image.height,
+                max_mae,
             )
-        if np.any(p99 > localized_p99_limit):
-            raise AssertionError(
-                f"{texture_name} 왕복 p99 {p99.tolist()}가 제한 {localized_p99_limit}를 넘었어요"
+            if np.any(channel_mae > mae_limit):
+                raise AssertionError(
+                    f"{texture_name} mip {index} 왕복 MAE {channel_mae.tolist()}가 "
+                    f"제한 {mae_limit}를 넘었어요"
+                )
+            if np.any(p99 > localized_p99_limit):
+                raise AssertionError(
+                    f"{texture_name} mip {index} 왕복 p99 {p99.tolist()}가 "
+                    f"제한 {localized_p99_limit}를 넘었어요"
+                )
+            if np.any(maximum > maximum_limit):
+                raise AssertionError(
+                    f"{texture_name} mip {index} 왕복 최대 오차 {maximum.tolist()}가 "
+                    f"제한 {maximum_limit}를 넘었어요"
+                )
+            roundtrip_path = None
+            if roundtrip_dir is not None:
+                suffix = "" if index == 0 else f".mip-{index:02d}"
+                roundtrip_path = roundtrip_dir / f"{texture_name}{suffix}.png"
+                roundtrip_path.parent.mkdir(parents=True, exist_ok=True)
+                roundtrip.save(roundtrip_path)
+            mip_reports.append(
+                {
+                    "level": index,
+                    "width": intended_image.width,
+                    "height": intended_image.height,
+                    "payload_size": info["mip_part_lengths"][index],
+                    "channel_mae": [round(float(value), 6) for value in channel_mae],
+                    "channel_p95": [round(float(value), 6) for value in p95],
+                    "channel_p99": [round(float(value), 6) for value in p99],
+                    "channel_max": [int(value) for value in maximum],
+                    "limits": {
+                        "channel_mae": mae_limit,
+                        "channel_p99": localized_p99_limit,
+                        "channel_max": maximum_limit,
+                    },
+                    "roundtrip": str(roundtrip_path) if roundtrip_path else None,
+                }
             )
-        roundtrip_path = None
-        if roundtrip_dir is not None:
-            roundtrip_path = roundtrip_dir / f"{texture_name}.png"
-            roundtrip_path.parent.mkdir(parents=True, exist_ok=True)
-            roundtrip.save(roundtrip_path)
+        top = mip_reports[0]
         texture_reports.append(
             {
                 "texture": texture_name,
                 "source_image": str(info["image_path"]),
                 "payload_size": info["payload_size"],
                 "resource": info["resource"],
-                "channel_mae": [round(float(value), 6) for value in channel_mae],
-                "channel_p95": [round(float(value), 6) for value in p95],
-                "channel_p99": [round(float(value), 6) for value in p99],
-                "channel_max": [int(value) for value in maximum],
+                "channel_mae": top["channel_mae"],
+                "channel_p95": top["channel_p95"],
+                "channel_p99": top["channel_p99"],
+                "channel_max": top["channel_max"],
                 "mip_filter": {
-                    "diffuse": "linear-light-area",
-                    "normal": "vector-area-renormalized",
-                    "gloss": "linear-area",
+                    "diffuse": "uv-nearest-pad+linear-light-area",
+                    "normal": "uv-nearest-pad+vector-area-renormalized",
+                    "gloss": "uv-nearest-pad+linear-area",
                 }[info["role"]],
-                "roundtrip": str(roundtrip_path) if roundtrip_path else None,
+                "uv_coverage": info["coverage_sources"],
+                "uv_padding_verified": True,
+                "roundtrip": top["roundtrip"],
+                "checked_mips": [report["level"] for report in mip_reports],
+                "missing_mips": 0,
+                "mips": mip_reports,
             }
         )
 
@@ -356,6 +635,7 @@ def repack_collection(
     inventory = load_inventory(paths.inventory)
     groups: dict[str, dict[str, Path]] = {}
     roles: dict[str, dict[str, str]] = {}
+    coverage_masks: dict[str, dict[str, list[Path]]] = {}
     for target in profile.targets:
         approved = paths.approved / f"{target.id}.png"
         if target.action != "localize" or not approved.is_file():
@@ -363,6 +643,9 @@ def repack_collection(
         record = record_for_target(inventory, target)
         groups.setdefault(record["bundle_key"], {})[record["texture"]] = approved
         roles.setdefault(record["bundle_key"], {})[record["texture"]] = "diffuse"
+        coverage_masks.setdefault(record["bundle_key"], {}).setdefault(
+            record["texture"], []
+        ).append(_verified_uv_coverage(paths, inventory, target.id))
 
     if not paths.derived_manifest.is_file():
         raise ValueError("현재 승인 SHA에 묶인 D/N/G derived manifest가 없어요")
@@ -387,6 +670,11 @@ def repack_collection(
             raise ValueError(f"{target.id} 재질 검증 뒤 승인본이 변경됐어요")
         if value.get("approval_sha256") != sha256_file(approval_path(paths, target.id)):
             raise ValueError(f"{target.id} 재질 검증 뒤 승인 증거가 변경됐어요")
+    auxiliary_plans = {
+        (value.get("texture_bundle_key"), int(value.get("path_id", 0)), value.get("role")): value
+        for value in derived.get("auxiliary_plans", [])
+        if isinstance(value, dict)
+    }
     output_targets = {output.get("target_id") for output in derived.get("outputs", [])}
     unknown = output_targets - expected_targets
     if unknown:
@@ -411,6 +699,20 @@ def repack_collection(
                 )
         groups.setdefault(output["bundle_key"], {})[output["texture"]] = source
         roles.setdefault(output["bundle_key"], {})[output["texture"]] = output["role"]
+        plan = auxiliary_plans.get(
+            (output["bundle_key"], int(output["path_id"]), output["role"])
+        )
+        if not isinstance(plan, dict) or not plan.get("target_ids"):
+            raise ValueError(
+                f"{output['texture']} 보조맵의 실제 target/UV coverage 계획이 없어요"
+            )
+        destination_coverages = coverage_masks.setdefault(output["bundle_key"], {}).setdefault(
+            output["texture"], []
+        )
+        for target_id in plan["target_ids"]:
+            destination_coverages.append(
+                _verified_uv_coverage(paths, inventory, str(target_id))
+            )
 
     reports = []
     overrides = inventory.get("source_bundle_overrides", {})
@@ -430,6 +732,7 @@ def repack_collection(
             roundtrip_dir=roundtrip,
             max_mae=max_mae,
             roles=roles[bundle_key],
+            coverage_masks=coverage_masks[bundle_key],
         )
         report["bundle_key"] = bundle_key
         report_path = paths.reports / "bundles" / f"{safe_bundle_name(bundle_key)}.json"

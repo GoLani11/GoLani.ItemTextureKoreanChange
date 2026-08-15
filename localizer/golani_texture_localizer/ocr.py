@@ -338,32 +338,97 @@ def run_ocr(
     *,
     phase: str,
 ) -> dict[str, Any]:
-    if phase not in {"source", "candidate"}:
-        raise ValueError("OCR phase는 source 또는 candidate여야 해요")
-    config = load_ocr_config(project_root)
-    recognizers = config[f"{phase}_recognizers"]
-    pipelines = [
-        (recognizer, _paddle_pipeline(config["detector"], recognizer, config.get("device", "cpu")))
-        for recognizer in recognizers
-    ]
+    session = OcrSession(project_root, phase=phase)
+    return session.run(image_path, output_path)
+
+
+class OcrSession:
+    """OCR 모델을 한 번만 올려 여러 텍스처를 같은 설정으로 판독해요."""
+
+    def __init__(self, project_root: Path, *, phase: str):
+        if phase not in {"source", "candidate"}:
+            raise ValueError("OCR phase는 source 또는 candidate여야 해요")
+        self.project_root = project_root
+        self.phase = phase
+        self.config = load_ocr_config(project_root)
+        self.recognizers = self.config[f"{phase}_recognizers"]
+        self.pipelines = [
+            (
+                recognizer,
+                _paddle_pipeline(
+                    self.config["detector"], recognizer, self.config.get("device", "cpu")
+                ),
+            )
+            for recognizer in self.recognizers
+        ]
+        try:
+            import easyocr
+        except ImportError as exc:
+            raise OcrUnavailable("EasyOCR가 OCR 전용 환경에 설치되지 않았어요") from exc
+        easy_root = _easy_cache(project_root)
+        self.readers = [
+            (
+                tuple(languages),
+                easyocr.Reader(
+                    languages,
+                    gpu=False,
+                    model_storage_directory=str(easy_root),
+                    download_enabled=False,
+                    verbose=False,
+                ),
+            )
+            for languages in self.config["easyocr_languages"][phase]
+        ]
+
+    @property
+    def engine_signature(self) -> dict[str, Any]:
+        return {
+            "paddleocr": _package_version("paddleocr"),
+            "paddlepaddle": _package_version("paddlepaddle"),
+            "easyocr": _package_version("easyocr"),
+            "torch": _package_version("torch"),
+            "detector": self.config["detector"],
+            "recognizers": self.recognizers,
+        }
+
+    def run(self, image_path: Path, output_path: Path) -> dict[str, Any]:
+        return _run_ocr_session(self, image_path, output_path)
+
+
+def reusable_ocr_report(
+    session: OcrSession,
+    image_path: Path,
+    output_path: Path,
+) -> dict[str, Any] | None:
+    if not output_path.is_file():
+        return None
     try:
-        import easyocr
-    except ImportError as exc:
-        raise OcrUnavailable("EasyOCR가 OCR 전용 환경에 설치되지 않았어요") from exc
-    easy_root = _easy_cache(project_root)
-    readers = [
-        (
-            tuple(languages),
-            easyocr.Reader(
-                languages,
-                gpu=False,
-                model_storage_directory=str(easy_root),
-                download_enabled=False,
-                verbose=False,
-            ),
-        )
-        for languages in config["easyocr_languages"][phase]
-    ]
+        report = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    expected = {
+        "schema_version": 1,
+        "phase": session.phase,
+        "image_sha256": _sha256(image_path),
+        "engine_signature": session.engine_signature,
+        "status": "completed",
+        "errors": [],
+    }
+    if all(report.get(key) == value for key, value in expected.items()):
+        return report
+    return None
+
+
+def _run_ocr_session(
+    session: OcrSession,
+    image_path: Path,
+    output_path: Path,
+) -> dict[str, Any]:
+    phase = session.phase
+    config = session.config
+    recognizers = session.recognizers
+    pipelines = session.pipelines
+    readers = session.readers
     with Image.open(image_path) as source_file:
         image_size = source_file.size
     minimum = float(config["minimum_confidence"])
@@ -449,14 +514,7 @@ def run_ocr(
         "image_sha256": _sha256(image_path),
         "width": image_size[0],
         "height": image_size[1],
-        "engine_signature": {
-            "paddleocr": _package_version("paddleocr"),
-            "paddlepaddle": _package_version("paddlepaddle"),
-            "easyocr": _package_version("easyocr"),
-            "torch": _package_version("torch"),
-            "detector": config["detector"],
-            "recognizers": recognizers,
-        },
+        "engine_signature": session.engine_signature,
         "variant_count": variant_count,
         "detections": compact,
         "errors": errors,

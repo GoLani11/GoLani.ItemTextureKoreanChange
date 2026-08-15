@@ -33,20 +33,43 @@ SPT가 `D:\SPT`가 아니면 `SPT_DIR` 환경변수 또는 `--spt-root`를 지�
 ## 안전한 작업 흐름
 
 1. `1_추출.bat`: 원본 Texture2D와 실제 Material 연결을 `workspace/`에 기록해요.
-2. 품목별 작업 기록을 만들고 원본 OCR을 실행해요.
+2. 품목별 작업 기록을 만들고 원본 OCR을 실행해요. 전체 배치는 완료 보고서의 입력 SHA와
+   모델 서명이 같으면 안전하게 이어서 실행해요.
 
 ```bat
 work\.venv\Scripts\python.exe .agents\skills\localize-spt-food-textures\scripts\review_record.py init mayo
 work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase source
+work\.venv-ocr\Scripts\python.exe localize.py ocr batch --phase source
 ```
 
-3. Codex가 원본을 독립 판독하고 OCR과 교차 검증해 번역·좌표·방향·UV 면을 확정해요.
+3. 실제 Renderer→Material→Mesh 연결에서 UV 경계를 추출하고, OCR 문자열을 숨긴 확대 시트로
+   Codex가 원본을 독립 판독해요. 그 뒤 OCR과 교차 검증해 번역·좌표·방향·UV 면을 확정해요.
+
+```bat
+work\.venv\Scripts\python.exe localize.py uv-review
+work\.venv\Scripts\python.exe localize.py visual-sheets
+work\.venv-ocr\Scripts\python.exe localize.py ocr batch --phase candidate --reference-approved
+work\.venv\Scripts\python.exe localize.py legacy-layout-sheets
+```
+
+`legacy-layout-sheets`의 오른쪽 이미지는 번역·크기·위치 제안만 비교하는 용도예요. 과거
+한글본 픽셀은 후보나 배경으로 복사하지 않아요.
+
 4. 원본 크기의 `old_text`, `new_text`, `editable`, `protected`, `seam_guard` 마스크를 만들어요.
-5. AI 편집은 글자 배경 복구 초안에만 쓰고, 최종 글자는 확정 좌표로 결정적으로 합성해요.
+   `localize.py mask <target-id> <mask-recipe.json>`으로 좌표·색 조건과 실제 UV seam을 묶어
+   재현 가능한 `old_text` 마스크를 만들 수 있어요. Normal·Gloss에 외국어 효과가 있으면
+   `output_stem`을 달리한 재질 전용 마스크를 만들고, Diffuse의 넓은 마스크를 재사용하지 않아요.
+5. AI 편집은 글자 배경 복구 초안에만 쓰고, 최종 글자는 해시 고정 마스크·글꼴·좌표 recipe로
+   결정적으로 합성해요.
+
+```bat
+work\.venv\Scripts\python.exe localize.py compose mayo workspace\reviews\mayo\compose-recipe.json
+```
 6. 후보 OCR과 Codex 시각 비교를 모두 기록한 뒤 `stage`해요.
 
 ```bat
 work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase candidate --image 후보.png
+work\.venv\Scripts\python.exe localize.py candidate-check mayo
 work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 ```
 

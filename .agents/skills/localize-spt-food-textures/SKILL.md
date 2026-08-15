@@ -38,9 +38,12 @@ description: Safely analyze, translate, generate, review, validate, and package 
 ## 필수 순서
 
 1. 원본·Texture2D·실제 Material 연결과 D/N/G 공유 관계를 확인하라.
+   `localize.py extract`가 기록한 Renderer→Material→Mesh와 target submesh 연결이 모두
+   해석됐는지 확인하고 `localize.py uv-review`로 실제 UV seam guard를 만들어라.
 2. OCR로 보이는 텍스트의 문자열, bbox, 회전, 읽는 방향, 신뢰도와 엔진 버전을 기록하라.
 3. OCR 문구를 정답으로 복사하지 말고 원본을 원본 해상도로 다시 시각 판독하라. 문자뿐
-   아니라 면·UV 섬·그림 방향·절취선·로고와 주변 질감도 기록하라.
+   아니라 면·UV 섬·그림 방향·절취선·로고와 주변 질감도 기록하라. 저장소 도구를 쓸 때는
+   `localize.py visual-sheets`의 OCR 문자열이 숨겨진 crop을 먼저 판독하라.
 4. 두 판독을 교차검증하라. 누락·오인식·방향·의미 충돌이 하나라도 남으면 생성하지 마라.
 5. 각 영역의 원문, 뜻, 최종 한국어, 횟수, 위치, 크기, 회전과 읽는 방향을 확정하라.
 6. `editable`, `old_text`, `new_text`, `protected`, `seam_guard` 마스크를 원본 크기로 확정하라.
@@ -52,7 +55,8 @@ description: Safely analyze, translate, generate, review, validate, and package 
 ```
 
 8. AI 결과는 기존 글자 영역의 배경 복구 초안으로만 사용하라. 최종 한글은 확정 문자열과
-   좌표로 결정적으로 조판하고 원본 위에 합성하라. 전체 이미지를 다시 생성하지 마라.
+   좌표로 결정적으로 조판하고 원본 위에 합성하라. 저장소의 해시 고정 recipe와
+   `localize.py compose`를 우선 사용하고 전체 이미지를 다시 생성하지 마라.
 9. 생성 후 OCR을 다시 실행하고, 별도로 원본·결과를 시각 비교하라. 문구 누락·오자·중복,
    외국어 잔상, 방향·그림 변화, 흐림과 마스크 밖 변경을 확인하라.
 10. 후보 게이트 통과 후에만 승인본으로 stage하라.
@@ -65,7 +69,8 @@ description: Safely analyze, translate, generate, review, validate, and package 
 
 11. 파일명 추정이 아니라 실제 Material의 Texture PPtr를 따라 D/N/G를 매핑하라. 동일 글자
     효과는 같은 확정 `new_text` 마스크와 좌표계를 사용하라. 평면 인쇄면 N/G를 보존하고,
-    기존 외국어 요철·광택이 있을 때만 명시적 `old_text` 마스크 안에서 제거하라.
+    기존 외국어 요철·광택이 있을 때만 각 보조맵에 명시한 재질 전용 `old_text` 마스크 안에서
+    제거하라. Diffuse의 넓은 복원 마스크를 Normal·Gloss에 자동 재사용하지 마라.
 12. 공유 보조맵의 모든 소비자를 확정하지 못했거나 서로 다른 디자인이 하나의 맵을 요구하면
     자동 파생하지 마라.
 13. 재질 게이트 통과 후에만 임시 번들을 만들라.

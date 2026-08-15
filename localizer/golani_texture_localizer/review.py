@@ -133,6 +133,8 @@ def verify_candidate(
     record_path, record = load_review(paths, target.id, through="candidate")
     if record.get("target_id") != target.id or record.get("action") != target.action:
         raise ValueError("작업 기록 대상이 profile과 달라요")
+    if record.get("expected_text") != list(target.exact_text):
+        raise ValueError("작업 기록 확정 문구가 현재 profile과 달라요")
     source_record = record.get("source", {})
     if source_record.get("texture") != target.texture:
         raise ValueError("작업 기록 Texture2D가 profile과 달라요")
