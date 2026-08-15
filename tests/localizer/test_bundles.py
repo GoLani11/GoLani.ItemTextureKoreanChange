@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -6,10 +7,12 @@ from PIL import Image
 
 from golani_texture_localizer.bundles import (
     _coverage_values,
+    _prune_stale_preserved_auxiliary_outputs,
     _roundtrip_limits,
     _sha256_file,
     _verified_source_bundle,
 )
+from golani_texture_localizer.paths import ProjectPaths
 
 
 def test_gloss_8px_roundtrip_limit_uses_noop_calibration() -> None:
@@ -83,3 +86,148 @@ def test_uv_coverage_rejects_unsafe_size_conversion(size: tuple[int, int]) -> No
 
     with pytest.raises(ValueError, match="UV coverage"):
         _coverage_values(coverage, size)
+
+
+def test_partial_repack_prunes_proven_stale_preserved_auxiliary_bundle(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    paths = ProjectPaths.create(root)
+    bundle_key = "assets/item/textures.bundle"
+    output = paths.bundles / bundle_key
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"stale derived normal")
+    roundtrip = paths.reports / "roundtrip" / "item" / "sample_nrm.png"
+    roundtrip.parent.mkdir(parents=True)
+    roundtrip.write_bytes(b"stale preview")
+    report = paths.reports / "bundles" / "assets@item@textures.bundle.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        json.dumps(
+            {
+                "output_bundle": str(output.resolve()),
+                "output_sha256": _sha256_file(output),
+                "textures": [
+                    {"texture": "sample_nrm", "roundtrip": str(roundtrip.resolve())}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    inventory = {
+        "records": [
+            {
+                "bundle_key": "assets/item/diffuse.bundle",
+                "path_id": 1,
+                "target_id": "sample",
+            },
+            {
+                "bundle_key": bundle_key,
+                "path_id": 2,
+                "texture": "sample_nrm",
+                "role": "normal",
+            },
+        ],
+        "materials": [
+            {
+                "bundle_key": "assets/item/model.bundle",
+                "path_id": 3,
+                "texture_slots": [
+                    {
+                        "property": "_MainTex",
+                        "texture_bundle_key": "assets/item/diffuse.bundle",
+                        "path_id": 1,
+                    },
+                    {
+                        "property": "_BumpMap",
+                        "texture_bundle_key": bundle_key,
+                        "path_id": 2,
+                    },
+                ],
+            }
+        ],
+    }
+    plans = {
+        (bundle_key, 2, "normal"): {
+            "policy": "preserve",
+            "target_ids": ["sample"],
+        }
+    }
+
+    pruned = _prune_stale_preserved_auxiliary_outputs(
+        paths, inventory, plans, {"sample"}, {"assets/item/diffuse.bundle"}
+    )
+
+    assert [value["bundle_key"] for value in pruned] == [bundle_key]
+    assert not output.exists()
+    assert not report.exists()
+    assert not roundtrip.exists()
+
+
+def test_partial_repack_keeps_auxiliary_bundle_shared_with_unselected_target(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    paths = ProjectPaths.create(root)
+    bundle_key = "assets/shared/textures.bundle"
+    output = paths.bundles / bundle_key
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"shared output")
+    report = paths.reports / "bundles" / "assets@shared@textures.bundle.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(
+        json.dumps(
+            {
+                "output_bundle": str(output.resolve()),
+                "output_sha256": _sha256_file(output),
+                "textures": [{"texture": "shared_nrm"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    inventory = {
+        "records": [
+            {"bundle_key": "a.bundle", "path_id": 1, "target_id": "selected"},
+            {"bundle_key": "b.bundle", "path_id": 2, "target_id": "other"},
+            {
+                "bundle_key": bundle_key,
+                "path_id": 9,
+                "texture": "shared_nrm",
+                "role": "normal",
+            },
+        ],
+        "materials": [
+            {
+                "bundle_key": "a.model",
+                "path_id": 10,
+                "texture_slots": [
+                    {"property": "_MainTex", "texture_bundle_key": "a.bundle", "path_id": 1},
+                    {"property": "_BumpMap", "texture_bundle_key": bundle_key, "path_id": 9},
+                ],
+            },
+            {
+                "bundle_key": "b.model",
+                "path_id": 11,
+                "texture_slots": [
+                    {"property": "_MainTex", "texture_bundle_key": "b.bundle", "path_id": 2},
+                    {"property": "_BumpMap", "texture_bundle_key": bundle_key, "path_id": 9},
+                ],
+            },
+        ],
+    }
+    plans = {
+        (bundle_key, 9, "normal"): {
+            "policy": "preserve",
+            "target_ids": ["selected"],
+        }
+    }
+
+    pruned = _prune_stale_preserved_auxiliary_outputs(
+        paths, inventory, plans, {"selected"}, {"a.bundle"}
+    )
+
+    assert pruned == []
+    assert output.is_file()
+    assert report.is_file()

@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from golani_texture_localizer.inventory import (
     _apply_source_overrides,
     _material_targets,
+    _slot,
     sha256_file,
 )
 from golani_texture_localizer.paths import ProjectPaths
@@ -110,3 +112,59 @@ def test_material_targets_follow_only_actual_main_texture_slots() -> None:
     ]
 
     assert _material_targets(records, materials) == {("model.bundle", 11): ["sample"]}
+
+
+def test_slot_resolves_external_texture_from_serialized_file_table() -> None:
+    pointer = SimpleNamespace(m_FileID=1, m_PathID=42)
+    environment_value = SimpleNamespace(
+        m_Texture=pointer,
+        m_Scale=SimpleNamespace(x=1, y=1),
+        m_Offset=SimpleNamespace(x=0, y=0),
+    )
+    assets_file = SimpleNamespace(
+        externals=[SimpleNamespace(name="CAB-TEXTURES")]
+    )
+
+    slot = _slot(
+        "_BumpMap",
+        environment_value,
+        {},
+        "model.bundle",
+        assets_file=assets_file,
+        textures_by_bundle={"textures.bundle": {42: "sample_nrm"}},
+        bundle_keys_by_assets_file={"cab-textures": {"textures.bundle"}},
+    )
+
+    assert slot["texture"] == "sample_nrm"
+    assert slot["texture_bundle_key"] == "textures.bundle"
+    assert slot["external_assets_file"] == "CAB-TEXTURES"
+
+
+def test_slot_leaves_ambiguous_external_texture_unresolved() -> None:
+    pointer = SimpleNamespace(m_FileID=1, m_PathID=42)
+    environment_value = SimpleNamespace(
+        m_Texture=pointer,
+        m_Scale=SimpleNamespace(x=1, y=1),
+        m_Offset=SimpleNamespace(x=0, y=0),
+    )
+    assets_file = SimpleNamespace(
+        externals=[SimpleNamespace(name="CAB-DUPLICATE")]
+    )
+
+    slot = _slot(
+        "_SpecMap",
+        environment_value,
+        {},
+        "model.bundle",
+        assets_file=assets_file,
+        textures_by_bundle={
+            "first.bundle": {42: "first_gloss"},
+            "second.bundle": {42: "second_gloss"},
+        },
+        bundle_keys_by_assets_file={
+            "cab-duplicate": {"first.bundle", "second.bundle"}
+        },
+    )
+
+    assert slot["texture"] is None
+    assert slot["texture_bundle_key"] is None

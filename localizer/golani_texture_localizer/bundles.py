@@ -12,7 +12,7 @@ import numpy as np
 from PIL import Image
 
 from .images import validate_approved
-from .inventory import load_inventory, record_for_target
+from .inventory import _material_targets, load_inventory, record_for_target
 from .models import CollectionProfile
 from .names import safe_bundle_name
 from .paths import ProjectPaths
@@ -655,6 +655,112 @@ def patch_bundle_exact(
     }
 
 
+def _prune_stale_preserved_auxiliary_outputs(
+    paths: ProjectPaths,
+    inventory: dict[str, Any],
+    auxiliary_plans: Mapping[tuple[Any, int, Any], dict[str, Any]],
+    selected_target_ids: set[str],
+    current_bundle_keys: set[str],
+) -> list[dict[str, Any]]:
+    """현재 보존 정책과 충돌하는 예전 N/G 출력만 증명 가능한 경우 제거해요."""
+
+    material_targets = _material_targets(
+        inventory.get("records", []), inventory.get("materials", [])
+    )
+    candidates: dict[str, set[str]] = {}
+    for (bundle_key, path_id, role), plan in auxiliary_plans.items():
+        if (
+            not isinstance(bundle_key, str)
+            or bundle_key in current_bundle_keys
+            or role not in {"normal", "gloss"}
+            or plan.get("policy") != "preserve"
+        ):
+            continue
+        consumer_identities = {
+            (str(material["bundle_key"]), int(material["path_id"]))
+            for material in inventory.get("materials", [])
+            if any(
+                slot.get("texture_bundle_key") == bundle_key
+                and int(slot.get("path_id", 0)) == path_id
+                for slot in material.get("texture_slots", [])
+            )
+        }
+        if not consumer_identities or any(
+            identity not in material_targets for identity in consumer_identities
+        ):
+            continue
+        consumer_targets = {
+            target_id
+            for identity in consumer_identities
+            for target_id in material_targets[identity]
+        }
+        if not consumer_targets or not consumer_targets.issubset(selected_target_ids):
+            continue
+        records = [
+            record
+            for record in inventory.get("records", [])
+            if record.get("bundle_key") == bundle_key
+            and int(record.get("path_id", 0)) == path_id
+            and record.get("role") == role
+        ]
+        if len(records) == 1:
+            candidates.setdefault(bundle_key, set()).add(str(records[0]["texture"]))
+
+    pruned: list[dict[str, Any]] = []
+    roundtrip_root = (paths.reports / "roundtrip").resolve()
+    for bundle_key, texture_names in sorted(candidates.items()):
+        output = (paths.bundles / Path(bundle_key)).resolve()
+        report_path = (
+            paths.reports / "bundles" / f"{safe_bundle_name(bundle_key)}.json"
+        ).resolve()
+        if not output.is_file() or not report_path.is_file():
+            continue
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        reported_output = Path(str(report.get("output_bundle", ""))).resolve()
+        reported_textures = {
+            str(value.get("texture"))
+            for value in report.get("textures", [])
+            if isinstance(value, dict) and value.get("texture")
+        }
+        if (
+            reported_output != output
+            or not reported_textures
+            or not reported_textures.issubset(texture_names)
+            or report.get("output_sha256") != _sha256_file(output)
+        ):
+            continue
+        roundtrip_paths: set[Path] = set()
+        for texture_report in report.get("textures", []):
+            if not isinstance(texture_report, dict):
+                continue
+            values = [texture_report.get("roundtrip")]
+            values.extend(
+                mip.get("roundtrip")
+                for mip in texture_report.get("mips", [])
+                if isinstance(mip, dict)
+            )
+            for value in values:
+                if not isinstance(value, str) or not value:
+                    continue
+                candidate = Path(value).resolve()
+                if candidate.is_file() and roundtrip_root in candidate.parents:
+                    roundtrip_paths.add(candidate)
+        output_sha256 = _sha256_file(output)
+        output.unlink()
+        report_path.unlink()
+        for candidate in roundtrip_paths:
+            candidate.unlink()
+        pruned.append(
+            {
+                "bundle_key": bundle_key,
+                "output_sha256": output_sha256,
+                "textures": sorted(reported_textures),
+                "reason": "current-material-policy-preserve",
+            }
+        )
+    return pruned
+
+
 def repack_collection(
     profile: CollectionProfile,
     paths: ProjectPaths,
@@ -806,6 +912,14 @@ def repack_collection(
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         reports.append(report)
 
+    pruned_stale_outputs = _prune_stale_preserved_auxiliary_outputs(
+        paths,
+        inventory,
+        auxiliary_plans,
+        expected_targets,
+        set(groups),
+    )
+
     payload = {
         "schema_version": 1,
         "collection": profile.id,
@@ -815,6 +929,7 @@ def repack_collection(
         "texture_count": sum(len(report["textures"]) for report in reports),
         "passed": all(report["passed"] for report in reports),
         "bundles": reports,
+        "pruned_stale_outputs": pruned_stale_outputs,
     }
     suffix = "" if target_ids is None else "." + "+".join(sorted(target_ids))
     summary = paths.reports / f"repack{suffix}.json"

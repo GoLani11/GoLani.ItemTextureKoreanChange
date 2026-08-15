@@ -94,17 +94,38 @@ def _slot(
     environment_value: Any,
     local_textures: dict[int, str],
     local_bundle_key: str,
+    *,
+    assets_file: Any | None = None,
+    textures_by_bundle: dict[str, dict[int, str]] | None = None,
+    bundle_keys_by_assets_file: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     pointer = environment_value.m_Texture
     file_id = int(pointer.m_FileID)
     path_id = int(pointer.m_PathID)
     texture = local_textures.get(path_id) if file_id == 0 else None
+    texture_bundle_key = local_bundle_key if texture else None
+    external_assets_file = None
+    if file_id and path_id and assets_file is not None:
+        externals = getattr(assets_file, "externals", [])
+        if 0 < file_id <= len(externals):
+            external_assets_file = str(externals[file_id - 1].name)
+            bundle_keys = (bundle_keys_by_assets_file or {}).get(
+                external_assets_file.casefold(), set()
+            )
+            matches = [
+                (bundle_key, (textures_by_bundle or {}).get(bundle_key, {}).get(path_id))
+                for bundle_key in sorted(bundle_keys)
+            ]
+            matches = [(bundle_key, name) for bundle_key, name in matches if name]
+            if len(matches) == 1:
+                texture_bundle_key, texture = matches[0]
     return {
         "property": str(property_name),
         "file_id": file_id,
         "path_id": path_id,
         "texture": texture,
-        "texture_bundle_key": local_bundle_key if texture else None,
+        "texture_bundle_key": texture_bundle_key,
+        "external_assets_file": external_assets_file,
         "scale": [float(environment_value.m_Scale.x), float(environment_value.m_Scale.y)],
         "offset": [float(environment_value.m_Offset.x), float(environment_value.m_Offset.y)],
     }
@@ -411,6 +432,8 @@ def _external_materials(
     bundle_root: Path,
     records: list[dict[str, Any]],
     existing: list[dict[str, Any]],
+    textures_by_bundle: dict[str, dict[int, str]],
+    bundle_keys_by_assets_file: dict[str, set[str]],
 ) -> list[dict[str, Any]]:
     """게임 카탈로그의 역의존성을 따라 별도 모델 번들의 Material PPtr를 해석해요."""
 
@@ -435,11 +458,6 @@ def _external_materials(
             and key != texture_bundle_key
         )
         texture_path = bundle_root / Path(texture_bundle_key)
-        all_path_ids = {
-            int(record["path_id"]): record
-            for record in records
-            if record["bundle_key"] == texture_bundle_key
-        }
         target_path_ids = {int(record["path_id"]) for record in target_records}
         resolved_target_ids: set[int] = set()
         for material_bundle_key in candidates:
@@ -454,47 +472,35 @@ def _external_materials(
                 if obj.type.name != "Material":
                     continue
                 material = obj.read()
+                origin_bundle_keys = bundle_keys_by_assets_file.get(
+                    str(obj.assets_file.name).casefold(), set()
+                )
+                if len(origin_bundle_keys) == 1:
+                    origin_bundle_key = next(iter(origin_bundle_keys))
+                    local_textures = textures_by_bundle.get(origin_bundle_key, {})
+                else:
+                    origin_bundle_key = material_bundle_key
+                    local_textures = {}
                 slots: list[dict[str, Any]] = []
                 consumes_target = False
                 for property_name, environment_value in material.m_SavedProperties.m_TexEnvs:
-                    pointer = environment_value.m_Texture
-                    file_id = int(pointer.m_FileID)
-                    path_id = int(pointer.m_PathID)
-                    texture = None
-                    resolved_bundle = None
-                    if path_id:
-                        try:
-                            resolved = pointer.deref()
-                            if resolved.type.name == "Texture2D":
-                                texture = str(pointer.read().m_Name)
-                                record = all_path_ids.get(int(resolved.path_id))
-                                if record is not None:
-                                    resolved_bundle = record["bundle_key"]
-                                    if (
-                                        int(resolved.path_id) in target_path_ids
-                                        and property_name in {"_MainTex", "_BaseMap", "_BaseColorMap"}
-                                    ):
-                                        consumes_target = True
-                                        resolved_target_ids.add(int(resolved.path_id))
-                        except (FileNotFoundError, KeyError, ValueError):
-                            pass
-                    slots.append(
-                        {
-                            "property": str(property_name),
-                            "file_id": file_id,
-                            "path_id": path_id,
-                            "texture": texture,
-                            "texture_bundle_key": resolved_bundle,
-                            "scale": [
-                                float(environment_value.m_Scale.x),
-                                float(environment_value.m_Scale.y),
-                            ],
-                            "offset": [
-                                float(environment_value.m_Offset.x),
-                                float(environment_value.m_Offset.y),
-                            ],
-                        }
+                    slot = _slot(
+                        property_name,
+                        environment_value,
+                        local_textures,
+                        origin_bundle_key,
+                        assets_file=obj.assets_file,
+                        textures_by_bundle=textures_by_bundle,
+                        bundle_keys_by_assets_file=bundle_keys_by_assets_file,
                     )
+                    slots.append(slot)
+                    if (
+                        slot["texture_bundle_key"] == texture_bundle_key
+                        and int(slot["path_id"]) in target_path_ids
+                        and property_name in _MAIN_TEXTURE_PROPERTIES
+                    ):
+                        consumes_target = True
+                        resolved_target_ids.add(int(slot["path_id"]))
                 identity = (material_bundle_key, int(obj.path_id))
                 if not consumes_target or identity in known:
                     continue
@@ -543,6 +549,9 @@ def scan_collection(
     records: list[dict[str, Any]] = []
     materials: list[dict[str, Any]] = []
     missing: list[str] = []
+    loaded_bundles: list[tuple[Any, Path, Any, str, dict[int, str]]] = []
+    textures_by_bundle: dict[str, dict[int, str]] = {}
+    bundle_keys_by_assets_file: dict[str, set[str]] = {}
     for bundle in profile.bundles:
         bundle_path = (bundle_root / Path(bundle.key)).resolve()
         if not bundle_path.is_file():
@@ -552,8 +561,17 @@ def scan_collection(
         bundle_sha256 = sha256_file(bundle_path)
         local_textures: dict[int, str] = {}
         for obj in environment.objects:
+            bundle_keys_by_assets_file.setdefault(
+                str(obj.assets_file.name).casefold(), set()
+            ).add(bundle.key)
             if obj.type.name == "Texture2D":
                 local_textures[int(obj.path_id)] = str(obj.read().m_Name)
+        textures_by_bundle[bundle.key] = local_textures
+        loaded_bundles.append(
+            (bundle, bundle_path, environment, bundle_sha256, local_textures)
+        )
+
+    for bundle, bundle_path, environment, bundle_sha256, local_textures in loaded_bundles:
         for obj in environment.objects:
             if obj.type.name != "Texture2D":
                 continue
@@ -604,7 +622,17 @@ def scan_collection(
             material = obj.read()
             slots = []
             for property_name, environment_value in material.m_SavedProperties.m_TexEnvs:
-                slots.append(_slot(property_name, environment_value, local_textures, bundle.key))
+                slots.append(
+                    _slot(
+                        property_name,
+                        environment_value,
+                        local_textures,
+                        bundle.key,
+                        assets_file=obj.assets_file,
+                        textures_by_bundle=textures_by_bundle,
+                        bundle_keys_by_assets_file=bundle_keys_by_assets_file,
+                    )
+                )
             materials.append(
                 {
                     "bundle_key": bundle.key,
@@ -615,7 +643,16 @@ def scan_collection(
                 }
             )
     if not missing:
-        materials.extend(_external_materials(profile, bundle_root, records, materials))
+        materials.extend(
+            _external_materials(
+                profile,
+                bundle_root,
+                records,
+                materials,
+                textures_by_bundle,
+                bundle_keys_by_assets_file,
+            )
+        )
     _apply_source_overrides(records, overrides, paths)
     renderers = (
         _renderer_meshes(bundle_root, records, materials, paths, extract=extract)
