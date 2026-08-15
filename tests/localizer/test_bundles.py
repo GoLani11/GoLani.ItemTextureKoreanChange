@@ -1,8 +1,14 @@
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
-from golani_texture_localizer.bundles import _sha256_file, _verified_source_bundle
+from golani_texture_localizer.bundles import (
+    _coverage_values,
+    _sha256_file,
+    _verified_source_bundle,
+)
 
 
 def test_source_bundle_must_match_inventory_hash(tmp_path: Path) -> None:
@@ -42,3 +48,25 @@ def test_missing_override_uses_matching_live_bundle(tmp_path: Path) -> None:
     }
 
     assert _verified_source_bundle(bundle_key, tmp_path, override, []) == live.resolve()
+
+
+def test_uv_coverage_uses_conservative_integer_downscale_for_auxiliary_map() -> None:
+    values = np.zeros((4, 4), dtype=np.uint8)
+    values[0, 0] = 255
+    values[1, 3] = 255
+    values[3, 2] = 255
+
+    result = _coverage_values(Image.fromarray(values, "L"), (2, 2))
+
+    np.testing.assert_array_equal(
+        result,
+        np.asarray([[True, True], [False, True]], dtype=bool),
+    )
+
+
+@pytest.mark.parametrize("size", [(3, 2), (2, 1), (8, 8)])
+def test_uv_coverage_rejects_unsafe_size_conversion(size: tuple[int, int]) -> None:
+    coverage = Image.new("L", (4, 4), 255)
+
+    with pytest.raises(ValueError, match="UV coverage"):
+        _coverage_values(coverage, size)

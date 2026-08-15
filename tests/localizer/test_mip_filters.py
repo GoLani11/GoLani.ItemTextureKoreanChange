@@ -94,6 +94,7 @@ def test_uv_padding_rejects_empty_coverage() -> None:
 def test_diffuse_roundtrip_limits_account_for_small_bc_blocks() -> None:
     assert _roundtrip_limits("diffuse", 512, 512, 6.0) == (6.0, 64.0, 128.0)
     assert _roundtrip_limits("diffuse", 32, 32, 6.0) == (12.0, 80.0, 128.0)
+    assert _roundtrip_limits("diffuse", 16, 16, 6.0) == (16.0, 80.0, 128.0)
     assert _roundtrip_limits("diffuse", 4, 4, 6.0) == (24.0, 80.0, 128.0)
     assert _roundtrip_limits("diffuse", 2, 2, 6.0) == (16.0, 80.0, 128.0)
 
