@@ -123,11 +123,21 @@ profile의 `exact_text`가 번역 영역에 모두 있어야 한다. 보이는 �
 
 보존 대상은 추가로 `rgba_equal: true`여야 한다.
 
+`edit_plan.data.compositor`에는 `mode: "ai-reference-lettering"`,
+`fixed_font_used: false`, `background_locked: true`와 영역별 `region_id`, `exact_text`, bbox,
+회전·방향, 모델 서명, 2개 이상의 후보 수, OCR 일치 여부를 기록한다. 각 영역에는 원본 스타일 crop,
+깨끗한 배경, 후보 시트, 선택 레터링과 레터링 마스크의 프로젝트 상대 경로·SHA-256을 묶는다.
+형태·크기·방향·간격·효과·표면 통합·옛 로고 실루엣 제거 판정을 영역별 `style_checks`에
+모두 `true`로 남긴다. 고정 폰트 SHA나 결정적 폰트 조판 기록은 통과 근거가 아니다.
+
 `post_ocr.data`에는 `candidate_sha256`, `engine_signature`,
 `forbidden_foreign_detected: false`, `expected_text_matched: true`,
 `duplicate_text_detected: false`를 둔다. `post_visual.data`에는 같은 `candidate_sha256`과
 `translation_matched`, `text_orientation_matched`, `artwork_orientation_matched`,
-`color_preserved`, `sharpness_passed`, `seams_preserved`를 모두 `true`로 둔다.
+`color_preserved`, `sharpness_passed`, `seams_preserved` 외에도 `lettering_shape_matched`,
+`lettering_size_matched`, `lettering_direction_matched`, `lettering_spacing_matched`,
+`lettering_effects_matched`, `surface_integration_matched`, `old_logo_silhouette_absent`를 모두
+`true`로 둔다.
 
 `material_validation.data`에는 실제 Material binding, 공유 소비자, D/N/G별 정책, 공통 글리프
 마스크 SHA, 마스크 밖 변경 수와 조명 진단 증거를 둔다. `neutralize_old_text`인 보조맵은

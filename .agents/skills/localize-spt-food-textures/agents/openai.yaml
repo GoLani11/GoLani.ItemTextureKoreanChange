@@ -1,6 +1,6 @@
 interface:
   display_name: "SPT 음식 텍스처 현지화"
-  short_description: "포장 문구 판독부터 D/N/G·번들 검증까지 안전하게 진행해요"
-  default_prompt: "Use $localize-spt-food-textures to analyze, localize, and fail-closed validate an SPT food texture."
+  short_description: "AI 맞춤 레터링과 D/N/G·번들을 안전하게 검증해요"
+  default_prompt: "Use $localize-spt-food-textures to create style-matched Korean AI lettering and fail-closed validate an SPT food texture."
 policy:
   allow_implicit_invocation: true

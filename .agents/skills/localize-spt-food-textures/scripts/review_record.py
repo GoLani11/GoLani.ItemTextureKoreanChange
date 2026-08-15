@@ -263,7 +263,126 @@ def _validate_evidence(
     return errors
 
 
-def _validate_masks(data: Any, source: Any, project_root: Path | None) -> list[str]:
+def _validate_artifact(
+    descriptor: Any,
+    location: str,
+    project_root: Path | None,
+) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(descriptor, dict):
+        return [f"{location}: 파일 명세가 없어요"]
+    if not _nonempty_string(descriptor.get("path")):
+        errors.append(f"{location}.path: 비어 있어요")
+    if not _valid_sha256(descriptor.get("sha256")):
+        errors.append(f"{location}.sha256: SHA-256 형식이 아니에요")
+    if project_root is None:
+        return errors
+    path, path_errors = _project_file(project_root, descriptor.get("path"), f"{location}.path")
+    errors.extend(path_errors)
+    if path is None:
+        return errors
+    if not path.is_file():
+        errors.append(f"{location}.path: 파일이 없어요: {path}")
+    elif _valid_sha256(descriptor.get("sha256")) and _sha256(path) != descriptor["sha256"]:
+        errors.append(f"{location}: 현재 파일 SHA가 기록과 달라요")
+    return errors
+
+
+def _validate_ai_lettering(
+    compositor: Any,
+    translations: Any,
+    project_root: Path | None,
+) -> list[str]:
+    errors: list[str] = []
+    location = "stages.edit_plan.data.compositor"
+    if not isinstance(compositor, dict):
+        return [f"{location}: 객체가 없어요"]
+    if compositor.get("mode") != "ai-reference-lettering":
+        errors.append(f"{location}.mode: ai-reference-lettering이어야 해요")
+    if compositor.get("fixed_font_used") is not False:
+        errors.append(f"{location}.fixed_font_used: false여야 해요")
+    if compositor.get("background_locked") is not True:
+        errors.append(f"{location}.background_locked: true여야 해요")
+
+    expected: dict[str, dict[str, Any]] = {}
+    if isinstance(translations, list):
+        expected = {
+            str(region.get("region_id")): region
+            for region in translations
+            if isinstance(region, dict) and _nonempty_string(region.get("region_id"))
+        }
+    regions = compositor.get("regions")
+    if not isinstance(regions, list) or not regions:
+        errors.append(f"{location}.regions: 비어 있지 않은 배열이어야 해요")
+        return errors
+
+    seen: set[str] = set()
+    for index, region in enumerate(regions):
+        item = f"{location}.regions[{index}]"
+        if not isinstance(region, dict):
+            errors.append(f"{item}: 객체가 아니에요")
+            continue
+        region_id = region.get("region_id")
+        if not _nonempty_string(region_id):
+            errors.append(f"{item}.region_id: 비어 있어요")
+            continue
+        region_id = str(region_id)
+        if region_id in seen:
+            errors.append(f"{item}.region_id: 중복됐어요")
+        seen.add(region_id)
+        translation = expected.get(region_id)
+        if translation is None:
+            errors.append(f"{item}.region_id: 번역 영역에 없는 ID예요")
+        else:
+            if region.get("exact_text") != translation.get("final_text_ko"):
+                errors.append(f"{item}.exact_text: 확정 한국어와 달라요")
+            for field in ("bbox", "rotation_deg", "direction"):
+                if region.get(field) != translation.get(field):
+                    errors.append(f"{item}.{field}: 번역 명세와 달라요")
+        if not _nonempty_string(region.get("model_signature")):
+            errors.append(f"{item}.model_signature: 비어 있어요")
+        count = region.get("candidate_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 2:
+            errors.append(f"{item}.candidate_count: 비교 가능한 2 이상의 정수여야 해요")
+        for field in ("ocr_exact_match", "style_match_passed"):
+            if region.get(field) is not True:
+                errors.append(f"{item}.{field}: true여야 해요")
+        style_checks = region.get("style_checks")
+        if not isinstance(style_checks, dict):
+            errors.append(f"{item}.style_checks: 객체가 없어요")
+        else:
+            for field in (
+                "shape_matched",
+                "size_matched",
+                "direction_matched",
+                "spacing_matched",
+                "effects_matched",
+                "surface_integration_matched",
+                "old_logo_silhouette_absent",
+            ):
+                if style_checks.get(field) is not True:
+                    errors.append(f"{item}.style_checks.{field}: true여야 해요")
+        for field in (
+            "source_style_reference",
+            "clean_background",
+            "candidate_sheet",
+            "selected_lettering",
+            "lettering_mask",
+        ):
+            errors.extend(_validate_artifact(region.get(field), f"{item}.{field}", project_root))
+
+    missing = sorted(set(expected) - seen)
+    if missing:
+        errors.append(f"{location}.regions: 번역 영역이 누락됐어요: {missing}")
+    return errors
+
+
+def _validate_masks(
+    data: Any,
+    source: Any,
+    translations: Any,
+    project_root: Path | None,
+) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
         return ["stages.edit_plan.data: 객체가 아니에요"]
@@ -290,16 +409,7 @@ def _validate_masks(data: Any, source: Any, project_root: Path | None) -> list[s
                     errors.append(f"{location}.path: 파일이 없어요: {path}")
                 elif _valid_sha256(mask.get("sha256")) and _sha256(path) != mask["sha256"]:
                     errors.append(f"{location}: 현재 마스크 SHA가 기록과 달라요")
-    compositor = data.get("compositor")
-    if not isinstance(compositor, dict):
-        errors.append("stages.edit_plan.data.compositor: 객체가 없어요")
-    else:
-        for field in ("mode", "shaping_engine", "shaping_version"):
-            if not _nonempty_string(compositor.get(field)):
-                errors.append(f"stages.edit_plan.data.compositor.{field}: 비어 있어요")
-        for field in ("font_sha256", "glyph_run_sha256"):
-            if not _valid_sha256(compositor.get(field)):
-                errors.append(f"stages.edit_plan.data.compositor.{field}: SHA-256 형식이 아니에요")
+    errors.extend(_validate_ai_lettering(data.get("compositor"), translations, project_root))
     return errors
 
 
@@ -346,6 +456,13 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
         ("color_preserved", True),
         ("sharpness_passed", True),
         ("seams_preserved", True),
+        ("lettering_shape_matched", True),
+        ("lettering_size_matched", True),
+        ("lettering_direction_matched", True),
+        ("lettering_spacing_matched", True),
+        ("lettering_effects_matched", True),
+        ("surface_integration_matched", True),
+        ("old_logo_silhouette_absent", True),
     ):
         if post_visual.get(field) != wanted:
             errors.append(f"stages.post_visual.data.{field}: {wanted!r}여야 해요")
@@ -647,7 +764,15 @@ def validate_record(
 
     if through in {"candidate", "material", "release"}:
         if record.get("action") == "localize":
-            errors.extend(_validate_masks(stages.get("edit_plan", {}).get("data"), source, project_root))
+            translations = stages.get("translation", {}).get("data", {}).get("regions", [])
+            errors.extend(
+                _validate_masks(
+                    stages.get("edit_plan", {}).get("data"),
+                    source,
+                    translations,
+                    project_root,
+                )
+            )
         else:
             candidate_data = stages.get("candidate_validation", {}).get("data", {})
             if candidate_data.get("rgba_equal") is not True:

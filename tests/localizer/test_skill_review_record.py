@@ -124,17 +124,52 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
             "width": 64,
             "height": 64,
         }
+    lettering_artifacts = {
+        name: _evidence(root, f"lettering-{name}")
+        for name in (
+            "source-style-reference",
+            "clean-background",
+            "candidate-sheet",
+            "selected-lettering",
+            "lettering-mask",
+        )
+    }
     record["stages"]["edit_plan"] = {
         "status": "pass",
         "evidence": [_evidence(root, "edit-plan")],
         "data": {
             "masks": masks,
             "compositor": {
-                "mode": "deterministic",
-                "shaping_engine": "harfbuzz",
-                "shaping_version": "1",
-                "font_sha256": "a" * 64,
-                "glyph_run_sha256": "b" * 64,
+                "mode": "ai-reference-lettering",
+                "fixed_font_used": False,
+                "background_locked": True,
+                "regions": [
+                    {
+                        "region_id": "front-brand-01",
+                        "exact_text": "마요네즈",
+                        "bbox": [10, 20, 50, 42],
+                        "rotation_deg": 0,
+                        "direction": "left-to-right",
+                        "model_signature": "image-model-v1:settings-sha",
+                        "candidate_count": 4,
+                        "ocr_exact_match": True,
+                        "style_match_passed": True,
+                        "style_checks": {
+                            "shape_matched": True,
+                            "size_matched": True,
+                            "direction_matched": True,
+                            "spacing_matched": True,
+                            "effects_matched": True,
+                            "surface_integration_matched": True,
+                            "old_logo_silhouette_absent": True,
+                        },
+                        "source_style_reference": lettering_artifacts["source-style-reference"],
+                        "clean_background": lettering_artifacts["clean-background"],
+                        "candidate_sheet": lettering_artifacts["candidate-sheet"],
+                        "selected_lettering": lettering_artifacts["selected-lettering"],
+                        "lettering_mask": lettering_artifacts["lettering-mask"],
+                    }
+                ],
             },
         },
     }
@@ -172,6 +207,13 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
             "color_preserved": True,
             "sharpness_passed": True,
             "seams_preserved": True,
+            "lettering_shape_matched": True,
+            "lettering_size_matched": True,
+            "lettering_direction_matched": True,
+            "lettering_spacing_matched": True,
+            "lettering_effects_matched": True,
+            "surface_integration_matched": True,
+            "old_logo_silhouette_absent": True,
         },
     }
 
@@ -238,6 +280,52 @@ def test_candidate_gate_rejects_changes_outside_editable_mask(tmp_path: Path) ->
     record["stages"]["candidate_validation"]["data"]["changed_outside_editable"] = 1
     errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
     assert any("changed_outside_editable" in error for error in errors)
+
+
+def test_candidate_gate_rejects_fixed_font_lettering(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+
+    compositor = record["stages"]["edit_plan"]["data"]["compositor"]
+    compositor["mode"] = "deterministic-font"
+    compositor["fixed_font_used"] = True
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+    assert any("mode: ai-reference-lettering" in error for error in errors)
+    assert any("fixed_font_used: false" in error for error in errors)
+
+
+def test_candidate_gate_requires_style_evidence_for_every_translation_region(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+
+    record["stages"]["edit_plan"]["data"]["compositor"]["regions"] = []
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+    assert any("regions: 비어 있지 않은 배열" in error for error in errors)
+
+
+def test_candidate_gate_rejects_unchecked_lettering_style(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    region["style_checks"]["effects_matched"] = False
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+    assert any("style_checks.effects_matched" in error for error in errors)
+
+
+def test_candidate_gate_binds_selected_ai_lettering_hash(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    selected = tmp_path / region["selected_lettering"]["path"]
+
+    selected.write_bytes(b"changed-after-selection")
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+    assert any("selected_lettering: 현재 파일 SHA가 기록과 달라요" in error for error in errors)
 
 
 def test_material_patch_is_bound_to_current_file_hash(tmp_path: Path) -> None:
