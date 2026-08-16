@@ -67,11 +67,15 @@
 추가하고, 해당 시각 영역은 conflict 없이 교차검증해야 한다. fallback이 없으면 두 단계는
 `pending`이어도 된다.
 
+기본 현지화 범위에서 제외한 미세 인쇄는 `source_visual.data.preserved_regions`에 bbox, 면,
+`kind`만 기록한다. 그 내용을 전사하거나 OCR로 해독하지 않는다.
+
 ## 번역 영역
 
 `translation.data.regions`에는 `region_id`, `source_text`, `meaning_ko`, `final_text_ko`,
 `occurrences`, bbox·회전·방향·면·시각적 역할·그림 방향을 기록한다. profile의 `exact_text`가
-모두 포함돼야 한다.
+모두 포함돼야 한다. `translation.data.scope`는 기본 `prominent`, 사용자가 명시한 전체 라벨은
+`full-label`로 기록한다. `protected_text_kinds`에는 제외한 미세 인쇄 종류를 기록한다.
 
 ## 증거와 마스크
 
@@ -112,6 +116,9 @@ SHA-256을 가진다. 검사 미실행은 빈 `pass`가 아니라 `error`, 확�
 `post_ocr.data`에는 `candidate_sha256`, `engine_signature`,
 `forbidden_foreign_detected: false`, `expected_text_matched: true`,
 `duplicate_text_detected: false`를 둔다.
+
+`forbidden_foreign_detected`는 `editable`과 겹치는 검출만 뜻한다. `protected`에서 원본과 픽셀이
+같은 외국어 미세 인쇄는 허용하며, 후보 픽셀 검사로 보존을 증명한다.
 
 `post_visual.data`에는 같은 후보 SHA와 번역·방향·그림·색·선명도·seam 판정에 더해
 `font_character_matched`, `lettering_style_matched`, `lettering_shape_matched`,

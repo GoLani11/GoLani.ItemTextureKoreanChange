@@ -17,7 +17,9 @@
 ## 2. Codex 비전 우선 원본 판독
 
 원본 mip 0을 `view_image`의 원본 상세도로 먼저 본다. 전체 배치와 연결된 라벨 면을 이해한 뒤
-각 대상 영역을 `source_visual.data.regions`에 기록한다.
+profile의 `exact_text`에 대응하는 영역만 `source_visual.data.regions`에 기록한다. 기본 범위는
+정상 게임 화면에서 식별되는 제품명·브랜드·짧은 핵심 문구다. 작은 원재료·법정표시·주소·영양·
+인증·바코드·날짜·장식성 미세 인쇄는 내용을 전사하지 않고 bbox와 종류를 보존 영역으로 묶는다.
 
 - 문자열 또는 읽을 수 없음 표시
 - 원본 픽셀 bbox/polygon, 회전, 읽는 방향, 면과 UV 섬
@@ -32,7 +34,8 @@
 
 ## 3. 조건부 원본 OCR
 
-모든 원본에 OCR을 일괄 실행하지 않는다. `needs_ocr_fallback: true`인 영역이 하나라도 있을
+모든 원본이나 보존 미세 인쇄에 OCR을 일괄 실행하지 않는다. 대상 중
+`needs_ocr_fallback: true`인 영역이 하나라도 있을
 때만 `source_visual.data.ocr_fallback_required: true`로 기록하고 그 영역 crop에 OCR을 실행한다.
 OCR에는 문자열·bbox·회전·방향·engine·model signature·confidence를 남긴다.
 
@@ -42,9 +45,10 @@ OCR을 사용한 영역만 `cross_validation`에서 시각 판독과 대조한�
 
 ## 4. 번역과 글자 명세
 
-각 영역에 원문, 뜻, 확정 한국어, 횟수, bbox, 회전, 읽는 방향, 면과 시각적 위계를 기록한다.
-profile의 `exact_text`를 글자 그대로 사용한다. 보이는 대상 문구가 profile에 없다면 생략하지
-말고 profile을 먼저 보완한다.
+각 대상 영역에 원문, 뜻, 확정 한국어, 횟수, bbox, 회전, 읽는 방향, 면과 시각적 위계를
+기록한다. profile의 `exact_text`를 글자 그대로 사용한다. `exact_text`는 편집 허용 목록이며
+목록 밖 미세 인쇄는 보호한다. 사용자가 전체 라벨 번역을 명시한 경우에만 profile을 보완해
+작은 문구를 대상에 추가한다.
 
 ```bash
 <python> .agents/skills/localize-spt-food-textures/scripts/review_record.py check \
@@ -58,7 +62,7 @@ profile의 `exact_text`를 글자 그대로 사용한다. 보이는 대상 문�
 - `old_text`: 지워야 할 원문 픽셀
 - `new_text`: 확정된 한글 글리프 픽셀
 - `editable`: 안티앨리어싱을 포함한 유일한 변경 허용 영역
-- `protected`: 그림, 로고 도형, 주름, 오염, 반사, 구조와 보존 문구
+- `protected`: 그림, 로고 도형, 주름, 오염, 반사, 구조와 목록 밖 미세 인쇄
 - `seam_guard`: UV 경계와 밉 번짐 보호 띠
 
 `old_text ∪ new_text ⊆ editable`, `editable ∩ protected = ∅`,
@@ -91,7 +95,8 @@ profile의 `exact_text`를 글자 그대로 사용한다. 보이는 대상 문�
 
 후보를 stage하기 전에 두 검사를 별도로 수행한다.
 
-1. 결과 OCR: 확정 한국어의 철자·횟수, 누락·중복과 금지 외국어 잔상을 검사한다.
+1. 결과 OCR: 확정 한국어의 철자·횟수, 누락·중복과 `editable` 안의 금지 외국어 잔상을
+   검사한다. `protected`에 원본 그대로 남은 외국어 미세 인쇄는 검사 대상이 아니다.
 2. Codex 시각 비교: 원본과 후보를 같은 배율로 비교해 typography lock과 비문자 보존을
    영역별로 판정한다.
 
@@ -107,8 +112,9 @@ seam guard 변경 0을 요구한다. OCR 통과만으로 시각 품질을 통과
 ## 8. D/N/G 정렬
 
 실제 Material graph에 연결된 맵을 대상으로 한다. 평면 인쇄는 normal/gloss 원본을 보존한다.
-기존 외국어 relief나 광택이 있을 때만 각 보조맵의 재질 전용 `old_text` 마스크 안에서
-중립화하고, 새 한글 효과가 필요하면 diffuse와 같은 `new_text` 좌표·회전을 사용한다.
+편집 대상의 기존 외국어 relief나 광택이 있을 때만 각 보조맵의 재질 전용 `old_text` 마스크
+안에서 중립화하고, 새 한글 효과가 필요하면 diffuse와 같은 `new_text` 좌표·회전을 사용한다.
+보호 미세 인쇄의 relief와 광택은 원본 그대로 둔다.
 공유 맵 소비자가 충돌하면 자동 파생하지 않는다.
 
 ## 9. 밉·압축·번들 검증

@@ -30,6 +30,7 @@ Codex 비전이 원본 전체와 라벨 맥락을 먼저 이해하고 이미지 
 - bbox, 회전, 읽는 방향, 면과 artwork 방향
 - 원본 typography signature
 - `old_text`, `new_text`, `editable`, `protected`, `seam_guard` 마스크
+- 제외한 미세 인쇄를 덮는 `protected` 영역과 그 원본 픽셀 SHA
 
 ## 한 번에 편집
 
@@ -41,6 +42,7 @@ Use case: text-localization
 Image 1: edit target and immutable visual reference
 Replace only the listed source lettering with the exact Korean text.
 Preserve all non-text pixels, artwork, label geometry, material, wear, folds, shadows and UV edges.
+Preserve every small legal, ingredient, nutrition, address, barcode, certification and date label verbatim.
 Match each source region's font character, stroke, proportions, ink size, baseline, spacing,
 rotation, reading direction, outline, shadow, layering and print wear as closely as possible.
 Render the Korean text verbatim with no extra or missing characters.
@@ -73,8 +75,9 @@ typography 항목만 실패하면 그 항목만 지적해 한 번 재시도할 �
 ## 합성과 검사
 
 생성 결과에서 승인한 문자 픽셀을 `lettering_mask`로 분리해 원본에 합성한다. mask 밖 생성
-픽셀은 버린다. 결과 OCR로 정확한 한국어와 반복 횟수, 금지 외국어 잔상을 검사한 뒤 Codex가
-원본/결과 비교 시트에서 typography lock과 비문자 보존을 최종 확인한다.
+픽셀은 버린다. 결과 OCR로 정확한 한국어와 반복 횟수, `editable` 안의 금지 외국어 잔상을
+검사한 뒤 Codex가 원본/결과 비교 시트에서 typography lock과 비문자·보호 미세 인쇄 보존을
+최종 확인한다.
 
 `edit_plan.data.compositor`는 다음 구조를 사용한다.
 
