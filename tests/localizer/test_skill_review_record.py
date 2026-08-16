@@ -43,6 +43,20 @@ def _region() -> dict[str, object]:
         "direction": "left-to-right",
         "face": "front",
         "artwork_direction": "뚜껑 위쪽을 향함",
+        "needs_ocr_fallback": False,
+        "typography": {
+            "style_class": "condensed serif display",
+            "stroke_character": "heavy verticals and wedge terminals",
+            "glyph_proportions": "tall and narrow",
+            "ink_bbox": [12, 22, 48, 40],
+            "ink_width_px": 36,
+            "ink_height_px": 18,
+            "alignment": "centered baseline",
+            "spacing": "tight tracking",
+            "effects": "black fill and cream outline",
+            "surface_finish": "worn print",
+            "slant_deg": 0,
+        },
     }
 
 
@@ -68,7 +82,6 @@ def _analysis_record(root: Path) -> dict[str, object]:
         "unresolved": [],
         "approvals": [],
     }
-    ocr = {**_region(), "engine": "paddle", "model_signature": "model-v1", "confidence": 0.98}
     visual = _region()
     translation = {
         "region_id": "front-brand-01",
@@ -84,24 +97,10 @@ def _analysis_record(root: Path) -> dict[str, object]:
         "artwork_direction": "뚜껑 위쪽을 향함",
     }
     stage_data = {
-        "source_ocr": {"detections": [ocr]},
-        "source_visual": {"regions": [visual]},
-        "cross_validation": {
-            "regions": [
-                {
-                    "region_id": "front-brand-01",
-                    "ocr_region_id": "front-brand-01",
-                    "visual_region_id": "front-brand-01",
-                    "agreed_text": "MAYO",
-                    "matched": True,
-                    "bbox": [10, 20, 50, 42],
-                    "rotation_deg": 0,
-                    "direction": "left-to-right",
-                    "face": "front",
-                    "artwork_direction": "뚜껑 위쪽을 향함",
-                }
-            ],
-            "conflicts": [],
+        "source_visual": {
+            "vision_first": True,
+            "ocr_fallback_required": False,
+            "regions": [visual],
         },
         "translation": {"regions": [translation]},
     }
@@ -128,11 +127,17 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
         name: _evidence(root, f"lettering-{name}")
         for name in (
             "source-style-reference",
-            "clean-background",
-            "candidate-sheet",
+            "generated-panel",
             "selected-lettering",
             "lettering-mask",
         )
+    }
+    source_typography = dict(_region()["typography"])
+    result_typography = {
+        **source_typography,
+        "glyph_proportions": "tall and narrow Hangul",
+        "ink_bbox": [13, 22, 48, 40],
+        "ink_width_px": 35,
     }
     record["stages"]["edit_plan"] = {
         "status": "pass",
@@ -140,9 +145,9 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
         "data": {
             "masks": masks,
             "compositor": {
-                "mode": "ai-reference-lettering",
+                "mode": "vision-panel-localization",
                 "fixed_font_used": False,
-                "background_locked": True,
+                "single_pass_panels": True,
                 "regions": [
                     {
                         "region_id": "front-brand-01",
@@ -151,21 +156,26 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
                         "rotation_deg": 0,
                         "direction": "left-to-right",
                         "model_signature": "image-model-v1:settings-sha",
-                        "candidate_count": 4,
+                        "generation_attempts": 1,
                         "ocr_exact_match": True,
-                        "style_match_passed": True,
-                        "style_checks": {
-                            "shape_matched": True,
+                        "source_typography": source_typography,
+                        "result_typography": result_typography,
+                        "typography_checks": {
+                            "font_character_matched": True,
+                            "style_matched": True,
                             "size_matched": True,
-                            "direction_matched": True,
+                            "alignment_matched": True,
                             "spacing_matched": True,
+                            "direction_exact": True,
                             "effects_matched": True,
-                            "surface_integration_matched": True,
-                            "old_logo_silhouette_absent": True,
+                            "surface_matched": True,
+                            "ink_height_delta_ratio": 0.0,
+                            "ink_width_delta_ratio": 0.03,
+                            "bbox_coverage_delta_ratio": 0.03,
+                            "rotation_delta_deg": 0.0,
                         },
                         "source_style_reference": lettering_artifacts["source-style-reference"],
-                        "clean_background": lettering_artifacts["clean-background"],
-                        "candidate_sheet": lettering_artifacts["candidate-sheet"],
+                        "generated_panel": lettering_artifacts["generated-panel"],
                         "selected_lettering": lettering_artifacts["selected-lettering"],
                         "lettering_mask": lettering_artifacts["lettering-mask"],
                     }
@@ -207,10 +217,15 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
             "color_preserved": True,
             "sharpness_passed": True,
             "seams_preserved": True,
+            "font_character_matched": True,
+            "lettering_style_matched": True,
             "lettering_shape_matched": True,
             "lettering_size_matched": True,
+            "lettering_bbox_coverage_matched": True,
+            "lettering_alignment_matched": True,
             "lettering_direction_matched": True,
             "lettering_spacing_matched": True,
+            "lettering_rotation_matched": True,
             "lettering_effects_matched": True,
             "surface_integration_matched": True,
             "old_logo_silhouette_absent": True,
@@ -237,38 +252,62 @@ def test_analysis_gate_is_fail_closed_and_binds_evidence_hash(tmp_path: Path) ->
 
     assert review_record.validate_record(record, "analysis", project_root=tmp_path) == []
 
-    (tmp_path / "source_ocr.json").write_bytes(b"changed-after-review")
+    (tmp_path / "source_visual.json").write_bytes(b"changed-after-review")
     errors = review_record.validate_record(record, "analysis", project_root=tmp_path)
     assert any("현재 파일 SHA가 기록과 달라요" in error for error in errors)
 
 
-def test_cross_validation_accepts_resolved_visual_only_region(tmp_path: Path) -> None:
+def test_analysis_gate_uses_source_ocr_only_for_ambiguous_regions(tmp_path: Path) -> None:
     record = _analysis_record(tmp_path)
-    visual_only = {
+    visual = record["stages"]["source_visual"]["data"]["regions"][0]
+    visual["needs_ocr_fallback"] = True
+    record["stages"]["source_visual"]["data"]["ocr_fallback_required"] = True
+
+    errors = review_record.validate_record(record, "analysis", project_root=tmp_path)
+    assert any("stages.source_ocr" in error for error in errors)
+    assert any("stages.cross_validation" in error for error in errors)
+
+    ocr = {
         **_region(),
-        "region_id": "lid-arc",
-        "text": "DEVILDOG'S FINEST MAYO",
-        "bbox": [5, 5, 60, 18],
+        "engine": "paddle",
+        "model_signature": "model-v1",
+        "confidence": 0.98,
     }
-    record["stages"]["source_visual"]["data"]["regions"].append(visual_only)
-    record["stages"]["cross_validation"]["data"]["regions"].append(
-        {
-            "region_id": "lid-arc",
-            "ocr_region_id": None,
-            "visual_region_id": "lid-arc",
-            "agreed_text": "DEVILDOG'S FINEST MAYO",
-            "resolution": "visual_only",
-            "matched": False,
-            "resolved": True,
-            "bbox": [5, 5, 60, 18],
-            "rotation_deg": 0,
-            "direction": "left-to-right",
-            "face": "lid",
-            "artwork_direction": "뚜껑 원호를 따름",
-        }
-    )
+    record["stages"]["source_ocr"] = {
+        "status": "pass",
+        "evidence": [_evidence(tmp_path, "source_ocr")],
+        "data": {"detections": [ocr]},
+    }
+    record["stages"]["cross_validation"] = {
+        "status": "pass",
+        "evidence": [_evidence(tmp_path, "cross_validation")],
+        "data": {
+            "regions": [{
+                "region_id": "front-brand-01",
+                "ocr_region_id": "front-brand-01",
+                "visual_region_id": "front-brand-01",
+                "agreed_text": "MAYO",
+                "matched": True,
+                "bbox": [10, 20, 50, 42],
+                "rotation_deg": 0,
+                "direction": "left-to-right",
+                "face": "front",
+                "artwork_direction": "뚜껑 위쪽을 향함",
+            }],
+            "conflicts": [],
+        },
+    }
 
     assert review_record.validate_record(record, "analysis", project_root=tmp_path) == []
+
+
+def test_analysis_gate_rejects_missing_typography_signature(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    del record["stages"]["source_visual"]["data"]["regions"][0]["typography"]
+
+    errors = review_record.validate_record(record, "analysis", project_root=tmp_path)
+
+    assert any("typography signature 객체가 없어요" in error for error in errors)
 
 
 def test_candidate_gate_rejects_changes_outside_editable_mask(tmp_path: Path) -> None:
@@ -287,12 +326,46 @@ def test_candidate_gate_rejects_fixed_font_lettering(tmp_path: Path) -> None:
     _complete_candidate(tmp_path, record)
 
     compositor = record["stages"]["edit_plan"]["data"]["compositor"]
-    compositor["mode"] = "deterministic-font"
     compositor["fixed_font_used"] = True
 
     errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
-    assert any("mode: ai-reference-lettering" in error for error in errors)
     assert any("fixed_font_used: false" in error for error in errors)
+
+
+def test_candidate_gate_rejects_old_hybrid_mode(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+
+    compositor = record["stages"]["edit_plan"]["data"]["compositor"]
+    compositor["mode"] = "hybrid-role-lettering"
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+
+    assert any("mode: vision-panel-localization" in error for error in errors)
+
+
+def test_candidate_gate_rejects_typography_size_drift(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    region["typography_checks"]["ink_height_delta_ratio"] = 0.11
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+
+    assert any("ink_height_delta_ratio: 0~0.10" in error for error in errors)
+
+
+def test_candidate_gate_rejects_typography_rotation_drift(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    region["typography_checks"]["rotation_delta_deg"] = 2.1
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+
+    assert any("rotation_delta_deg: 절댓값 2.0" in error for error in errors)
 
 
 def test_candidate_gate_requires_style_evidence_for_every_translation_region(tmp_path: Path) -> None:
@@ -310,10 +383,10 @@ def test_candidate_gate_rejects_unchecked_lettering_style(tmp_path: Path) -> Non
     _complete_candidate(tmp_path, record)
 
     region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
-    region["style_checks"]["effects_matched"] = False
+    region["typography_checks"]["effects_matched"] = False
 
     errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
-    assert any("style_checks.effects_matched" in error for error in errors)
+    assert any("typography_checks.effects_matched" in error for error in errors)
 
 
 def test_candidate_gate_binds_selected_ai_lettering_hash(tmp_path: Path) -> None:

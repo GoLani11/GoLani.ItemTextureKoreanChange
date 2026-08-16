@@ -27,14 +27,47 @@ STAGES = (
     "runtime_validation",
     "release_validation",
 )
+ANALYSIS_STAGES = ("source_visual", "translation")
+CANDIDATE_STAGES = ANALYSIS_STAGES + (
+    "edit_plan",
+    "candidate_validation",
+    "post_ocr",
+    "post_visual",
+)
 THROUGH = {
-    "analysis": STAGES[:4],
-    "candidate": STAGES[:8],
-    "material": STAGES[:9],
-    "release": STAGES,
+    "analysis": ANALYSIS_STAGES,
+    "candidate": CANDIDATE_STAGES,
+    "material": CANDIDATE_STAGES + ("material_validation",),
+    "release": CANDIDATE_STAGES
+    + (
+        "material_validation",
+        "mip_validation",
+        "bundle_validation",
+        "runtime_validation",
+        "release_validation",
+    ),
 }
 DIRECTIONS = {"left-to-right", "right-to-left", "top-to-bottom", "bottom-to-top"}
 CROSS_RESOLUTIONS = {"matched", "visual_only", "ocr_only_resolved"}
+TYPOGRAPHY_TEXT_FIELDS = (
+    "style_class",
+    "stroke_character",
+    "glyph_proportions",
+    "alignment",
+    "spacing",
+    "effects",
+    "surface_finish",
+)
+TYPOGRAPHY_BOOLEAN_CHECKS = (
+    "font_character_matched",
+    "style_matched",
+    "size_matched",
+    "alignment_matched",
+    "spacing_matched",
+    "direction_exact",
+    "effects_matched",
+    "surface_matched",
+)
 
 
 def _project_root(start: Path) -> Path:
@@ -167,6 +200,46 @@ def _validate_region(region: Any, location: str, *, ocr: bool) -> list[str]:
     return errors
 
 
+def _validate_typography_signature(signature: Any, location: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(signature, dict):
+        return [f"{location}: typography signature 객체가 없어요"]
+    for field in TYPOGRAPHY_TEXT_FIELDS:
+        if not _nonempty_string(signature.get(field)):
+            errors.append(f"{location}.{field}: 비어 있어요")
+    ink_bbox = signature.get("ink_bbox")
+    if (
+        not isinstance(ink_bbox, list)
+        or len(ink_bbox) != 4
+        or not all(isinstance(value, int) and not isinstance(value, bool) for value in ink_bbox)
+        or ink_bbox[0] < 0
+        or ink_bbox[1] < 0
+        or ink_bbox[2] <= ink_bbox[0]
+        or ink_bbox[3] <= ink_bbox[1]
+    ):
+        errors.append(f"{location}.ink_bbox: [x0, y0, x1, y1] 원본 픽셀 좌표가 아니에요")
+    for field in ("ink_width_px", "ink_height_px"):
+        value = signature.get(field)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+            errors.append(f"{location}.{field}: 0보다 큰 숫자가 아니에요")
+    slant = signature.get("slant_deg")
+    if not isinstance(slant, (int, float)) or isinstance(slant, bool):
+        errors.append(f"{location}.slant_deg: 숫자가 아니에요")
+    return errors
+
+
+def _validate_visual_region(region: Any, location: str) -> list[str]:
+    errors = _validate_region(region, location, ocr=False)
+    if not isinstance(region, dict):
+        return errors
+    if not isinstance(region.get("needs_ocr_fallback"), bool):
+        errors.append(f"{location}.needs_ocr_fallback: boolean이어야 해요")
+    errors.extend(
+        _validate_typography_signature(region.get("typography"), f"{location}.typography")
+    )
+    return errors
+
+
 def _validate_translation(region: Any, location: str) -> list[str]:
     errors: list[str] = []
     if not isinstance(region, dict):
@@ -288,7 +361,7 @@ def _validate_artifact(
     return errors
 
 
-def _validate_ai_lettering(
+def _validate_lettering(
     compositor: Any,
     translations: Any,
     project_root: Path | None,
@@ -297,12 +370,12 @@ def _validate_ai_lettering(
     location = "stages.edit_plan.data.compositor"
     if not isinstance(compositor, dict):
         return [f"{location}: 객체가 없어요"]
-    if compositor.get("mode") != "ai-reference-lettering":
-        errors.append(f"{location}.mode: ai-reference-lettering이어야 해요")
+    if compositor.get("mode") != "vision-panel-localization":
+        errors.append(f"{location}.mode: vision-panel-localization이어야 해요")
     if compositor.get("fixed_font_used") is not False:
         errors.append(f"{location}.fixed_font_used: false여야 해요")
-    if compositor.get("background_locked") is not True:
-        errors.append(f"{location}.background_locked: true여야 해요")
+    if compositor.get("single_pass_panels") is not True:
+        errors.append(f"{location}.single_pass_panels: true여야 해요")
 
     expected: dict[str, dict[str, Any]] = {}
     if isinstance(translations, list):
@@ -341,31 +414,58 @@ def _validate_ai_lettering(
                     errors.append(f"{item}.{field}: 번역 명세와 달라요")
         if not _nonempty_string(region.get("model_signature")):
             errors.append(f"{item}.model_signature: 비어 있어요")
-        count = region.get("candidate_count")
-        if not isinstance(count, int) or isinstance(count, bool) or count < 2:
-            errors.append(f"{item}.candidate_count: 비교 가능한 2 이상의 정수여야 해요")
-        for field in ("ocr_exact_match", "style_match_passed"):
-            if region.get(field) is not True:
-                errors.append(f"{item}.{field}: true여야 해요")
-        style_checks = region.get("style_checks")
-        if not isinstance(style_checks, dict):
-            errors.append(f"{item}.style_checks: 객체가 없어요")
+        attempts = region.get("generation_attempts")
+        if (
+            not isinstance(attempts, int)
+            or isinstance(attempts, bool)
+            or attempts < 1
+            or attempts > 2
+        ):
+            errors.append(f"{item}.generation_attempts: 1 또는 2여야 해요")
+        if region.get("ocr_exact_match") is not True:
+            errors.append(f"{item}.ocr_exact_match: true여야 해요")
+        errors.extend(
+            _validate_typography_signature(
+                region.get("source_typography"), f"{item}.source_typography"
+            )
+        )
+        errors.extend(
+            _validate_typography_signature(
+                region.get("result_typography"), f"{item}.result_typography"
+            )
+        )
+        typography_checks = region.get("typography_checks")
+        if not isinstance(typography_checks, dict):
+            errors.append(f"{item}.typography_checks: 객체가 없어요")
         else:
+            for field in TYPOGRAPHY_BOOLEAN_CHECKS:
+                if typography_checks.get(field) is not True:
+                    errors.append(f"{item}.typography_checks.{field}: true여야 해요")
             for field in (
-                "shape_matched",
-                "size_matched",
-                "direction_matched",
-                "spacing_matched",
-                "effects_matched",
-                "surface_integration_matched",
-                "old_logo_silhouette_absent",
+                "ink_height_delta_ratio",
+                "ink_width_delta_ratio",
+                "bbox_coverage_delta_ratio",
             ):
-                if style_checks.get(field) is not True:
-                    errors.append(f"{item}.style_checks.{field}: true여야 해요")
+                value = typography_checks.get(field)
+                if (
+                    not isinstance(value, (int, float))
+                    or isinstance(value, bool)
+                    or value < 0
+                    or value > 0.10
+                ):
+                    errors.append(f"{item}.typography_checks.{field}: 0~0.10이어야 해요")
+            rotation_delta = typography_checks.get("rotation_delta_deg")
+            if (
+                not isinstance(rotation_delta, (int, float))
+                or isinstance(rotation_delta, bool)
+                or abs(float(rotation_delta)) > 2.0
+            ):
+                errors.append(
+                    f"{item}.typography_checks.rotation_delta_deg: 절댓값 2.0 이하여야 해요"
+                )
         for field in (
             "source_style_reference",
-            "clean_background",
-            "candidate_sheet",
+            "generated_panel",
             "selected_lettering",
             "lettering_mask",
         ):
@@ -409,7 +509,7 @@ def _validate_masks(
                     errors.append(f"{location}.path: 파일이 없어요: {path}")
                 elif _valid_sha256(mask.get("sha256")) and _sha256(path) != mask["sha256"]:
                     errors.append(f"{location}: 현재 마스크 SHA가 기록과 달라요")
-    errors.extend(_validate_ai_lettering(data.get("compositor"), translations, project_root))
+    errors.extend(_validate_lettering(data.get("compositor"), translations, project_root))
     return errors
 
 
@@ -456,10 +556,15 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
         ("color_preserved", True),
         ("sharpness_passed", True),
         ("seams_preserved", True),
+        ("font_character_matched", True),
+        ("lettering_style_matched", True),
         ("lettering_shape_matched", True),
         ("lettering_size_matched", True),
+        ("lettering_bbox_coverage_matched", True),
+        ("lettering_alignment_matched", True),
         ("lettering_direction_matched", True),
         ("lettering_spacing_matched", True),
+        ("lettering_rotation_matched", True),
         ("lettering_effects_matched", True),
         ("surface_integration_matched", True),
         ("old_logo_silhouette_absent", True),
@@ -683,33 +788,24 @@ def validate_record(
             errors.append(f"stages.{name}: {stage.get('status', 'missing')} 상태라 {through} 게이트를 통과할 수 없어요")
 
     if through in {"analysis", "candidate", "material", "release"}:
-        ocr_detections = stages.get("source_ocr", {}).get("data", {}).get("detections")
-        visual_regions = stages.get("source_visual", {}).get("data", {}).get("regions")
-        cross_regions = stages.get("cross_validation", {}).get("data", {}).get("regions")
-        conflicts = stages.get("cross_validation", {}).get("data", {}).get("conflicts")
+        visual_data = stages.get("source_visual", {}).get("data", {})
+        visual_regions = visual_data.get("regions")
         translations = stages.get("translation", {}).get("data", {}).get("regions")
+        if visual_data.get("vision_first") is not True:
+            errors.append("source_visual.data.vision_first: true여야 해요")
+        fallback_required = visual_data.get("ocr_fallback_required")
+        if not isinstance(fallback_required, bool):
+            errors.append("source_visual.data.ocr_fallback_required: boolean이어야 해요")
         for label, values in (
-            ("source_ocr.data.detections", ocr_detections),
             ("source_visual.data.regions", visual_regions),
-            ("cross_validation.data.regions", cross_regions),
             ("translation.data.regions", translations),
         ):
             if not isinstance(values, list):
                 errors.append(f"{label}: 배열이 아니에요")
-        if not isinstance(conflicts, list):
-            errors.append("cross_validation.data.conflicts: 배열이 아니에요")
-        elif conflicts:
-            errors.append(f"cross_validation.data.conflicts: 충돌 {len(conflicts)}개가 남아 있어요")
-        if isinstance(ocr_detections, list):
-            for index, region in enumerate(ocr_detections):
-                errors.extend(_validate_region(region, f"source_ocr.data.detections[{index}]", ocr=True))
         if isinstance(visual_regions, list):
             for index, region in enumerate(visual_regions):
-                errors.extend(_validate_region(region, f"source_visual.data.regions[{index}]", ocr=False))
-        if isinstance(cross_regions, list):
-            for index, region in enumerate(cross_regions):
                 errors.extend(
-                    _validate_cross_region(region, f"cross_validation.data.regions[{index}]")
+                    _validate_visual_region(region, f"source_visual.data.regions[{index}]")
                 )
         if isinstance(translations, list):
             for index, region in enumerate(translations):
@@ -720,47 +816,91 @@ def validate_record(
                     if expected not in final_texts:
                         errors.append(f"translation: profile 확정 문구 {expected!r}가 없어요")
         if record.get("action") == "localize":
-            for label, values in (
-                ("source_ocr.data.detections", ocr_detections),
-                ("source_visual.data.regions", visual_regions),
-                ("cross_validation.data.regions", cross_regions),
-                ("translation.data.regions", translations),
-            ):
-                if isinstance(values, list) and not values:
-                    errors.append(f"{label}: 현지화 대상인데 판독 영역이 없어요")
-        if all(isinstance(values, list) for values in (ocr_detections, visual_regions, cross_regions)):
-            source_ids = {
-                str(region.get("region_id"))
-                for values in (ocr_detections, visual_regions)
-                for region in values
-                if isinstance(region, dict) and region.get("region_id")
-            }
-            cross_ocr_ids = {
-                str(region.get("ocr_region_id"))
-                for region in cross_regions
-                if isinstance(region, dict) and _nonempty_string(region.get("ocr_region_id"))
-            }
-            cross_visual_ids = {
-                str(region.get("visual_region_id"))
-                for region in cross_regions
-                if isinstance(region, dict) and _nonempty_string(region.get("visual_region_id"))
-            }
-            ocr_ids = {
-                str(region.get("region_id"))
-                for region in ocr_detections
-                if isinstance(region, dict) and region.get("region_id")
-            }
+            if isinstance(visual_regions, list) and not visual_regions:
+                errors.append("source_visual.data.regions: 현지화 대상인데 판독 영역이 없어요")
+            if isinstance(translations, list) and not translations:
+                errors.append("translation.data.regions: 현지화 대상인데 번역 영역이 없어요")
+        fallback_ids: set[str] = set()
+        visual_ids: set[str] = set()
+        if isinstance(visual_regions, list):
             visual_ids = {
                 str(region.get("region_id"))
                 for region in visual_regions
-                if isinstance(region, dict) and region.get("region_id")
+                if isinstance(region, dict) and _nonempty_string(region.get("region_id"))
             }
-            missing_ocr_ids = sorted(ocr_ids - cross_ocr_ids)
-            missing_visual_ids = sorted(visual_ids - cross_visual_ids)
-            if missing_ocr_ids:
-                errors.append(f"cross_validation: OCR 영역이 누락됐어요: {missing_ocr_ids}")
-            if missing_visual_ids:
-                errors.append(f"cross_validation: 시각 판독 영역이 누락됐어요: {missing_visual_ids}")
+            fallback_ids = {
+                str(region.get("region_id"))
+                for region in visual_regions
+                if isinstance(region, dict)
+                and _nonempty_string(region.get("region_id"))
+                and region.get("needs_ocr_fallback") is True
+            }
+        if fallback_ids and fallback_required is not True:
+            errors.append("source_visual.data.ocr_fallback_required: 모호한 영역이 있어 true여야 해요")
+        if fallback_required is True and not fallback_ids:
+            errors.append("source_visual.data.ocr_fallback_required: fallback 대상 영역이 없어요")
+        if isinstance(translations, list):
+            translation_ids = {
+                str(region.get("region_id"))
+                for region in translations
+                if isinstance(region, dict) and _nonempty_string(region.get("region_id"))
+            }
+            missing_visual = sorted(translation_ids - visual_ids)
+            if missing_visual:
+                errors.append(f"translation: 시각 판독에 없는 영역이 있어요: {missing_visual}")
+
+        if fallback_required is True:
+            for stage_name in ("source_ocr", "cross_validation"):
+                stage = stages.get(stage_name, {})
+                if stage.get("status") != "pass":
+                    errors.append(f"stages.{stage_name}: OCR fallback에 필요하므로 pass여야 해요")
+                errors.extend(
+                    _validate_evidence(
+                        stage.get("evidence"),
+                        f"stages.{stage_name}.evidence",
+                        project_root=project_root,
+                        required=True,
+                    )
+                )
+            ocr_detections = stages.get("source_ocr", {}).get("data", {}).get("detections")
+            cross_data = stages.get("cross_validation", {}).get("data", {})
+            cross_regions = cross_data.get("regions")
+            conflicts = cross_data.get("conflicts")
+            if not isinstance(ocr_detections, list) or not ocr_detections:
+                errors.append("source_ocr.data.detections: fallback 검출 영역이 없어요")
+            else:
+                for index, region in enumerate(ocr_detections):
+                    errors.extend(
+                        _validate_region(
+                            region, f"source_ocr.data.detections[{index}]", ocr=True
+                        )
+                    )
+            if not isinstance(cross_regions, list) or not cross_regions:
+                errors.append("cross_validation.data.regions: fallback 교차검증 영역이 없어요")
+            else:
+                for index, region in enumerate(cross_regions):
+                    errors.extend(
+                        _validate_cross_region(
+                            region, f"cross_validation.data.regions[{index}]"
+                        )
+                    )
+                cross_visual_ids = {
+                    str(region.get("visual_region_id"))
+                    for region in cross_regions
+                    if isinstance(region, dict)
+                    and _nonempty_string(region.get("visual_region_id"))
+                }
+                missing_fallback = sorted(fallback_ids - cross_visual_ids)
+                if missing_fallback:
+                    errors.append(
+                        f"cross_validation: fallback 시각 영역이 누락됐어요: {missing_fallback}"
+                    )
+            if not isinstance(conflicts, list):
+                errors.append("cross_validation.data.conflicts: 배열이 아니에요")
+            elif conflicts:
+                errors.append(
+                    f"cross_validation.data.conflicts: 충돌 {len(conflicts)}개가 남아 있어요"
+                )
 
     if through in {"candidate", "material", "release"}:
         if record.get("action") == "localize":
