@@ -48,9 +48,12 @@ rotation, reading direction, outline, shadow, layering and print wear as closely
 Render the Korean text verbatim with no extra or missing characters.
 ```
 
-최소 복수 후보를 만들지 않는다. 첫 결과를 바로 최종 크기로 검사한다. 철자나 한 가지
-typography 항목만 실패하면 그 항목만 지적해 한 번 재시도할 수 있다. 여러 항목이 흔들리거나
-비문자 영역이 바뀌면 반복 생성하지 말고 `review` 또는 `block`으로 둔다.
+최소 복수 후보를 만들지 않는다. 첫 결과를 바로 최종 크기로 검사한다. 결과 OCR에서 확정
+한국어의 철자와 지정 횟수가 모두 맞을 때까지 철자·방향·간격처럼 실패 원인 하나씩만 지적해
+생성·합성·OCR을 반복한다. 비문자 영역이 흔들리면 다음 생성 결과 전체를 쓰지 말고 승인한
+문자 패치만 원본에 합성해 보호 픽셀을 복원한다. OCR을 통과한 뒤에도 typography lock이나
+보호 검사가 실패하면 `review` 또는 `block`으로 두며, OCR 실패본은 최종 미리보기로 보고하지
+않는다.
 
 고정 한글 폰트 오버레이, 원문 폭을 맞추기 위한 사후 글리프 변형, 글자별 별도 생성, 후보별
 배경 재생성과 전체 Texture2D 재생성을 금지한다.

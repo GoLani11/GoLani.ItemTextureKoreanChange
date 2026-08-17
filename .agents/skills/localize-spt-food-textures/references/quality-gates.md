@@ -28,8 +28,10 @@
 - `compositor.mode`는 `vision-panel-localization`, `fixed_font_used`는 `false`,
   `single_pass_panels`는 `true`여야 한다.
 - 연결된 라벨 면은 한 생성 호출에서 편집하고 글자별 호출을 금지한다.
-- 각 영역에 모델 서명, 1~2회의 생성 시도, 원본/결과 typography signature, 원본 스타일
+- 각 영역에 모델 서명, 1회 이상의 생성 시도, 원본/결과 typography signature, 원본 스타일
   참조, 생성 패널, 선택 글자 패치와 마스크를 해시 고정해야 한다.
+- 결과 OCR에서 모든 확정 한국어의 철자·지정 횟수가 맞을 때까지 실패 원인 하나씩 보정한
+  생성·합성·OCR 반복 기록이 있어야 하며 OCR 실패본을 최종 미리보기로 승인하면 안 된다.
 
 ## G3 typography lock
 

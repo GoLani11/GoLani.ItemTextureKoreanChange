@@ -93,7 +93,7 @@ SHA-256을 가진다. 검사 미실행은 빈 `pass`가 아니라 `error`, 확�
 - `mode: "vision-panel-localization"`
 - `fixed_font_used: false`
 - `single_pass_panels: true`
-- 영역별 확정 문자열, bbox, 회전, 방향, 모델 서명과 `generation_attempts` 1~2
+- 영역별 확정 문자열, bbox, 회전, 방향, 모델 서명과 1 이상의 `generation_attempts`
 - 원본/결과 typography signature와 `typography_checks`
 - 원본 스타일 crop, 생성 패널, 선택 글자 패치와 마스크의 경로·SHA
 

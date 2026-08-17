@@ -368,6 +368,26 @@ def test_candidate_gate_rejects_typography_rotation_drift(tmp_path: Path) -> Non
     assert any("rotation_delta_deg: 절댓값 2.0" in error for error in errors)
 
 
+def test_candidate_gate_accepts_more_than_two_ocr_driven_attempts(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    region["generation_attempts"] = 4
+
+    assert review_record.validate_record(record, "candidate", project_root=tmp_path) == []
+
+
+def test_candidate_gate_rejects_zero_generation_attempts(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    region["generation_attempts"] = 0
+
+    errors = review_record.validate_record(record, "candidate", project_root=tmp_path)
+
+    assert any("generation_attempts: 1 이상의 정수" in error for error in errors)
+
+
 def test_candidate_gate_requires_style_evidence_for_every_translation_region(tmp_path: Path) -> None:
     record = _analysis_record(tmp_path)
     _complete_candidate(tmp_path, record)

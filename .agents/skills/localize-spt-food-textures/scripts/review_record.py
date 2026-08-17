@@ -415,13 +415,8 @@ def _validate_lettering(
         if not _nonempty_string(region.get("model_signature")):
             errors.append(f"{item}.model_signature: 비어 있어요")
         attempts = region.get("generation_attempts")
-        if (
-            not isinstance(attempts, int)
-            or isinstance(attempts, bool)
-            or attempts < 1
-            or attempts > 2
-        ):
-            errors.append(f"{item}.generation_attempts: 1 또는 2여야 해요")
+        if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+            errors.append(f"{item}.generation_attempts: 1 이상의 정수여야 해요")
         if region.get("ocr_exact_match") is not True:
             errors.append(f"{item}.ocr_exact_match: true여야 해요")
         errors.extend(
