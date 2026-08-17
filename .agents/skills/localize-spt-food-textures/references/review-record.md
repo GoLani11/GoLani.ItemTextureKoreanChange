@@ -94,6 +94,8 @@ SHA-256을 가진다. 검사 미실행은 빈 `pass`가 아니라 `error`, 확�
 - `fixed_font_used: false`
 - `single_pass_panels: true`
 - 영역별 확정 문자열, bbox, 회전, 방향, 모델 서명과 1 이상의 `generation_attempts`
+- 연결 면 `panel_id`, 생성 패널 NFC 완전일치 `panel_ocr`, 원본 좌표 복원을 증명하는
+  `panel_transform`
 - 원본/결과 typography signature와 `typography_checks`
 - 원본 스타일 crop, 생성 패널, 선택 글자 패치와 마스크의 경로·SHA
 
@@ -115,7 +117,9 @@ SHA-256을 가진다. 검사 미실행은 빈 `pass`가 아니라 `error`, 확�
 
 `post_ocr.data`에는 `candidate_sha256`, `engine_signature`,
 `forbidden_foreign_detected: false`, `expected_text_matched: true`,
-`duplicate_text_detected: false`를 둔다.
+`duplicate_text_detected: false`, `match_mode: "nfc-literal"`,
+`oriented_region_ocr_complete: true`를 둔다. 공백·줄바꿈·구두점·숫자·단위를 버리는 부분일치나
+전체 Texture2D OCR 결과를 후보 통과 근거로 사용하지 않는다.
 
 `forbidden_foreign_detected`는 `editable`과 겹치는 검출만 뜻한다. `protected`에서 원본과 픽셀이
 같은 외국어 미세 인쇄는 허용하며, 후보 픽셀 검사로 보존을 증명한다.

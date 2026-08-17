@@ -291,25 +291,56 @@ def audit_candidate(
     target_dir = paths.reviews / target.id
     draft_dir = paths.drafts / target.id
     compose_path = draft_dir / "compose-report.json"
-    glyph_path = draft_dir / "glyph-run.json"
+    lettering_path = draft_dir / "lettering-run.json"
     candidate_path = draft_dir / "candidate.png"
     ocr_path = target_dir / "candidate-ocr.json"
     compose = _read_json(compose_path, "조판 보고서")
-    glyph = _read_json(glyph_path, "글리프 실행 기록")
+    lettering = _read_json(lettering_path, "레터링 실행 기록")
     ocr = _read_json(ocr_path, "후보 OCR 보고서")
-    if compose.get("target_id") != target.id or glyph.get("target_id") != target.id:
+    if (
+        compose.get("target_id") != target.id
+        or lettering.get("schema_version") != 2
+        or lettering.get("target_id") != target.id
+        or lettering.get("source_sha256") != compose.get("source_sha256")
+    ):
         raise ValueError("조판 보고서 target이 현재 품목과 달라요")
+    compositor = compose.get("compositor", {})
+    if (
+        compose.get("schema_version") != 2
+        or compositor.get("mode") != "vision-panel-localization"
+        or compositor.get("fixed_font_used") is not False
+        or compositor.get("single_pass_panels") is not True
+        or compose.get("candidate_gate_eligible") is not True
+    ):
+        raise ValueError("후보가 최신 비전 패널 합성 계약으로 만들어지지 않았어요")
+    lettering_descriptor = compositor.get("lettering_run")
+    if not isinstance(lettering_descriptor, dict):
+        raise ValueError("조판 보고서에 레터링 실행 기록 명세가 없어요")
+    recorded_lettering_path = _project_path(
+        paths,
+        lettering_descriptor.get("path"),
+        "레터링 실행 기록",
+    )
+    if (
+        recorded_lettering_path != lettering_path.resolve()
+        or lettering_descriptor.get("sha256") != sha256_file(lettering_path)
+    ):
+        raise ValueError("레터링 실행 기록이 조판 보고서 뒤 변경됐어요")
     if not candidate_path.is_file() or compose.get("candidate_sha256") != sha256_file(candidate_path):
         raise ValueError("후보 이미지가 없거나 조판 뒤 변경됐어요")
     source_path = _project_path(paths, review["source"]["image"], "원본")
     if review["source"].get("sha256") != sha256_file(source_path):
         raise ValueError("작업 기록의 원본 SHA가 현재 파일과 달라요")
+    if compose.get("source_sha256") != review["source"].get("sha256"):
+        raise ValueError("조판 후보가 현재 작업 기록의 원본에서 만들어지지 않았어요")
     candidate_sha = sha256_file(candidate_path)
     if (
         ocr.get("schema_version") != 1
         or ocr.get("phase") != "candidate"
         or ocr.get("status") != "completed"
         or ocr.get("image_sha256") != candidate_sha
+        or ocr.get("recognition_contract") != "approved-regions+nfc-literal-v1"
+        or ocr.get("scope") != "approved-regions"
         or ocr.get("errors") != []
     ):
         raise ValueError("후보 OCR이 현재 후보에서 오류 없이 완료되지 않았어요")
@@ -360,21 +391,17 @@ def audit_candidate(
         **mip_metrics,
     }
     translations = review["stages"]["translation"]["data"].get("regions", [])
-    glyph_counts: dict[str, int] = {}
-    glyph_ocr_capable: dict[str, bool] = {}
-    for run in glyph.get("glyph_runs", []):
+    lettering_counts: dict[str, int] = {}
+    for run in lettering.get("lettering_runs", []):
         text = str(run.get("text", ""))
-        glyph_counts[text] = glyph_counts.get(text, 0) + 1
-        glyph_ocr_capable[text] = glyph_ocr_capable.get(text, False) or (
-            int(run.get("font_size", 0)) >= 12 and run.get("arc") is None
-        )
-    expected_counts, ocr_required_counts = _ocr_requirement_counts(
-        translations, glyph_ocr_capable
-    )
+        occurrences = int(run.get("occurrences", 0))
+        lettering_counts[text] = lettering_counts.get(text, 0) + occurrences
+    expected_counts, _ = _ocr_requirement_counts(translations, {})
+    ocr_required_counts = dict(expected_counts)
     required_translation_regions = [
         region
         for region in translations
-        if isinstance(region, dict) and region.get("ocr_required") is True
+        if isinstance(region, dict)
     ]
     expected_region_plan_sha256 = (
         _region_plan_sha256(required_translation_regions)
@@ -384,30 +411,8 @@ def audit_candidate(
     if ocr.get("region_plan_sha256") != expected_region_plan_sha256:
         raise ValueError("후보 OCR의 방향별 영역 계획이 현재 번역 기록과 달라요")
     ocr_required = {text: count > 0 for text, count in ocr_required_counts.items()}
-    recipe_matched = glyph_counts == expected_counts
+    recipe_matched = lettering_counts == expected_counts
     detections = [value for value in ocr.get("detections", []) if isinstance(value, dict)]
-    recognized_tokens = [_normalize_text(value.get("text", "")) for value in detections]
-    recognized = "".join(recognized_tokens)
-    full_image_ocr_counts = {
-        text: recognized.count(_normalize_text(text)) if _normalize_text(text) else 0
-        for text in expected_counts
-    }
-    for text, count in list(full_image_ocr_counts.items()):
-        normalized = _normalize_text(text)
-        if count:
-            continue
-        minimum = max(3, math.ceil(len(normalized) * 0.75))
-        full_image_ocr_counts[text] = sum(
-            1
-            for token in recognized_tokens
-            if len(token) >= minimum
-            and (
-                normalized.startswith(token)
-                or normalized.endswith(token)
-                or token.startswith(normalized)
-                or token.endswith(normalized)
-            )
-        )
     region_results = {
         str(value.get("region_id")): value
         for value in ocr.get("region_ocr", [])
@@ -417,28 +422,20 @@ def audit_candidate(
         str(region.get("region_id")) in region_results
         for region in required_translation_regions
     )
+    ocr_counts = {text: 0 for text in expected_counts}
     if region_ocr_complete:
-        ocr_counts = {text: 0 for text in expected_counts}
         for region in required_translation_regions:
             result = region_results[str(region["region_id"])]
-            if result.get("matched") is True:
+            if (
+                result.get("matched") is True
+                and result.get("match_mode") == "nfc-literal"
+                and result.get("expected_text") == region.get("final_text_ko")
+            ):
                 text = str(region.get("final_text_ko", ""))
                 ocr_counts[text] += int(region.get("occurrences", 0))
-    else:
-        ocr_counts = full_image_ocr_counts
     ocr_expected_matched = all(
         ocr_counts[text] >= count for text, count in ocr_required_counts.items()
-    )
-    ocr_deferred_to_visual = [
-        {
-            "text": text,
-            "expected_count": count,
-            "ocr_required_count": ocr_required_counts[text],
-            "ocr_count": ocr_counts[text],
-        }
-        for text, count in expected_counts.items()
-        if ocr_required_counts[text] < count and ocr_counts[text] < count
-    ]
+    ) and region_ocr_complete
     expected_with_latin = [
         _normalize_text(text)
         for text in expected_counts
@@ -482,7 +479,9 @@ def audit_candidate(
             ambiguous_foreign_detections.append(entry)
         else:
             foreign_detections.append(entry)
-    duplicate = any(glyph_counts.get(text, 0) > count for text, count in expected_counts.items())
+    duplicate = any(
+        lettering_counts.get(text, 0) > count for text, count in expected_counts.items()
+    )
     post_ocr_data = {
         "candidate_sha256": candidate_sha,
         "engine_signature": json.dumps(
@@ -495,11 +494,10 @@ def audit_candidate(
         "ocr_expected_text_matched": ocr_expected_matched,
         "ocr_required": ocr_required,
         "ocr_required_counts": ocr_required_counts,
-        "ocr_deferred_to_visual": ocr_deferred_to_visual,
+        "match_mode": "nfc-literal",
         "expected_counts": expected_counts,
-        "glyph_counts": glyph_counts,
+        "lettering_counts": lettering_counts,
         "ocr_counts": ocr_counts,
-        "full_image_ocr_counts": full_image_ocr_counts,
         "oriented_region_ocr_complete": region_ocr_complete,
         "oriented_region_ocr": [
             region_results[str(region["region_id"])]
@@ -509,9 +507,7 @@ def audit_candidate(
         "foreign_detections_in_editable": foreign_detections,
         "ambiguous_foreign_detections": ambiguous_foreign_detections,
         "allowed_foreign_detections": allowed_foreign_detections,
-        "requires_visual_resolution": bool(
-            ambiguous_foreign_detections or ocr_deferred_to_visual
-        ),
+        "requires_visual_resolution": bool(ambiguous_foreign_detections),
         "ocr_report": ocr_path.relative_to(paths.root).as_posix(),
         "ocr_report_sha256": sha256_file(ocr_path),
     }

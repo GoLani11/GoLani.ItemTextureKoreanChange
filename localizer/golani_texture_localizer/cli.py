@@ -86,7 +86,7 @@ def _parser() -> argparse.ArgumentParser:
     visual_sheets.add_argument("--target", action="append", dest="target_ids")
 
     compose = subparsers.add_parser(
-        "compose", help="해시 고정 마스크·글꼴 recipe로 한글 후보를 결정적으로 조판해요"
+        "compose", help="해시 고정 배경판·승인 레터링 패치로 한글 후보를 합성해요"
     )
     compose.add_argument("target_id")
     compose.add_argument("recipe", type=Path)
@@ -143,10 +143,24 @@ def _candidate_ocr_regions(paths: ProjectPaths, target_id: str) -> list[dict] | 
     regions = translation.get("data", {}).get("regions", [])
     if translation.get("status") != "pass" or not isinstance(regions, list):
         return None
+    selected = [region for region in regions if isinstance(region, dict)]
+    return selected or None
+
+
+def _source_ocr_regions(paths: ProjectPaths, target_id: str) -> list[dict] | None:
+    path = paths.reviews / target_id / "review.json"
+    if not path.is_file():
+        return None
+    record = json.loads(path.read_text(encoding="utf-8"))
+    source_visual = record.get("stages", {}).get("source_visual", {})
+    data = source_visual.get("data", {})
+    regions = data.get("regions", [])
+    if source_visual.get("status") != "pass" or not isinstance(regions, list):
+        return None
     selected = [
         region
         for region in regions
-        if isinstance(region, dict) and region.get("ocr_required") is True
+        if isinstance(region, dict) and region.get("needs_ocr_fallback") is True
     ]
     return selected or None
 
@@ -222,7 +236,7 @@ def main(argv: list[str] | None = None) -> None:
                 regions = (
                     _candidate_ocr_regions(paths, target.id)
                     if args.phase == "candidate"
-                    else None
+                    else _source_ocr_regions(paths, target.id)
                 )
                 cached = (
                     None
@@ -275,7 +289,7 @@ def main(argv: list[str] | None = None) -> None:
         regions = (
             _candidate_ocr_regions(paths, target.id)
             if args.phase == "candidate"
-            else None
+            else _source_ocr_regions(paths, target.id)
         )
         result = run_ocr(paths.root, image, output, phase=args.phase, regions=regions)
         _print(
@@ -345,7 +359,7 @@ def main(argv: list[str] | None = None) -> None:
                     paths,
                     target.id,
                     source,
-                    paths.reviews / target.id / "source-ocr.json",
+                    None,
                 )
             )
         _print({"target_count": len(reports), "passed": True, "reports": reports})

@@ -419,6 +419,75 @@ def _validate_lettering(
             errors.append(f"{item}.generation_attempts: 1 이상의 정수여야 해요")
         if region.get("ocr_exact_match") is not True:
             errors.append(f"{item}.ocr_exact_match: true여야 해요")
+        if not _nonempty_string(region.get("panel_id")):
+            errors.append(f"{item}.panel_id: 비어 있어요")
+        occurrences = region.get("occurrences")
+        if (
+            not isinstance(occurrences, int)
+            or isinstance(occurrences, bool)
+            or occurrences < 1
+        ):
+            errors.append(f"{item}.occurrences: 1 이상의 정수여야 해요")
+        errors.extend(
+            _validate_artifact(region.get("panel_ocr"), f"{item}.panel_ocr", project_root)
+        )
+        transform = region.get("panel_transform")
+        if not isinstance(transform, dict):
+            errors.append(f"{item}.panel_transform: 객체가 없어요")
+        else:
+            if transform.get("coordinate_space") != "source-mip0":
+                errors.append(f"{item}.panel_transform.coordinate_space: source-mip0여야 해요")
+            crop_bbox = transform.get("crop_bbox")
+            if (
+                not isinstance(crop_bbox, list)
+                or len(crop_bbox) != 4
+                or not all(isinstance(value, int) and not isinstance(value, bool) for value in crop_bbox)
+            ):
+                errors.append(f"{item}.panel_transform.crop_bbox: 정수 bbox여야 해요")
+            elif translation is not None:
+                target_bbox = translation.get("bbox")
+                if (
+                    isinstance(target_bbox, list)
+                    and len(target_bbox) == 4
+                    and not (
+                        crop_bbox[0] <= target_bbox[0]
+                        and crop_bbox[1] <= target_bbox[1]
+                        and crop_bbox[2] >= target_bbox[2]
+                        and crop_bbox[3] >= target_bbox[3]
+                    )
+                ):
+                    errors.append(
+                        f"{item}.panel_transform.crop_bbox: 번역 bbox를 포함해야 해요"
+                    )
+            source_rotation = transform.get("source_rotation_deg")
+            deskew = transform.get("deskew_rotation_deg")
+            inverse = transform.get("inverse_rotation_deg")
+            expected_rotation = region.get("rotation_deg")
+            if not all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in (source_rotation, deskew, inverse, expected_rotation)
+            ):
+                errors.append(f"{item}.panel_transform: 회전 기록이 숫자여야 해요")
+            else:
+                if abs(float(source_rotation) - float(expected_rotation)) > 1e-6:
+                    errors.append(
+                        f"{item}.panel_transform.source_rotation_deg: 영역 회전과 달라요"
+                    )
+                if abs(float(deskew) - float(expected_rotation)) > 1e-6:
+                    errors.append(
+                        f"{item}.panel_transform.deskew_rotation_deg: 원문 역회전과 달라요"
+                    )
+                if abs(float(inverse) + float(expected_rotation)) > 1e-6:
+                    errors.append(
+                        f"{item}.panel_transform.inverse_rotation_deg: 정확한 역변환이 아니에요"
+                    )
+            if transform.get("selected_lettering_restored_to_source") is not True:
+                errors.append(
+                    f"{item}.panel_transform.selected_lettering_restored_to_source: true여야 해요"
+                )
+            for field in ("source_texture_resampled", "final_texture_resampled"):
+                if transform.get(field) is not False:
+                    errors.append(f"{item}.panel_transform.{field}: false여야 해요")
         errors.extend(
             _validate_typography_signature(
                 region.get("source_typography"), f"{item}.source_typography"
@@ -532,6 +601,8 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
         ("forbidden_foreign_detected", False),
         ("expected_text_matched", True),
         ("duplicate_text_detected", False),
+        ("match_mode", "nfc-literal"),
+        ("oriented_region_ocr_complete", True),
     ):
         if post_ocr.get(field) != wanted:
             errors.append(f"stages.post_ocr.data.{field}: {wanted!r}여야 해요")

@@ -130,6 +130,7 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
             "generated-panel",
             "selected-lettering",
             "lettering-mask",
+            "panel-ocr",
         )
     }
     source_typography = dict(_region()["typography"])
@@ -150,14 +151,28 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
                 "single_pass_panels": True,
                 "regions": [
                     {
+                        "panel_id": "front-panel",
                         "region_id": "front-brand-01",
                         "exact_text": "마요네즈",
+                        "occurrences": 1,
                         "bbox": [10, 20, 50, 42],
                         "rotation_deg": 0,
                         "direction": "left-to-right",
                         "model_signature": "image-model-v1:settings-sha",
                         "generation_attempts": 1,
                         "ocr_exact_match": True,
+                        "panel_ocr": lettering_artifacts["panel-ocr"],
+                        "panel_transform": {
+                            "coordinate_space": "source-mip0",
+                            "crop_bbox": [10, 20, 50, 42],
+                            "padding_px": 0,
+                            "source_rotation_deg": 0,
+                            "deskew_rotation_deg": 0,
+                            "inverse_rotation_deg": 0,
+                            "selected_lettering_restored_to_source": True,
+                            "source_texture_resampled": False,
+                            "final_texture_resampled": False,
+                        },
                         "source_typography": source_typography,
                         "result_typography": result_typography,
                         "typography_checks": {
@@ -204,6 +219,8 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
             "forbidden_foreign_detected": False,
             "expected_text_matched": True,
             "duplicate_text_detected": False,
+            "match_mode": "nfc-literal",
+            "oriented_region_ocr_complete": True,
         },
     }
     record["stages"]["post_visual"] = {

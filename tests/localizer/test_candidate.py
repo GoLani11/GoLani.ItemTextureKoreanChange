@@ -10,7 +10,7 @@ from golani_texture_localizer.candidate import (
 )
 
 
-def test_text_normalization_keeps_hangul_and_removes_spacing() -> None:
+def test_search_normalization_keeps_hangul_and_removes_spacing() -> None:
     assert _normalize_text("  미군 전투식량™ ") == "미군전투식량"
 
 

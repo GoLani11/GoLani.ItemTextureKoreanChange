@@ -288,7 +288,7 @@ def _render_text_layer(
     return combined, glyph_runs
 
 
-def compose_candidate(
+def _compose_legacy_font_candidate(
     paths: ProjectPaths,
     target_id: str,
     recipe_path: Path,
@@ -483,6 +483,8 @@ def compose_candidate(
         "masks": mask_reports,
         "compositor": {
             "mode": "deterministic-local-mask-inpaint-and-font",
+            "fixed_font_used": True,
+            "single_pass_panels": False,
             "shaping_engine": "Pillow-FreeType-basic",
             "shaping_version": PIL.__version__,
             "font_sha256": _sha256(font_path),
@@ -491,8 +493,26 @@ def compose_candidate(
         },
         "recipe": str(recipe_path),
         "recipe_sha256": _sha256(recipe_path),
+        "candidate_gate_eligible": False,
         "passed": True,
     }
     report_path = output_dir / "compose-report.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return {**report, "report": str(report_path), "report_sha256": _sha256(report_path)}
+
+
+def compose_candidate(
+    paths: ProjectPaths,
+    target_id: str,
+    recipe_path: Path,
+) -> dict[str, Any]:
+    recipe = json.loads(recipe_path.read_text(encoding="utf-8"))
+    if recipe.get("target_id") != target_id:
+        raise ValueError("조판 recipe target이 요청과 달라요")
+    if recipe.get("schema_version") == 2:
+        from .vision_compose import compose_vision_candidate
+
+        return compose_vision_candidate(paths, target_id, recipe_path, recipe)
+    if recipe.get("schema_version") == 1:
+        return _compose_legacy_font_candidate(paths, target_id, recipe_path)
+    raise ValueError("지원하지 않는 조판 recipe schema예요")

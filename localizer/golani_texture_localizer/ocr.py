@@ -267,6 +267,11 @@ def _normalize(text: str) -> str:
     return "".join(char.casefold() for char in unicodedata.normalize("NFC", text) if char.isalnum())
 
 
+def _literal(text: str) -> str:
+    """Normalize Unicode and newlines without discarding meaningful characters."""
+    return unicodedata.normalize("NFC", text.replace("\r\n", "\n").replace("\r", "\n"))
+
+
 def _region_plan_sha256(regions: Iterable[Mapping[str, Any]] | None) -> str | None:
     if regions is None:
         return None
@@ -325,9 +330,6 @@ def _oriented_region_variants(
     x0, y0, x1, y1 = bbox
     if x0 < 0 or y0 < 0 or x1 <= x0 or y1 <= y0 or x1 > rgba.width or y1 > rgba.height:
         raise ValueError("OCR 영역 bbox가 이미지 밖이에요")
-    if float(rotation) % 90:
-        raise ValueError("OCR 영역 회전은 90도 단위여야 해요")
-
     crop = rgba.crop((x0, y0, x1, y1))
     if float(rotation) % 360:
         crop = crop.rotate(
@@ -359,18 +361,116 @@ def _oriented_region_variants(
             canvas = Image.new("RGBA", crop.size, (value, value, value, 255))
             rgb = Image.alpha_composite(canvas, crop).convert("RGB")
         rgb_values = np.asarray(rgb, dtype=np.uint8)
-        variants.append((f"{background}:scale{scale}", rgb_values))
+        variants.append((f"{background}:rotation{float(rotation):g}:scale{scale}", rgb_values))
         grayscale = np.asarray(rgb.convert("L"), dtype=np.uint8)
         if int(grayscale.max()) > int(grayscale.min()):
             threshold = _otsu_threshold(grayscale)
             binary = np.where(grayscale <= threshold, 0, 255).astype(np.uint8)
             variants.append(
                 (
-                    f"{background}:otsu{threshold}:scale{scale}",
+                    f"{background}:rotation{float(rotation):g}:otsu{threshold}:scale{scale}",
                     np.repeat(binary[..., None], 3, axis=2),
                 )
             )
     return variants
+
+
+def _reading_geometry(value: Mapping[str, Any]) -> tuple[float, float, float, float]:
+    polygon = value.get("polygon")
+    if not isinstance(polygon, (list, tuple)) or not polygon:
+        return (0.0, 0.0, 1.0, 1.0)
+    points = [
+        (float(point[0]), float(point[1]))
+        for point in polygon
+        if isinstance(point, (list, tuple)) and len(point) >= 2
+    ]
+    if not points:
+        return (0.0, 0.0, 1.0, 1.0)
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (
+        (min(xs) + max(xs)) / 2.0,
+        (min(ys) + max(ys)) / 2.0,
+        max(1.0, max(xs) - min(xs)),
+        max(1.0, max(ys) - min(ys)),
+    )
+
+
+def _ordered_region_tokens(values: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    entries = [(value, _reading_geometry(value)) for value in values]
+    entries.sort(key=lambda item: (item[1][1], item[1][0]))
+    lines: list[dict[str, Any]] = []
+    for value, geometry in entries:
+        center_y = geometry[1]
+        height = geometry[3]
+        line = next(
+            (
+                current
+                for current in lines
+                if abs(center_y - float(current["center_y"]))
+                <= max(height, float(current["height"])) * 0.6
+            ),
+            None,
+        )
+        if line is None:
+            line = {"center_y": center_y, "height": height, "values": []}
+            lines.append(line)
+        values_in_line = line["values"]
+        assert isinstance(values_in_line, list)
+        values_in_line.append((value, geometry))
+        count = len(values_in_line)
+        line["center_y"] = (
+            float(line["center_y"]) * (count - 1) + center_y
+        ) / count
+        line["height"] = max(float(line["height"]), height)
+    lines.sort(key=lambda line: float(line["center_y"]))
+    ordered: list[tuple[int, dict[str, Any]]] = []
+    for line_index, line in enumerate(lines):
+        values_in_line = line["values"]
+        assert isinstance(values_in_line, list)
+        values_in_line.sort(key=lambda item: item[1][0])
+        ordered.extend((line_index, value) for value, _ in values_in_line)
+    return ordered
+
+
+def _store_exact_region_readings(
+    readings: dict[tuple[str, str, str], dict[str, Any]],
+    values: list[dict[str, Any]],
+) -> None:
+    """Store literal, layout-aware candidates from one OCR invocation."""
+    valid = [value for value in values if _literal(str(value.get("text", ""))).strip()]
+    ordered = _ordered_region_tokens(valid)
+    candidates = [value for _, value in ordered]
+    for start in range(len(ordered)):
+        for end in range(start + 2, len(ordered) + 1):
+            span = ordered[start:end]
+            pieces = [str(span[0][1]["text"]).strip()]
+            for (previous_line, _), (line_index, value) in zip(span, span[1:]):
+                pieces.append("\n" if line_index != previous_line else " ")
+                pieces.append(str(value["text"]).strip())
+            combined_text = "".join(pieces)
+            candidates.append(
+                {
+                    "text": combined_text,
+                    "script": _script(combined_text),
+                    "confidence": round(
+                        min(float(value["confidence"]) for _, value in span), 6
+                    ),
+                    "engine": span[0][1]["engine"],
+                    "model_signature": span[0][1]["model_signature"],
+                    "variant": span[0][1]["variant"],
+                    "composite": True,
+                    "components": [str(value["text"]) for _, value in span],
+                    "layout_separator": "line-aware",
+                }
+            )
+    for value in candidates:
+        literal = _literal(str(value["text"]))
+        key = (str(value["model_signature"]), str(value["variant"]), literal)
+        if key not in readings or float(value["confidence"]) > float(
+            readings[key]["confidence"]
+        ):
+            readings[key] = value
 
 
 def _iou(left: list[int], right: list[int]) -> float:
@@ -612,6 +712,8 @@ def reusable_ocr_report(
     *,
     regions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
+    if not regions:
+        return None
     if not output_path.is_file():
         return None
     try:
@@ -624,6 +726,8 @@ def reusable_ocr_report(
         "image_sha256": _sha256(image_path),
         "engine_signature": session.engine_signature,
         "region_plan_sha256": _region_plan_sha256(regions),
+        "recognition_contract": "approved-regions+nfc-literal-v1",
+        "scope": "approved-regions",
         "status": "completed",
         "errors": [],
     }
@@ -647,84 +751,23 @@ def _run_ocr_session(
     with Image.open(image_path) as source_file:
         rgba = source_file.convert("RGBA")
         image_size = rgba.size
+    if not isinstance(regions, list) or not regions:
+        raise ValueError(
+            "OCR은 비전 판독으로 승인된 대상 영역에만 실행할 수 있어요"
+        )
     minimum = float(config["minimum_confidence"])
-    detections: list[dict[str, Any]] = []
+    scoped_detections: list[dict[str, Any]] = []
     errors: list[str] = []
     variant_count = 0
-    for variant in _variants(image_path, config):
-        variant_count += 1
-        bgr = variant.rgb[..., ::-1].copy()
-        for recognizer, pipeline in pipelines:
-            try:
-                for result in pipeline.predict(bgr):
-                    data = _result_mapping(result)
-                    texts = list(data.get("rec_texts", []))
-                    scores = list(data.get("rec_scores", []))
-                    polygons = list(data.get("rec_polys", data.get("dt_polys", [])))
-                    for text, score, polygon in zip(texts, scores, polygons):
-                        confidence = float(score)
-                        if confidence < minimum or not str(text).strip():
-                            continue
-                        mapped = _inverse_points(
-                            polygon, variant.rotation, variant.width, variant.height, variant.x, variant.y
-                        )
-                        detections.append(
-                            {
-                                "text": unicodedata.normalize("NFC", str(text)),
-                                "script": _script(str(text)),
-                                "confidence": round(confidence, 6),
-                                "engine": "paddleocr",
-                                "model_signature": f"{config['detector']}+{recognizer}",
-                                "variant": variant.id,
-                                "polygon": mapped,
-                                "bbox": _bbox(mapped, image_size),
-                                "rotation_deg": (360 - variant.rotation) % 360,
-                                "direction": "left-to-right",
-                                "face": "unreviewed",
-                                "artwork_direction": "unreviewed",
-                            }
-                        )
-            except Exception as exc:
-                errors.append(f"paddle/{recognizer}/{variant.id}: {type(exc).__name__}: {exc}")
-        for languages, reader in readers:
-            try:
-                for polygon, text, score in reader.readtext(
-                    variant.rgb,
-                    detail=1,
-                    paragraph=False,
-                    min_size=8,
-                    workers=0,
-                ):
-                    confidence = float(score)
-                    if confidence < minimum or not str(text).strip():
-                        continue
-                    mapped = _inverse_points(
-                        polygon, variant.rotation, variant.width, variant.height, variant.x, variant.y
-                    )
-                    detections.append(
-                        {
-                            "text": unicodedata.normalize("NFC", str(text)),
-                            "script": _script(str(text)),
-                            "confidence": round(confidence, 6),
-                            "engine": "easyocr",
-                            "model_signature": f"easyocr-1.7.2:{'+'.join(languages)}",
-                            "variant": variant.id,
-                            "polygon": mapped,
-                            "bbox": _bbox(mapped, image_size),
-                            "rotation_deg": (360 - variant.rotation) % 360,
-                            "direction": "left-to-right",
-                            "face": "unreviewed",
-                            "artwork_direction": "unreviewed",
-                        }
-                    )
-            except Exception as exc:
-                errors.append(f"easyocr/{'+'.join(languages)}/{variant.id}: {type(exc).__name__}: {exc}")
-    compact = _deduplicate(detections)
     region_ocr: list[dict[str, Any]] = []
     for index, region in enumerate(regions or []):
         region_id = str(region.get("region_id", f"region-{index + 1:03d}"))
-        expected_text = unicodedata.normalize("NFC", str(region.get("final_text_ko", "")))
+        expected_field = "final_text_ko" if phase == "candidate" else "text"
+        expected_text = _literal(str(region.get(expected_field, "")))
+        if not expected_text:
+            raise ValueError(f"OCR 영역 {region_id}의 확정 문자열이 비어 있어요")
         readings: dict[tuple[str, str], dict[str, Any]] = {}
+        exact_readings: dict[tuple[str, str, str], dict[str, Any]] = {}
         region_errors: list[str] = []
         try:
             variants = _oriented_region_variants(
@@ -736,6 +779,7 @@ def _run_ocr_session(
         except Exception as exc:
             variants = []
             region_errors.append(f"prepare: {type(exc).__name__}: {exc}")
+        variant_count += len(variants)
         for variant_id, rgb in variants:
             bgr = rgb[..., ::-1].copy()
             for recognizer, pipeline in pipelines:
@@ -743,17 +787,17 @@ def _run_ocr_session(
                     for result in pipeline.predict(bgr):
                         data = _result_mapping(result)
                         pass_readings: list[dict[str, Any]] = []
-                        for text, score in zip(
+                        for text, score, polygon in zip(
                             list(data.get("rec_texts", [])),
                             list(data.get("rec_scores", [])),
+                            list(data.get("rec_polys", data.get("dt_polys", []))),
                         ):
                             confidence = float(score)
-                            normalized = _normalize(str(text))
-                            if confidence < minimum or not normalized:
+                            if confidence < minimum or not _literal(str(text)).strip():
                                 continue
                             pass_readings.append(
                                 {
-                                    "text": unicodedata.normalize("NFC", str(text)),
+                                    "text": _literal(str(text)),
                                     "script": _script(str(text)),
                                     "confidence": round(confidence, 6),
                                     "engine": "paddleocr",
@@ -761,9 +805,14 @@ def _run_ocr_session(
                                         f"{config['detector']}+{recognizer}"
                                     ),
                                     "variant": variant_id,
+                                    "polygon": [
+                                        [float(point[0]), float(point[1])]
+                                        for point in polygon
+                                    ],
                                 }
                             )
                         _store_region_readings(readings, pass_readings)
+                        _store_exact_region_readings(exact_readings, pass_readings)
                 except Exception as exc:
                     region_errors.append(
                         f"paddle/{recognizer}/{variant_id}: {type(exc).__name__}: {exc}"
@@ -771,7 +820,7 @@ def _run_ocr_session(
             for languages, reader in readers:
                 try:
                     pass_readings = []
-                    for _, text, score in reader.readtext(
+                    for polygon, text, score in reader.readtext(
                         rgb,
                         detail=1,
                         paragraph=False,
@@ -779,44 +828,72 @@ def _run_ocr_session(
                         workers=0,
                     ):
                         confidence = float(score)
-                        normalized = _normalize(str(text))
-                        if confidence < minimum or not normalized:
+                        if confidence < minimum or not _literal(str(text)).strip():
                             continue
                         signature = f"easyocr-1.7.2:{'+'.join(languages)}"
                         pass_readings.append(
                             {
-                                "text": unicodedata.normalize("NFC", str(text)),
+                                "text": _literal(str(text)),
                                 "script": _script(str(text)),
                                 "confidence": round(confidence, 6),
                                 "engine": "easyocr",
                                 "model_signature": signature,
                                 "variant": variant_id,
+                                "polygon": [
+                                    [float(point[0]), float(point[1])]
+                                    for point in polygon
+                                ],
                             }
                         )
                     _store_region_readings(readings, pass_readings)
+                    _store_exact_region_readings(exact_readings, pass_readings)
                 except Exception as exc:
                     region_errors.append(
                         f"easyocr/{'+'.join(languages)}/{variant_id}: {type(exc).__name__}: {exc}"
                     )
-        ordered = sorted(readings.values(), key=lambda value: -float(value["confidence"]))
-        expected_normalized = _normalize(expected_text)
+        ordered = sorted(exact_readings.values(), key=lambda value: -float(value["confidence"]))
         matching = [
-            value for value in ordered if _normalize(value["text"]) == expected_normalized
+            value for value in ordered if _literal(str(value["text"])) == expected_text
         ]
+        best_by_model: dict[tuple[str, str], dict[str, Any]] = {}
+        for value in ordered:
+            key = (str(value["engine"]), str(value["model_signature"]))
+            if key not in best_by_model:
+                best_by_model[key] = value
+        for value in best_by_model.values():
+            scoped_detections.append(
+                {
+                    "region_id": region_id,
+                    "text": value["text"],
+                    "script": value["script"],
+                    "confidence": value["confidence"],
+                    "engine": value["engine"],
+                    "model_signature": value["model_signature"],
+                    "variant": value["variant"],
+                    "bbox": region.get("bbox"),
+                    "rotation_deg": float(region.get("rotation_deg", 0)),
+                    "direction": region.get("direction"),
+                    "scope": "approved-region",
+                }
+            )
         region_ocr.append(
             {
                 "region_id": region_id,
                 "expected_text": expected_text,
                 "bbox": region.get("bbox"),
-                "rotation_deg": region.get("rotation_deg", 0),
+                "rotation_deg": float(region.get("rotation_deg", 0)),
+                "direction": region.get("direction"),
+                "deskew_rotation_deg": float(region.get("rotation_deg", 0)),
+                "inverse_rotation_deg": -float(region.get("rotation_deg", 0)),
                 "matched": bool(matching),
+                "match_mode": "nfc-literal",
                 "matching_engines": sorted({value["engine"] for value in matching}),
                 "readings": ordered[:16],
                 "errors": region_errors,
             }
         )
         errors.extend(f"region/{region_id}/{error}" for error in region_errors)
-    if not compact and errors:
+    if not scoped_detections and errors:
         raise RuntimeError("모든 OCR 호출이 실패했어요: " + " | ".join(errors[:3]))
     report = {
         "schema_version": 1,
@@ -829,7 +906,9 @@ def _run_ocr_session(
         "engine_signature": session.engine_signature,
         "region_plan_sha256": _region_plan_sha256(regions),
         "variant_count": variant_count,
-        "detections": compact,
+        "recognition_contract": "approved-regions+nfc-literal-v1",
+        "scope": "approved-regions",
+        "detections": scoped_detections,
         "region_ocr": region_ocr,
         "errors": errors,
         "requires_independent_visual_review": True,

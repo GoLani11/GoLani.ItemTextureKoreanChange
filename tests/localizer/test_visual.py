@@ -70,3 +70,17 @@ def test_no_ocr_detection_still_creates_whole_image_visual_review(tmp_path: Path
 
     assert report["whole_image_fallback"] is True
     assert report["regions"][0]["bbox"] == [0, 0, 40, 24]
+
+
+def test_vision_first_sheet_does_not_require_an_ocr_report(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    root.mkdir()
+    paths = ProjectPaths.create(root)
+    source = root / "source.png"
+    Image.new("RGBA", (48, 32), (80, 90, 100, 255)).save(source)
+
+    report = create_visual_transcription_sheet(paths, "vision-first", source)
+
+    assert report["vision_first"] is True
+    assert report["ocr_region_source"] is None
+    assert report["regions"][0]["bbox"] == [0, 0, 48, 32]

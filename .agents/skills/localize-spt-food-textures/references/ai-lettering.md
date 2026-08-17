@@ -103,14 +103,28 @@ Render the Korean text verbatim with no extra or missing characters.
   "single_pass_panels": true,
   "regions": [
     {
+      "panel_id": "front-panel",
       "region_id": "front-brand-01",
       "exact_text": "한글 제품명",
+      "occurrences": 1,
       "bbox": [120, 84, 418, 148],
       "rotation_deg": 0,
       "direction": "left-to-right",
       "model_signature": "image-model-and-settings",
       "generation_attempts": 1,
       "ocr_exact_match": true,
+      "panel_ocr": {"path": "...", "sha256": "..."},
+      "panel_transform": {
+        "coordinate_space": "source-mip0",
+        "crop_bbox": [96, 60, 442, 172],
+        "padding_px": 24,
+        "source_rotation_deg": 0,
+        "deskew_rotation_deg": 0,
+        "inverse_rotation_deg": 0,
+        "selected_lettering_restored_to_source": true,
+        "source_texture_resampled": false,
+        "final_texture_resampled": false
+      },
       "source_typography": {
         "style_class": "condensed high-contrast serif display",
         "stroke_character": "heavy verticals, thin cross strokes, wedge terminals",

@@ -33,13 +33,13 @@ SPT가 `D:\SPT`가 아니면 `SPT_DIR` 환경변수 또는 `--spt-root`를 지�
 ## 안전한 작업 흐름
 
 1. `1_추출.bat`: 원본 Texture2D와 실제 Material 연결을 `workspace/`에 기록해요.
-2. 품목별 작업 기록을 만들고 원본 OCR을 실행해요. 전체 배치는 완료 보고서의 입력 SHA와
-   모델 서명이 같으면 안전하게 이어서 실행해요.
+2. 품목별 작업 기록을 만들고 Codex가 원본을 먼저 판독해요. 확대해도 모호한 번역 대상만
+   `needs_ocr_fallback: true`로 기록한 뒤 해당 ROI에만 원본 OCR을 실행해요. 보호 미세 인쇄나
+   전체 Texture2D에는 OCR을 실행하지 않아요.
 
 ```bat
 work\.venv\Scripts\python.exe .agents\skills\localize-spt-food-textures\scripts\review_record.py init mayo
 work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase source
-work\.venv-ocr\Scripts\python.exe localize.py ocr batch --phase source
 ```
 
 3. 실제 Renderer→Material→Mesh 연결에서 UV 경계를 추출하고, OCR 문자열을 숨긴 확대 시트로
@@ -59,16 +59,19 @@ work\.venv\Scripts\python.exe localize.py legacy-layout-sheets
    `localize.py mask <target-id> <mask-recipe.json>`으로 좌표·색 조건과 실제 UV seam을 묶어
    재현 가능한 `old_text` 마스크를 만들 수 있어요. Normal·Gloss에 외국어 효과가 있으면
    `output_stem`을 달리한 재질 전용 마스크를 만들고, Diffuse의 넓은 마스크를 재사용하지 않아요.
-5. AI 편집은 글자 배경 복구 초안에만 쓰고, 최종 글자는 해시 고정 마스크·글꼴·좌표 recipe로
-   결정적으로 합성해요.
+5. 원문 배경은 `old_text` 안에서만 복원하고 원본·마스크·복원 설정 SHA로 캐시해요. 이미지
+   생성기는 연결된 라벨 면 전체를 한 번에 편집하지만, 최종 후보에는 OCR과 시각 검사를 통과한
+   `selected_lettering` RGBA와 `lettering_mask`만 합성해요. 일반 한글 폰트 픽셀은 최종 후보에
+   사용할 수 없어요. schema v2 recipe 형식은
+   [비전 패널 합성 계약](docs/vision-panel-compositor.md)에 있어요.
 
 ```bat
-work\.venv\Scripts\python.exe localize.py compose mayo workspace\reviews\mayo\compose-recipe.json
+work\.venv\Scripts\python.exe localize.py compose mayo workspace\reviews\mayo\compose-recipe-v2.json
 ```
 6. 후보 OCR과 Codex 시각 비교를 모두 기록한 뒤 `stage`해요.
 
 ```bat
-work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase candidate --image 후보.png
+work\.venv-ocr\Scripts\python.exe localize.py ocr run mayo --phase candidate
 work\.venv\Scripts\python.exe localize.py candidate-check mayo
 work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 ```
@@ -87,6 +90,9 @@ work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 - 예전 `work/2_edited`, 루트 `bundles/`, `tools/auto.py build/deploy` 결과는 새 release로
   간주하지 않아요.
 - OCR 무검출은 “문자가 없음”의 증거가 아니며, OCR 결과만으로 승인하지 않아요.
+- 후보 OCR은 승인된 번역 ROI를 임의 원문 각도의 역각으로 정방향화한 뒤 NFC 기준으로
+  공백·줄바꿈·구두점·숫자·단위를 보존해 완전일치해야 해요. 부분일치는 통과하지 않아요.
+- schema v1 고정 폰트 조판은 과거 배치 참고용 레거시이며 새 후보 게이트를 통과할 수 없어요.
 - 현재 `workspace/approved`의 옛 결과는 마스크·이중 검토·재질 증거가 없으므로 새 게이트에서
   의도적으로 실패해요. 품목별로 다시 검증해야 해요.
 - 원본보다 큰 4096 업스케일은 실제 디테일을 늘리지 않고 흐림·메모리 사용을 키워 사용하지 않아요.

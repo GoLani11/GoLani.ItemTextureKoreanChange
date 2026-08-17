@@ -79,14 +79,16 @@ def create_visual_transcription_sheet(
     paths: ProjectPaths,
     target_id: str,
     source_path: Path,
-    ocr_report_path: Path,
+    ocr_report_path: Path | None = None,
 ) -> dict[str, Any]:
-    report = json.loads(ocr_report_path.read_text(encoding="utf-8"))
-    if report.get("image_sha256") != _sha256(source_path):
-        raise ValueError(f"{target_id} OCR 보고서가 현재 원본과 달라요")
-    if report.get("status") != "completed" or report.get("errors"):
-        raise ValueError(f"{target_id} OCR 보고서가 오류 없이 완료된 상태가 아니에요")
-    regions = _visual_regions(report.get("detections", []))
+    regions: list[dict[str, Any]] = []
+    if ocr_report_path is not None:
+        report = json.loads(ocr_report_path.read_text(encoding="utf-8"))
+        if report.get("image_sha256") != _sha256(source_path):
+            raise ValueError(f"{target_id} OCR 보고서가 현재 원본과 달라요")
+        if report.get("status") != "completed" or report.get("errors"):
+            raise ValueError(f"{target_id} OCR 보고서가 오류 없이 완료된 상태가 아니에요")
+        regions = _visual_regions(report.get("detections", []))
 
     with Image.open(source_path) as source_file:
         source = source_file.convert("RGBA")
@@ -157,9 +159,12 @@ def create_visual_transcription_sheet(
         "target_id": target_id,
         "source": str(source_path),
         "source_sha256": _sha256(source_path),
-        "ocr_region_source": str(ocr_report_path),
-        "ocr_region_source_sha256": _sha256(ocr_report_path),
+        "ocr_region_source": str(ocr_report_path) if ocr_report_path is not None else None,
+        "ocr_region_source_sha256": (
+            _sha256(ocr_report_path) if ocr_report_path is not None else None
+        ),
         "ocr_text_hidden_from_sheet": True,
+        "vision_first": ocr_report_path is None,
         "whole_image_fallback": whole_image_fallback,
         "requires_whole_image_visual_check_for_missed_regions": True,
         "regions": regions,

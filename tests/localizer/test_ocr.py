@@ -15,6 +15,7 @@ from golani_texture_localizer.ocr import (
     _oriented_region_variants,
     _otsu_threshold,
     _positions,
+    _region_plan_sha256,
     _store_region_readings,
     reusable_ocr_report,
 )
@@ -86,20 +87,23 @@ def test_completed_ocr_report_is_reused_only_for_same_input_and_engine(tmp_path)
         phase = "source"
         engine_signature = {"detector": "fixed"}
 
+    regions = [{"region_id": "front", "text": "SOURCE", "bbox": [0, 0, 10, 10]}]
     report = {
         "schema_version": 1,
         "phase": "source",
         "image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
         "engine_signature": Session.engine_signature,
-        "region_plan_sha256": None,
+        "region_plan_sha256": _region_plan_sha256(regions),
+        "recognition_contract": "approved-regions+nfc-literal-v1",
+        "scope": "approved-regions",
         "status": "completed",
         "errors": [],
     }
     report_path.write_text(json.dumps(report), encoding="utf-8")
 
-    assert reusable_ocr_report(Session(), image, report_path) == report
+    assert reusable_ocr_report(Session(), image, report_path, regions=regions) == report
     image.write_bytes(b"changed image")
-    assert reusable_ocr_report(Session(), image, report_path) is None
+    assert reusable_ocr_report(Session(), image, report_path, regions=regions) is None
 
 
 def test_region_ocr_crop_is_rotated_back_and_small_text_is_upscaled() -> None:
@@ -127,13 +131,15 @@ def test_otsu_threshold_separates_dark_text_from_light_background() -> None:
     assert 45 <= threshold < 210
 
 
-def test_region_ocr_crop_rejects_non_right_angle_rotation() -> None:
-    with pytest.raises(ValueError, match="90도"):
-        _oriented_region_variants(
-            Image.new("RGBA", (20, 40), "white"),
-            {"bbox": [2, 4, 8, 24], "rotation_deg": 45},
-            ["white"],
-        )
+def test_region_ocr_crop_accepts_arbitrary_rotation() -> None:
+    variants = _oriented_region_variants(
+        Image.new("RGBA", (20, 40), "white"),
+        {"bbox": [2, 4, 8, 24], "rotation_deg": 45},
+        ["white"],
+    )
+
+    assert variants
+    assert all("rotation45" in name for name, _ in variants)
 
 
 def _detection(
