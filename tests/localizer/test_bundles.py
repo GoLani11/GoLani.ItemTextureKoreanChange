@@ -7,9 +7,11 @@ from PIL import Image
 
 from golani_texture_localizer.bundles import (
     _coverage_values,
+    _mip_chain,
     _prune_stale_preserved_auxiliary_outputs,
     _roundtrip_limits,
     _sha256_file,
+    _validate_derived_material_output,
     _verified_source_bundle,
 )
 from golani_texture_localizer.paths import ProjectPaths
@@ -25,6 +27,28 @@ def test_gloss_8px_roundtrip_limit_uses_noop_calibration() -> None:
 
 def test_gloss_16px_roundtrip_limit_keeps_default() -> None:
     assert _roundtrip_limits("gloss", 16, 16, 6.0)[0] == 6.0
+
+
+def test_repack_rejects_unverified_derived_material_channels() -> None:
+    output = {
+        "policy": "neutralize_old_text",
+        "metrics": {
+            "changed_outside_mask": 0,
+            "changed_unselected_channels": 0,
+            "mode_preserved": True,
+            "selected_channels": ["R"],
+        },
+    }
+
+    _validate_derived_material_output(output, expected_channels=["R"])
+
+    output["metrics"]["changed_unselected_channels"] = 1
+    with pytest.raises(ValueError, match="changed_unselected_channels"):
+        _validate_derived_material_output(output)
+
+    output["metrics"]["changed_unselected_channels"] = 0
+    with pytest.raises(ValueError, match="현재 재질 계약과 달라요"):
+        _validate_derived_material_output(output, expected_channels=["G"])
 
 
 def test_source_bundle_must_match_inventory_hash(tmp_path: Path) -> None:
@@ -78,6 +102,31 @@ def test_uv_coverage_uses_conservative_integer_downscale_for_auxiliary_map() -> 
         result,
         np.asarray([[True, True], [False, True]], dtype=bool),
     )
+
+
+def test_auxiliary_mips_preserve_channels_not_changed_by_material_edit() -> None:
+    values = np.arange(8 * 8 * 4, dtype=np.uint8).reshape((8, 8, 4))
+
+    normal = values.copy()
+    normal[2:6, 2:6, 1] = 200
+    normal[2:6, 2:6, 3] = 180
+    source_normal_mips = _mip_chain(Image.fromarray(values, "RGBA"), "normal", 4)
+    changed_normal_mips = _mip_chain(Image.fromarray(normal, "RGBA"), "normal", 4)
+    for source, changed in zip(source_normal_mips, changed_normal_mips, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(source)[..., [0, 2]],
+            np.asarray(changed)[..., [0, 2]],
+        )
+
+    gloss = values.copy()
+    gloss[2:6, 2:6, 0] = 220
+    source_gloss_mips = _mip_chain(Image.fromarray(values, "RGBA"), "gloss", 4)
+    changed_gloss_mips = _mip_chain(Image.fromarray(gloss, "RGBA"), "gloss", 4)
+    for source, changed in zip(source_gloss_mips, changed_gloss_mips, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(source)[..., 1:],
+            np.asarray(changed)[..., 1:],
+        )
 
 
 @pytest.mark.parametrize("size", [(3, 2), (2, 1), (8, 8)])

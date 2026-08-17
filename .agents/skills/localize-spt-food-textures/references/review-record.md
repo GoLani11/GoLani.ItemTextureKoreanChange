@@ -133,8 +133,31 @@ SHA-256을 가진다. 검사 미실행은 빈 `pass`가 아니라 `error`, 확�
 
 ## 재질·release 측정값
 
-`material_validation.data`에는 실제 binding, 공유 소비자, D/N/G별 정책, 공통 글리프 마스크
-SHA, 마스크 밖 변경 수와 조명 진단 증거를 둔다. `graph_scope`는 `resolved`여야 한다.
+`material_validation.data`에는 derive 전 실제 binding, 공유 소비자, D/N/G별 정책, 공통 글리프
+마스크 SHA와 입력 증거를 둔다. `graph_scope`는 `resolved`여야 한다. derive 뒤의 변경 픽셀과
+채널 보존은 `workspace/derived.json`의 실측값으로 검증한다. 새 효과 producer가 생기면 좌표
+오차도 이 manifest에서 검증한다. 모든 binding과 shared consumer에는 texture identity와 함께
+슬롯 `scale`·`offset`을 기록한다.
+
+`auxiliary_contract`는 `schema_version: 1`,
+`mode: "source-base+master-lettering-alpha-v1"`과 다음을 포함한다.
+
+- `master_geometry: "selected-lettering-continuous-alpha"`
+- `whole_map_generation_used: false`, `binary_new_text_resampled: false`
+- `source_maps_immutable_outside_effect_masks: true`
+- `master_lettering`: region ID별 candidate의 `selected_lettering_sha256`과
+  `lettering_mask_sha256`
+- `maps`: `policies`와 같은 key의 bundle/path ID/texture/role/크기/포맷/UV ST, source-map
+  경로·SHA, policy, 전체 생성 여부와 공유 호환성
+- 수정 맵의 channel semantics 확인 방식·증거 SHA, packing·사용 채널·linear 처리와
+  neutralization signature
+- 맵별 old-effect mask SHA와 neutralized-base fingerprint
+- 미래의 절차 파생 producer가 생기면 master/target 크기·UV ST·V축·texel-center·resampling,
+  대상 region, 허용오차와 algorithm signature
+
+전체 예시와 정책별 요구사항은 [auxiliary-maps.md](auxiliary-maps.md)를 따른다. material 단계는
+derive 입력과 계약을 검증하고, derive manifest가 실제 변경 픽셀과 output SHA를 기록한다.
+현재 코드가 구현하지 않은 정책을 빈 증거로 `pass`시키지 않는다.
 
 - `mip_validation.data`: `checked_mips`, `missing_mips`
 - `bundle_validation.data`: `layout_equal`, `bytes_equal_outside_payloads`, `roundtrip_passed`

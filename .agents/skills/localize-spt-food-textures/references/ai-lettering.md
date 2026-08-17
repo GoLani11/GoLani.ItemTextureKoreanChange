@@ -94,6 +94,11 @@ Render the Korean text verbatim with no extra or missing characters.
 검사한 뒤 Codex가 원본/결과 비교 시트에서 typography lock과 비문자·보호 미세 인쇄 보존을
 최종 확인한다.
 
+승인된 `selected_lettering`의 연속 알파는 downstream 보조맵의 유일한 master geometry다.
+영역별 `selected_lettering`과 `lettering_mask` SHA를 함께 고정한다. Normal·Gloss용 글자를 다시
+생성·검출하지 말고, 각 해상도에서 같은 알파/SDF를 UV 기준으로 재래스터화한다. 물리적 요철에
+채움만 써야 한다면 fill/outline/shadow submask를 분리해 각각 해시 고정한다.
+
 `edit_plan.data.compositor`는 다음 구조를 사용한다.
 
 ```json

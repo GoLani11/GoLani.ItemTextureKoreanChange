@@ -24,6 +24,7 @@ from .review import (
 DIFFUSE_PROPERTIES = {"_MainTex", "_BaseMap", "_BaseColorMap"}
 NORMAL_PROPERTIES = {"_BumpMap", "_NormalMap"}
 GLOSS_PROPERTIES = {"_SpecMap", "_GlossMap", "_MetallicGlossMap"}
+CHANNEL_INDEX = {"R": 0, "G": 1, "B": 2, "A": 3}
 
 
 def _target_bindings(
@@ -52,7 +53,8 @@ def _target_bindings(
 
 
 def _auxiliary_slots(bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    found: dict[tuple[str, str, int], dict[str, Any]] = {}
+    found: list[dict[str, Any]] = []
+    roles_by_texture: dict[tuple[str, int], set[str]] = {}
     for material in bindings:
         for slot in material["texture_slots"]:
             if slot.get("property") in NORMAL_PROPERTIES:
@@ -83,13 +85,18 @@ def _auxiliary_slots(bindings: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "scale": slot["scale"],
                 "offset": slot["offset"],
             }
-            found[(role, str(slot["texture_bundle_key"]), int(slot["path_id"]))] = value
-    return list(found.values())
+            texture_key = (str(slot["texture_bundle_key"]), int(slot["path_id"]))
+            roles_by_texture.setdefault(texture_key, set()).add(role)
+            found.append(value)
+    conflicting = sorted(key for key, roles in roles_by_texture.items() if len(roles) > 1)
+    if conflicting:
+        raise ValueError(f"같은 보조맵 PPtr가 Normal/Gloss 역할을 함께 사용해요: {conflicting}")
+    return found
 
 
 def _binding_signature(
     bindings: list[dict[str, Any]],
-) -> list[tuple[str, str, str, str | None, int, str | None]]:
+) -> list[tuple[Any, ...]]:
     relevant = DIFFUSE_PROPERTIES | NORMAL_PROPERTIES | GLOSS_PROPERTIES
     return sorted(
         (
@@ -99,6 +106,8 @@ def _binding_signature(
             slot.get("texture_bundle_key"),
             int(slot["path_id"]),
             slot.get("texture"),
+            tuple(float(value) for value in slot.get("scale", [1.0, 1.0])),
+            tuple(float(value) for value in slot.get("offset", [0.0, 0.0])),
         )
         for material in bindings
         for slot in material["texture_slots"]
@@ -117,6 +126,8 @@ def _all_consumers(inventory: dict[str, Any], bundle_key: str, path_id: int) -> 
                         "material_bundle_key": material["bundle_key"],
                         "material_path_id": material["path_id"],
                         "property": slot["property"],
+                        "scale": slot.get("scale", [1.0, 1.0]),
+                        "offset": slot.get("offset", [0.0, 0.0]),
                     }
                 )
     return consumers
@@ -128,6 +139,74 @@ def _slot_consumers(inventory: dict[str, Any], slot: dict[str, Any]) -> list[dic
         str(slot["texture_bundle_key"]),
         int(slot["path_id"]),
     )
+
+
+def _verify_auxiliary_contract_entry(
+    entry: Any,
+    slot: dict[str, Any],
+    record: dict[str, Any],
+    source_map: Path,
+    material_mask: dict[str, Any] | None,
+    project_root: Path,
+) -> tuple[int, ...] | None:
+    if not isinstance(entry, dict):
+        raise ValueError("보조맵 source-base 계약이 없어요")
+    expected_identity = {
+        "texture_bundle_key": record["bundle_key"],
+        "path_id": int(record["path_id"]),
+        "texture": record["texture"],
+        "role": slot["role"],
+        "width": int(record["width"]),
+        "height": int(record["height"]),
+        "format": int(record["format"]),
+        "uv_scale": list(slot.get("scale", [1.0, 1.0])),
+        "uv_offset": list(slot.get("offset", [0.0, 0.0])),
+    }
+    if entry.get("identity") != expected_identity:
+        raise ValueError("보조맵 source-base identity나 UV ST가 현재 inventory와 달라요")
+    source_descriptor = entry.get("source_map")
+    if (
+        not isinstance(source_descriptor, dict)
+        or source_descriptor.get("sha256") != sha256_file(source_map)
+    ):
+        raise ValueError("보조맵 source-base SHA-256이 현재 원본과 달라요")
+    source_path = source_descriptor.get("path")
+    if not isinstance(source_path, str) or not source_path:
+        raise ValueError("보조맵 source-base 경로가 없어요")
+    contract_source = (project_root / source_path).resolve()
+    try:
+        contract_source.relative_to(project_root.resolve())
+    except ValueError as exc:
+        raise ValueError("보조맵 source-base 경로가 프로젝트 밖을 가리켜요") from exc
+    if contract_source != source_map.resolve():
+        raise ValueError("보조맵 source-base 경로가 현재 inventory 원본과 달라요")
+    if entry.get("whole_map_generated") is not False:
+        raise ValueError("보조맵 전체 이미지 생성은 허용하지 않아요")
+    if material_mask is None:
+        return None
+    channel_contract = entry.get("channel_contract")
+    if not isinstance(channel_contract, dict):
+        raise ValueError("수정할 보조맵의 채널 계약이 없어요")
+    used_channels = channel_contract.get("used_channels")
+    if (
+        not isinstance(used_channels, list)
+        or not used_channels
+        or any(channel not in CHANNEL_INDEX for channel in used_channels)
+    ):
+        raise ValueError("수정할 보조맵의 사용 채널 계약이 잘못됐어요")
+    if slot["role"] == "normal" and (
+        channel_contract.get("packing") != "dxt5nm-x-a-y-g"
+        or used_channels != ["G", "A"]
+    ):
+        raise ValueError("Normal은 확인된 DXT5nm G/A 채널만 수정해야 해요")
+    if material_mask["method"] == "patch":
+        expected_signature = "patch-copy:v1"
+    else:
+        radius = max(1, round(min(int(record["width"]), int(record["height"])) / 512 * 3))
+        expected_signature = f"opencv-telea:v1:radius={radius}"
+    if entry.get("neutralization_signature") != expected_signature:
+        raise ValueError("보조맵 중립화 알고리즘 계약이 현재 derive 구현과 달라요")
+    return tuple(CHANNEL_INDEX[channel] for channel in used_channels)
 
 
 def _register_auxiliary_plan(
@@ -226,6 +305,7 @@ def _neutralize_map(
     role: str,
     *,
     patch: np.ndarray | None = None,
+    channels: tuple[int, ...] | None = None,
 ) -> tuple[Image.Image, dict[str, Any]]:
     with Image.open(source) as source_file:
         mode = source_file.mode
@@ -233,25 +313,41 @@ def _neutralize_map(
     if mask.shape != image.shape[:2]:
         raise ValueError(f"{role} 마스크 크기가 맵과 달라요")
     output = image.copy()
-    hard_mask = mask.astype(np.uint8) * 255
-    if not mask.any():
-        return Image.fromarray(output, "RGBA"), {"changed_pixels": 0, "changed_outside_mask": 0}
-    radius = max(1, round(min(mask.shape) / 512 * 3))
-    channels = (1, 3) if role == "normal" else (0, 1, 2, 3)
+    if channels is None:
+        channels = (1, 3) if role == "normal" else (0, 1, 2, 3)
+    if (
+        not channels
+        or len(set(channels)) != len(channels)
+        or any(channel not in {0, 1, 2, 3} for channel in channels)
+    ):
+        raise ValueError(f"{role} 수정 채널이 잘못됐어요")
     if role not in {"normal", "gloss"}:
         raise ValueError(f"지원하지 않는 보조맵 역할이에요: {role}")
     if patch is not None:
         if patch.shape != image.shape or patch.dtype != np.uint8:
             raise ValueError(f"{role} 복원 patch 규격이 원본과 달라요")
+        method = "patch"
+    else:
+        method = "inpaint"
+    if not mask.any():
+        return Image.fromarray(output, "RGBA"), {
+            "changed_pixels": 0,
+            "changed_outside_mask": 0,
+            "changed_unselected_channels": 0,
+            "selected_channels": ["RGBA"[channel] for channel in channels],
+            "mode_preserved": mode == "RGBA",
+            "method": method,
+        }
+    hard_mask = mask.astype(np.uint8) * 255
+    radius = max(1, round(min(mask.shape) / 512 * 3))
+    if patch is not None:
         for channel in channels:
             output[..., channel][mask] = patch[..., channel][mask]
-        method = "patch"
     else:
         for channel in channels:
             output[..., channel] = cv2.inpaint(
                 image[..., channel], hard_mask, radius, cv2.INPAINT_TELEA
             )
-        method = "inpaint"
     if role == "normal":
         # Tarkov의 DXT5nm packing에서 X=A, Y=G예요. R/B는 원본 그대로 둬요.
         x = output[..., 3].astype(np.float32) / 127.5 - 1.0
@@ -261,11 +357,19 @@ def _neutralize_map(
         normalized_y = np.clip((y / length + 1.0) * 127.5, 0, 255).astype(np.uint8)
         output[..., 3][mask] = normalized_x[mask]
         output[..., 1][mask] = normalized_y[mask]
-    # gloss는 채널 레이아웃을 추측해 회색맵으로 재작성하지 않고 네 채널을 각각 복원해요.
+    # Gloss는 확인된 채널만 독립 복원하고 나머지 채널은 원본 그대로 둬요.
     changed = np.any(output != image, axis=2)
+    unselected = tuple(channel for channel in range(4) if channel not in channels)
+    changed_unselected = (
+        int((output[..., unselected] != image[..., unselected]).sum())
+        if unselected
+        else 0
+    )
     return Image.fromarray(output, "RGBA"), {
         "changed_pixels": int(changed.sum()),
         "changed_outside_mask": int((changed & ~mask).sum()),
+        "changed_unselected_channels": changed_unselected,
+        "selected_channels": ["RGBA"[channel] for channel in channels],
         "mode_preserved": mode == "RGBA",
         "method": method,
     }
@@ -334,6 +438,8 @@ def derive_approved_materials(
                 value.get("texture_bundle_key"),
                 int(value.get("path_id", 0)),
                 value.get("texture"),
+                tuple(float(item) for item in value.get("scale", [])),
+                tuple(float(item) for item in value.get("offset", [])),
             )
             for value in reviewed_bindings
             if isinstance(value, dict)
@@ -343,6 +449,10 @@ def derive_approved_materials(
         policies = material_data.get("policies")
         if not isinstance(policies, dict):
             raise ValueError(f"{target.id}: 보조맵별 policies가 없어요")
+        contract = material_data.get("auxiliary_contract")
+        contract_maps = contract.get("maps") if isinstance(contract, dict) else None
+        if not isinstance(contract_maps, dict):
+            raise ValueError(f"{target.id}: 보조맵 source-base 계약이 없어요")
         masks = review["stages"]["edit_plan"]["data"]["masks"]
         if material_data.get("text_mask_sha256") != masks["new_text"]["sha256"]:
             raise ValueError(f"{target.id}: material 글자 마스크가 edit plan과 달라요")
@@ -362,6 +472,16 @@ def derive_approved_materials(
             if policy not in {"preserve", "neutralize_old_text"}:
                 raise ValueError(f"{target.id}: {key} 정책을 명시해야 해요")
             consumers = _slot_consumers(inventory, slot)
+            consumer_roles = {
+                "normal"
+                if consumer.get("property") in NORMAL_PROPERTIES
+                else "gloss"
+                if consumer.get("property") in GLOSS_PROPERTIES
+                else "other"
+                for consumer in consumers
+            }
+            if len(consumer_roles) != 1 or "other" in consumer_roles:
+                raise ValueError(f"{target.id}: {key} 공유 PPtr의 재질 역할이 서로 달라요")
             reviewed_consumers = material_data.get("shared_consumers", {}).get(key)
             if reviewed_consumers != consumers:
                 raise ValueError(f"{target.id}: {key} 공유 소비자 검토가 현재 graph와 달라요")
@@ -369,6 +489,16 @@ def derive_approved_materials(
                 _material_mask_descriptor(material_data, key)
                 if policy == "neutralize_old_text"
                 else None
+            )
+            record = _map_record(inventory, slot["texture_bundle_key"], slot["path_id"])
+            source_map = Path(record["source_png"])
+            channel_indices = _verify_auxiliary_contract_entry(
+                contract_maps.get(key),
+                slot,
+                record,
+                source_map,
+                material_mask,
+                paths.root,
             )
             first_operation = _register_auxiliary_plan(
                 auxiliary_plans,
@@ -379,7 +509,18 @@ def derive_approved_materials(
                     material_mask["sha256"] if material_mask is not None else "preserve"
                 ),
                 operation_signature=(
-                    json.dumps(material_mask, ensure_ascii=False, sort_keys=True)
+                    json.dumps(
+                        {
+                            "material_mask": material_mask,
+                            "identity": contract_maps[key]["identity"],
+                            "channel_contract": contract_maps[key]["channel_contract"],
+                            "neutralization_signature": contract_maps[key][
+                                "neutralization_signature"
+                            ],
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
                     if material_mask is not None
                     else "preserve"
                 ),
@@ -390,8 +531,6 @@ def derive_approved_materials(
                 raise ValueError(f"{target.id}: 공유 보조맵 {key} 충돌이 해결되지 않았어요")
             if not first_operation:
                 continue
-            record = _map_record(inventory, slot["texture_bundle_key"], slot["path_id"])
-            source_map = Path(record["source_png"])
             with Image.open(source_map) as map_file:
                 size = map_file.size
             if material_mask is None:
@@ -411,9 +550,12 @@ def derive_approved_materials(
                 old_text,
                 slot["role"],
                 patch=patch_values,
+                channels=channel_indices,
             )
             if metrics["changed_outside_mask"] != 0:
                 raise AssertionError(f"{target.id} {key} 마스크 밖 픽셀이 바뀌었어요")
+            if metrics["changed_unselected_channels"] != 0:
+                raise AssertionError(f"{target.id} {key} 미사용 채널이 바뀌었어요")
             if not metrics.get("mode_preserved", True):
                 raise ValueError(f"{target.id} {key} 원본 색 모드가 RGBA가 아니에요")
             destination = paths.derived / safe_bundle_name(record["bundle_key"]) / f"{record['texture']}.png"

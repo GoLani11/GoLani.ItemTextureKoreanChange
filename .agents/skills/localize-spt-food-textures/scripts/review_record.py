@@ -68,6 +68,10 @@ TYPOGRAPHY_BOOLEAN_CHECKS = (
     "effects_matched",
     "surface_matched",
 )
+MATERIAL_POLICIES = {"preserve", "neutralize_old_text"}
+MATERIAL_ROLES = {"normal", "gloss"}
+MATERIAL_NORMAL_PROPERTIES = {"_BumpMap", "_NormalMap"}
+MATERIAL_GLOSS_PROPERTIES = {"_SpecMap", "_GlossMap", "_MetallicGlossMap"}
 
 
 def _project_root(start: Path) -> Path:
@@ -112,6 +116,16 @@ def _project_file(project_root: Path, value: Any, location: str) -> tuple[Path |
 
 def _stage() -> dict[str, Any]:
     return {"status": "pending", "evidence": [], "data": {}}
+
+
+def _stage_data(stages: Any, name: str) -> dict[str, Any]:
+    if not isinstance(stages, dict):
+        return {}
+    stage = stages.get(name)
+    if not isinstance(stage, dict):
+        return {}
+    data = stage.get("data")
+    return data if isinstance(data, dict) else {}
 
 
 def init_record(project_root: Path, target_id: str, output: Path | None = None) -> Path:
@@ -596,7 +610,7 @@ def _validate_candidate_metrics(data: Any) -> list[str]:
 
 def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    post_ocr = stages.get("post_ocr", {}).get("data", {})
+    post_ocr = _stage_data(stages, "post_ocr")
     for field, wanted in (
         ("forbidden_foreign_detected", False),
         ("expected_text_matched", True),
@@ -614,7 +628,7 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
         elif not _nonempty_string(value):
             errors.append(f"stages.post_ocr.data.{field}: 비어 있어요")
 
-    post_visual = stages.get("post_visual", {}).get("data", {})
+    post_visual = _stage_data(stages, "post_visual")
     for field, wanted in (
         ("translation_matched", True),
         ("text_orientation_matched", True),
@@ -654,107 +668,413 @@ def _validate_post_checks(stages: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _validate_material_metrics(data: Any, project_root: Path) -> list[str]:
+def _numeric_pair(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(
+            isinstance(item, (int, float)) and not isinstance(item, bool)
+            for item in value
+        )
+    )
+
+
+def _master_lettering(stages: dict[str, Any]) -> dict[str, tuple[Any, Any]]:
+    edit_plan = stages.get("edit_plan")
+    if not isinstance(edit_plan, dict):
+        return {}
+    data = edit_plan.get("data")
+    if not isinstance(data, dict):
+        return {}
+    compositor = data.get("compositor", {})
+    regions = compositor.get("regions") if isinstance(compositor, dict) else None
+    if not isinstance(regions, list):
+        return {}
+    result: dict[str, tuple[Any, Any]] = {}
+    for region in regions:
+        if not isinstance(region, dict) or not _nonempty_string(region.get("region_id")):
+            continue
+        selected = region.get("selected_lettering")
+        mask = region.get("lettering_mask")
+        result[str(region["region_id"])] = (
+            selected.get("sha256") if isinstance(selected, dict) else None,
+            mask.get("sha256") if isinstance(mask, dict) else None,
+        )
+    return result
+
+
+def _neutralized_base_fingerprint(
+    item: dict[str, Any],
+    descriptor: dict[str, Any],
+) -> str:
+    source_map = item.get("source_map")
+    payload = {
+        "mode": "neutralized-base-v1",
+        "identity": item.get("identity"),
+        "source_map_sha256": (
+            source_map.get("sha256") if isinstance(source_map, dict) else None
+        ),
+        "source_effect_mask_sha256": descriptor.get("sha256"),
+        "method": descriptor.get("method"),
+        "patch_sha256": descriptor.get("patch_sha256"),
+        "channel_contract": item.get("channel_contract"),
+        "neutralization_signature": item.get("neutralization_signature"),
+    }
+    packed = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(packed.encode("utf-8")).hexdigest()
+
+
+def _validate_material_metrics(
+    data: Any,
+    stages: dict[str, Any],
+    project_root: Path | None,
+) -> list[str]:
     errors: list[str] = []
     if not isinstance(data, dict):
         return ["stages.material_validation.data: 객체가 아니에요"]
+    base_location = "stages.material_validation.data"
     graph_scope = data.get("graph_scope")
     bindings = data.get("bindings")
     if not isinstance(bindings, list) or not bindings:
-        errors.append("stages.material_validation.data.bindings: 배열이 아니에요")
+        errors.append(f"{base_location}.bindings: 비어 있지 않은 배열이어야 해요")
+    else:
+        for index, binding in enumerate(bindings):
+            location = f"{base_location}.bindings[{index}]"
+            if not isinstance(binding, dict):
+                errors.append(f"{location}: 객체가 아니에요")
+                continue
+            for field in (
+                "material_bundle_key",
+                "material",
+                "property",
+                "texture_bundle_key",
+                "texture",
+            ):
+                if not _nonempty_string(binding.get(field)):
+                    errors.append(f"{location}.{field}: 비어 있어요")
+            path_id = binding.get("path_id")
+            if not isinstance(path_id, int) or isinstance(path_id, bool) or path_id == 0:
+                errors.append(f"{location}.path_id: 0이 아닌 정수여야 해요")
+            for field in ("scale", "offset"):
+                if not _numeric_pair(binding.get(field)):
+                    errors.append(f"{location}.{field}: 숫자 두 개 배열이어야 해요")
     if graph_scope != "resolved":
-        errors.append("stages.material_validation.data.graph_scope: resolved여야 해요")
-    expected = {
-        "shared_consumers_resolved": True,
-        "alignment_passed": True,
-        "foreign_relief_detected": False,
-        "changed_outside_masks": 0,
-    }
+        errors.append(f"{base_location}.graph_scope: resolved여야 해요")
+    expected = {"shared_consumers_resolved": True}
     for field, wanted in expected.items():
         if data.get(field) != wanted:
-            errors.append(f"stages.material_validation.data.{field}: {wanted!r}여야 해요")
-    if not _valid_sha256(data.get("text_mask_sha256")):
-        errors.append("stages.material_validation.data.text_mask_sha256: SHA-256 형식이 아니에요")
+            errors.append(f"{base_location}.{field}: {wanted!r}여야 해요")
+    text_mask_sha = data.get("text_mask_sha256")
+    if not _valid_sha256(text_mask_sha):
+        errors.append(f"{base_location}.text_mask_sha256: SHA-256 형식이 아니에요")
+    edit_masks = _stage_data(stages, "edit_plan").get("masks", {})
+    expected_text_mask_sha = (
+        edit_masks.get("new_text", {}).get("sha256")
+        if isinstance(edit_masks, dict)
+        else None
+    )
+    if _valid_sha256(expected_text_mask_sha) and text_mask_sha != expected_text_mask_sha:
+        errors.append(f"{base_location}.text_mask_sha256: 승인 new_text 마스크와 달라요")
+
     policies = data.get("policies")
     material_masks = data.get("material_masks")
+    shared_consumers = data.get("shared_consumers")
     if not isinstance(policies, dict) or not policies:
-        errors.append("stages.material_validation.data.policies: 비어 있지 않은 객체여야 해요")
+        errors.append(f"{base_location}.policies: 비어 있지 않은 객체여야 해요")
     else:
+        if not isinstance(shared_consumers, dict) or set(shared_consumers) != set(policies):
+            errors.append(f"{base_location}.shared_consumers: policies와 같은 맵 키가 필요해요")
         for key, policy in policies.items():
-            if policy not in {"preserve", "neutralize_old_text"}:
-                errors.append(f"stages.material_validation.data.policies.{key}: 지원하지 않는 정책이에요")
+            if not _nonempty_string(key) or policy not in MATERIAL_POLICIES:
+                errors.append(f"{base_location}.policies.{key}: 지원하지 않는 정책이에요")
                 continue
-            if policy != "neutralize_old_text":
+            if policy == "preserve":
                 continue
             descriptor = material_masks.get(key) if isinstance(material_masks, dict) else None
             if not isinstance(descriptor, dict):
-                errors.append(f"stages.material_validation.data.material_masks.{key}: 마스크가 없어요")
+                errors.append(f"{base_location}.material_masks.{key}: 마스크가 없어요")
                 continue
-            mask_path, path_errors = _project_file(
-                project_root,
-                descriptor.get("path"),
-                f"stages.material_validation.data.material_masks.{key}.path",
-            )
-            errors.extend(path_errors)
-            checksum = descriptor.get("sha256")
-            if not _valid_sha256(checksum):
-                errors.append(
-                    f"stages.material_validation.data.material_masks.{key}.sha256: SHA-256 형식이 아니에요"
+            errors.extend(
+                _validate_artifact(
+                    descriptor,
+                    f"{base_location}.material_masks.{key}",
+                    project_root,
                 )
-            elif mask_path is not None:
-                if not mask_path.is_file():
-                    errors.append(
-                        f"stages.material_validation.data.material_masks.{key}.path: 파일이 없어요"
-                    )
-                elif _sha256(mask_path) != checksum:
-                    errors.append(
-                        f"stages.material_validation.data.material_masks.{key}: 현재 파일 SHA-256이 달라요"
-                    )
+            )
             method = descriptor.get("method")
             if method not in {"inpaint", "patch"}:
                 errors.append(
-                    f"stages.material_validation.data.material_masks.{key}.method: "
+                    f"{base_location}.material_masks.{key}.method: "
                     "inpaint 또는 patch여야 해요"
                 )
             if method == "patch":
-                patch_path, patch_errors = _project_file(
-                    project_root,
-                    descriptor.get("patch"),
-                    f"stages.material_validation.data.material_masks.{key}.patch",
-                )
-                errors.extend(patch_errors)
-                patch_checksum = descriptor.get("patch_sha256")
-                if not _valid_sha256(patch_checksum):
-                    errors.append(
-                        f"stages.material_validation.data.material_masks.{key}.patch_sha256: "
-                        "SHA-256 형식이 아니에요"
+                errors.extend(
+                    _validate_artifact(
+                        {
+                            "path": descriptor.get("patch"),
+                            "sha256": descriptor.get("patch_sha256"),
+                        },
+                        f"{base_location}.material_masks.{key}.patch",
+                        project_root,
                     )
-                elif patch_path is not None:
-                    if not patch_path.is_file():
-                        errors.append(
-                            f"stages.material_validation.data.material_masks.{key}.patch: "
-                            "파일이 없어요"
-                        )
-                    elif _sha256(patch_path) != patch_checksum:
-                        errors.append(
-                            f"stages.material_validation.data.material_masks.{key}.patch: "
-                            "현재 파일 SHA-256이 달라요"
-                        )
+                )
+
+        if isinstance(shared_consumers, dict):
+            for key, consumers in shared_consumers.items():
+                location = f"{base_location}.shared_consumers.{key}"
+                if not isinstance(consumers, list) or not consumers:
+                    errors.append(f"{location}: 비어 있지 않은 배열이어야 해요")
+                    continue
+                for index, consumer in enumerate(consumers):
+                    item = f"{location}[{index}]"
+                    if not isinstance(consumer, dict):
+                        errors.append(f"{item}: 객체가 아니에요")
+                        continue
+                    for field in ("material", "material_bundle_key", "property"):
+                        if not _nonempty_string(consumer.get(field)):
+                            errors.append(f"{item}.{field}: 비어 있어요")
+                    material_path_id = consumer.get("material_path_id")
+                    if (
+                        not isinstance(material_path_id, int)
+                        or isinstance(material_path_id, bool)
+                        or material_path_id == 0
+                    ):
+                        errors.append(f"{item}.material_path_id: 0이 아닌 정수여야 해요")
+                    for field in ("scale", "offset"):
+                        if not _numeric_pair(consumer.get(field)):
+                            errors.append(f"{item}.{field}: 숫자 두 개 배열이어야 해요")
+
+    contract = data.get("auxiliary_contract")
+    contract_location = f"{base_location}.auxiliary_contract"
+    if not isinstance(contract, dict):
+        return errors + [
+            f"{contract_location}: v1 source-base 계약이 없어요. 기존 재질 기록을 다시 검토해야 해요"
+        ]
+    for field, wanted in (
+        ("schema_version", 1),
+        ("mode", "source-base+master-lettering-alpha-v1"),
+        ("master_geometry", "selected-lettering-continuous-alpha"),
+        ("whole_map_generation_used", False),
+        ("binary_new_text_resampled", False),
+        ("source_maps_immutable_outside_effect_masks", True),
+    ):
+        if contract.get(field) != wanted:
+            errors.append(f"{contract_location}.{field}: {wanted!r}여야 해요")
+
+    expected_master = _master_lettering(stages)
+    master_records = contract.get("master_lettering")
+    recorded_master: dict[str, tuple[Any, Any]] = {}
+    if not isinstance(master_records, list):
+        errors.append(f"{contract_location}.master_lettering: 배열이어야 해요")
+    else:
+        for index, item in enumerate(master_records):
+            location = f"{contract_location}.master_lettering[{index}]"
+            if not isinstance(item, dict):
+                errors.append(f"{location}: 객체가 아니에요")
+                continue
+            region_id = item.get("region_id")
+            if not _nonempty_string(region_id):
+                errors.append(f"{location}.region_id: 비어 있어요")
+                continue
+            region_id = str(region_id)
+            if region_id in recorded_master:
+                errors.append(f"{location}.region_id: 중복됐어요")
+            selected_sha = item.get("selected_lettering_sha256")
+            mask_sha = item.get("lettering_mask_sha256")
+            if not _valid_sha256(selected_sha):
+                errors.append(f"{location}.selected_lettering_sha256: SHA-256 형식이 아니에요")
+            if not _valid_sha256(mask_sha):
+                errors.append(f"{location}.lettering_mask_sha256: SHA-256 형식이 아니에요")
+            recorded_master[region_id] = (selected_sha, mask_sha)
+        if recorded_master != expected_master:
+            errors.append(
+                f"{contract_location}.master_lettering: 승인된 selected_lettering/lettering_mask와 달라요"
+            )
+
+    maps = contract.get("maps")
+    if not isinstance(maps, dict) or not maps:
+        errors.append(f"{contract_location}.maps: 비어 있지 않은 객체여야 해요")
+        return errors
+    policy_keys = set(policies) if isinstance(policies, dict) else set()
+    map_keys = set(maps)
+    if map_keys != policy_keys:
+        errors.append(f"{contract_location}.maps: policies와 같은 맵 키를 가져야 해요")
+
+    for key, item in maps.items():
+        location = f"{contract_location}.maps.{key}"
+        if not isinstance(item, dict):
+            errors.append(f"{location}: 객체가 아니에요")
+            continue
+        policy = item.get("policy")
+        if policy != (policies.get(key) if isinstance(policies, dict) else None):
+            errors.append(f"{location}.policy: policies의 값과 달라요")
+        identity = item.get("identity")
+        identity_location = f"{location}.identity"
+        if not isinstance(identity, dict):
+            errors.append(f"{identity_location}: 객체가 없어요")
+        else:
+            for field in ("texture_bundle_key", "texture"):
+                if not _nonempty_string(identity.get(field)):
+                    errors.append(f"{identity_location}.{field}: 비어 있어요")
+            texture_format = identity.get("format")
+            if (
+                not isinstance(texture_format, int)
+                or isinstance(texture_format, bool)
+                or texture_format < 0
+            ):
+                errors.append(f"{identity_location}.format: 0 이상의 정수여야 해요")
+            path_id = identity.get("path_id")
+            if not isinstance(path_id, int) or isinstance(path_id, bool) or path_id == 0:
+                errors.append(f"{identity_location}.path_id: 0이 아닌 정수여야 해요")
+            if identity.get("role") not in MATERIAL_ROLES:
+                errors.append(f"{identity_location}.role: normal 또는 gloss여야 해요")
+            for field in ("width", "height"):
+                value = identity.get(field)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    errors.append(f"{identity_location}.{field}: 1 이상의 정수여야 해요")
+            for field in ("uv_scale", "uv_offset"):
+                if not _numeric_pair(identity.get(field)):
+                    errors.append(f"{identity_location}.{field}: 숫자 두 개 배열이어야 해요")
+            material_name, separator, property_name = str(key).rpartition("::")
+            matching_bindings = [
+                binding
+                for binding in bindings
+                if isinstance(binding, dict)
+                and binding.get("material") == material_name
+                and binding.get("property") == property_name
+            ] if isinstance(bindings, list) and separator else []
+            if len(matching_bindings) != 1:
+                errors.append(f"{location}: 같은 material/property binding이 정확히 하나여야 해요")
+            else:
+                binding = matching_bindings[0]
+                expected_role = (
+                    "normal"
+                    if property_name in MATERIAL_NORMAL_PROPERTIES
+                    else "gloss"
+                    if property_name in MATERIAL_GLOSS_PROPERTIES
+                    else None
+                )
+                comparisons = {
+                    "texture_bundle_key": binding.get("texture_bundle_key"),
+                    "path_id": binding.get("path_id"),
+                    "texture": binding.get("texture"),
+                    "role": expected_role,
+                    "uv_scale": binding.get("scale"),
+                    "uv_offset": binding.get("offset"),
+                }
+                for field, expected_value in comparisons.items():
+                    if identity.get(field) != expected_value:
+                        errors.append(f"{identity_location}.{field}: binding과 달라요")
+        errors.extend(
+            _validate_artifact(item.get("source_map"), f"{location}.source_map", project_root)
+        )
+        if item.get("whole_map_generated") is not False:
+            errors.append(f"{location}.whole_map_generated: false여야 해요")
+        if policy == "preserve" and not isinstance(
+            item.get("shared_effect_compatible"), bool
+        ):
+            errors.append(f"{location}.shared_effect_compatible: boolean이어야 해요")
+        elif policy != "preserve" and item.get("shared_effect_compatible") is not True:
+            errors.append(f"{location}.shared_effect_compatible: true여야 해요")
+
+        if policy == "preserve":
+            if item.get("effect_kind") != "none":
+                errors.append(f"{location}.effect_kind: preserve는 'none'이어야 해요")
+            continue
+
+        channel = item.get("channel_contract")
+        channel_location = f"{location}.channel_contract"
+        if not isinstance(channel, dict):
+            errors.append(f"{channel_location}: 객체가 없어요")
+        else:
+            if channel.get("semantics_verified") is not True:
+                errors.append(f"{channel_location}.semantics_verified: true여야 해요")
+            if channel.get("verification_method") not in {
+                "shader-reflection",
+                "controlled-render",
+                "source-asset-analysis",
+            }:
+                errors.append(f"{channel_location}.verification_method: 지원하지 않는 방식이에요")
+            errors.extend(
+                _validate_artifact(
+                    channel.get("evidence"),
+                    f"{channel_location}.evidence",
+                    project_root,
+                )
+            )
+            if not _nonempty_string(channel.get("packing")):
+                errors.append(f"{channel_location}.packing: 비어 있어요")
+            used_channels = channel.get("used_channels")
+            if (
+                not isinstance(used_channels, list)
+                or not used_channels
+                or len(set(used_channels)) != len(used_channels)
+                or any(value not in {"R", "G", "B", "A"} for value in used_channels)
+            ):
+                errors.append(f"{channel_location}.used_channels: 고유한 RGBA 채널 배열이어야 해요")
+            if isinstance(identity, dict) and identity.get("role") == "normal" and (
+                channel.get("packing") != "dxt5nm-x-a-y-g"
+                or used_channels != ["G", "A"]
+            ):
+                errors.append(
+                    f"{channel_location}: Normal은 DXT5nm의 G/A 채널만 사용해야 해요"
+                )
+            if channel.get("linear_data") is not True:
+                errors.append(f"{channel_location}.linear_data: true여야 해요")
+        descriptor = material_masks.get(key) if isinstance(material_masks, dict) else None
+        mask_sha = descriptor.get("sha256") if isinstance(descriptor, dict) else None
+        if item.get("source_effect_mask_sha256") != mask_sha or not _valid_sha256(mask_sha):
+            errors.append(f"{location}.source_effect_mask_sha256: 재질 old-effect 마스크와 달라요")
+        if not _nonempty_string(item.get("neutralization_signature")):
+            errors.append(f"{location}.neutralization_signature: 비어 있어요")
+        elif isinstance(descriptor, dict) and isinstance(identity, dict):
+            if descriptor.get("method") == "patch":
+                expected_signature = "patch-copy:v1"
+            else:
+                width = identity.get("width")
+                height = identity.get("height")
+                if all(
+                    isinstance(value, int) and not isinstance(value, bool) and value > 0
+                    for value in (width, height)
+                ):
+                    radius = max(1, round(min(width, height) / 512 * 3))
+                    expected_signature = f"opencv-telea:v1:radius={radius}"
+                else:
+                    expected_signature = None
+            if (
+                expected_signature is not None
+                and item.get("neutralization_signature") != expected_signature
+            ):
+                errors.append(
+                    f"{location}.neutralization_signature: 현재 producer와 달라요"
+                )
+        fingerprint = item.get("base_cache_fingerprint")
+        if not _valid_sha256(fingerprint):
+            errors.append(f"{location}.base_cache_fingerprint: SHA-256 형식이 아니에요")
+        elif isinstance(descriptor, dict) and fingerprint != _neutralized_base_fingerprint(
+            item, descriptor
+        ):
+            errors.append(f"{location}.base_cache_fingerprint: 현재 입력 계약과 달라요")
+
+        if policy == "neutralize_old_text":
+            if item.get("effect_kind") != "remove-only":
+                errors.append(f"{location}.effect_kind: 'remove-only'여야 해요")
+            continue
     return errors
 
 
 def _validate_release_metrics(stages: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    mip = stages.get("mip_validation", {}).get("data", {})
+    mip = _stage_data(stages, "mip_validation")
     if not isinstance(mip.get("checked_mips"), list) or not mip["checked_mips"]:
         errors.append("stages.mip_validation.data.checked_mips: 검사한 밉 목록이 없어요")
     if mip.get("missing_mips") != 0:
         errors.append("stages.mip_validation.data.missing_mips: 0이어야 해요")
-    bundle = stages.get("bundle_validation", {}).get("data", {})
+    bundle = _stage_data(stages, "bundle_validation")
     for field in ("layout_equal", "bytes_equal_outside_payloads", "roundtrip_passed"):
         if bundle.get(field) is not True:
             errors.append(f"stages.bundle_validation.data.{field}: true여야 해요")
-    runtime = stages.get("runtime_validation", {}).get("data", {})
+    runtime = _stage_data(stages, "runtime_validation")
     if not isinstance(runtime.get("capture_matrix"), list) or not runtime["capture_matrix"]:
         errors.append("stages.runtime_validation.data.capture_matrix: 실제 렌더 목록이 없어요")
     for field, wanted in (
@@ -764,7 +1084,7 @@ def _validate_release_metrics(stages: dict[str, Any]) -> list[str]:
     ):
         if runtime.get(field) != wanted:
             errors.append(f"stages.runtime_validation.data.{field}: {wanted!r}여야 해요")
-    release = stages.get("release_validation", {}).get("data", {})
+    release = _stage_data(stages, "release_validation")
     for field in ("input_hashes", "report_hashes", "bundle_hashes"):
         values = release.get(field)
         if not isinstance(values, dict) or not values:
@@ -854,9 +1174,9 @@ def validate_record(
             errors.append(f"stages.{name}: {stage.get('status', 'missing')} 상태라 {through} 게이트를 통과할 수 없어요")
 
     if through in {"analysis", "candidate", "material", "release"}:
-        visual_data = stages.get("source_visual", {}).get("data", {})
+        visual_data = _stage_data(stages, "source_visual")
         visual_regions = visual_data.get("regions")
-        translations = stages.get("translation", {}).get("data", {}).get("regions")
+        translations = _stage_data(stages, "translation").get("regions")
         if visual_data.get("vision_first") is not True:
             errors.append("source_visual.data.vision_first: true여야 해요")
         fallback_required = visual_data.get("ocr_fallback_required")
@@ -918,6 +1238,8 @@ def validate_record(
         if fallback_required is True:
             for stage_name in ("source_ocr", "cross_validation"):
                 stage = stages.get(stage_name, {})
+                if not isinstance(stage, dict):
+                    stage = {}
                 if stage.get("status") != "pass":
                     errors.append(f"stages.{stage_name}: OCR fallback에 필요하므로 pass여야 해요")
                 errors.extend(
@@ -928,8 +1250,8 @@ def validate_record(
                         required=True,
                     )
                 )
-            ocr_detections = stages.get("source_ocr", {}).get("data", {}).get("detections")
-            cross_data = stages.get("cross_validation", {}).get("data", {})
+            ocr_detections = _stage_data(stages, "source_ocr").get("detections")
+            cross_data = _stage_data(stages, "cross_validation")
             cross_regions = cross_data.get("regions")
             conflicts = cross_data.get("conflicts")
             if not isinstance(ocr_detections, list) or not ocr_detections:
@@ -970,25 +1292,27 @@ def validate_record(
 
     if through in {"candidate", "material", "release"}:
         if record.get("action") == "localize":
-            translations = stages.get("translation", {}).get("data", {}).get("regions", [])
+            translations = _stage_data(stages, "translation").get("regions", [])
             errors.extend(
                 _validate_masks(
-                    stages.get("edit_plan", {}).get("data"),
+                    _stage_data(stages, "edit_plan"),
                     source,
                     translations,
                     project_root,
                 )
             )
         else:
-            candidate_data = stages.get("candidate_validation", {}).get("data", {})
+            candidate_data = _stage_data(stages, "candidate_validation")
             if candidate_data.get("rgba_equal") is not True:
                 errors.append("보존 대상은 stages.candidate_validation.data.rgba_equal이 true여야 해요")
-        errors.extend(_validate_candidate_metrics(stages.get("candidate_validation", {}).get("data")))
+        errors.extend(_validate_candidate_metrics(_stage_data(stages, "candidate_validation")))
         errors.extend(_validate_post_checks(stages))
     if through in {"material", "release"}:
         errors.extend(
             _validate_material_metrics(
-                stages.get("material_validation", {}).get("data"), project_root
+                _stage_data(stages, "material_validation"),
+                stages,
+                project_root,
             )
         )
     if through == "release":

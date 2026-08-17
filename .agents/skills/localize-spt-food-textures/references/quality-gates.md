@@ -66,18 +66,31 @@
 ## G5 Diffuse·Normal·Gloss
 
 - 파일명 family가 아니라 실제 Material 연결을 사용해야 한다.
-- 같은 문자 효과는 같은 확정 글리프 마스크·좌표·회전을 사용해야 한다.
-- 평면 인쇄는 N/G를 원본 그대로 보존해야 한다.
-- 기존 원문 relief·광택 제거는 재질 전용 old-text 영역 안에서만 수행해야 한다.
-- normal packing·극성·벡터 길이와 gloss 사용 채널을 유지해야 한다.
+- 보조맵 전체 이미지 생성 이력이 없어야 하고 원본 N/G를 불변 base로 사용해야 한다.
+- 같은 문자 효과는 승인된 `selected_lettering` 연속 알파 하나에서 파생해야 한다. 영역별
+  selected-lettering/mask SHA가 candidate와 같아야 한다.
+- 해상도나 UV ST가 다르면 binary `new_text`를 resize하지 말고 같은 master alpha/SDF를 Mesh
+  UV·texel-center 규칙으로 재래스터화해야 한다.
+- 평면 인쇄는 N/G payload를 byte 보존해야 한다.
+- 기존 원문 relief·광택 제거는 재질 전용 old-effect 안에서만 수행하고 중립 base의 입력
+  fingerprint를 고정해야 한다.
+- 새 요철·광택은 확인된 channel semantics와 algorithm signature로만 절차 파생해야 한다.
+- normal packing·극성·벡터 길이와 gloss 사용 채널을 유지하고 사용하지 않은 채널 변경은
+  0이어야 한다.
+- aux 기준 중심 오차 0.5 texel, bbox 오차 1 texel 이내, 회전 오차 0°여야 한다.
 - 공유 보조맵 소비자를 모두 확인하고 사광 진단에서 편집 대상의 기존 외국어가 보이지 않아야
   한다. 보호 미세 인쇄 효과는 원본과 같아야 한다.
+
+현재 producer가 `neutralize_and_derive`를 구현하지 않았다면 수동 생성 맵을 대신 통과시키지
+않고 material을 `block`한다.
 
 ## G6 밉·압축
 
 - diffuse, normal, gloss에 역할별 축소 방식을 사용해야 한다.
 - 각 UV island를 padding하고 모든 필수 밉에서 글자 ROI와 seam을 검사해야 한다.
 - normal은 매 단계 재정규화하고 gloss는 선형 scalar로 처리해야 한다.
+- 변경하지 않은 채널은 같은 source mip 0에서 만든 no-op 역할별 mip chain과 pre-compression
+  값이 같아야 한다. 압축 뒤 차이는 편집과 교차하는 BC 블록 안에서만 평가한다.
 - 글자·seam ROI의 p95, p99, 최대 오차와 edge 보존을 검사해야 한다.
 
 ## G7 번들
@@ -97,6 +110,7 @@
 ## G9 Release·배포
 
 - source, profile, 판독, 번역, 마스크, 후보, D/N/G, 밉, bundle과 렌더 보고서 SHA를 묶는다.
+- repack 보고서에 현재 `workspace/derived.json` SHA를 포함하고 release·배포까지 다시 확인한다.
 - 어느 입력이든 바뀌면 downstream 결과와 기존 승인을 무효화한다.
 - 실패·검토 대기·누락·오래된 캐시가 하나라도 있으면 release를 만들지 않는다.
 - 실제 설치는 사용자 요청과 백업·복원 계획이 있을 때만 수행한다.

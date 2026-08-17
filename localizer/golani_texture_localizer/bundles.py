@@ -51,6 +51,38 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_derived_material_output(
+    output: Any,
+    *,
+    expected_channels: list[str] | None = None,
+) -> None:
+    if not isinstance(output, dict):
+        raise ValueError("derived 보조맵 산출물이 객체가 아니에요")
+    if output.get("policy") != "neutralize_old_text":
+        raise ValueError("derived 보조맵 산출물 정책이 현재 producer와 달라요")
+    metrics = output.get("metrics")
+    if not isinstance(metrics, dict):
+        raise ValueError("derived 보조맵 실측값이 없어요")
+    expected = {
+        "changed_outside_mask": 0,
+        "changed_unselected_channels": 0,
+        "mode_preserved": True,
+    }
+    for field, wanted in expected.items():
+        if metrics.get(field) != wanted:
+            raise ValueError(f"derived 보조맵 metrics.{field}는 {wanted!r}여야 해요")
+    selected_channels = metrics.get("selected_channels")
+    if (
+        not isinstance(selected_channels, list)
+        or not selected_channels
+        or len(set(selected_channels)) != len(selected_channels)
+        or any(channel not in {"R", "G", "B", "A"} for channel in selected_channels)
+    ):
+        raise ValueError("derived 보조맵 selected_channels가 잘못됐어요")
+    if expected_channels is not None and selected_channels != expected_channels:
+        raise ValueError("derived 보조맵 selected_channels가 현재 재질 계약과 달라요")
+
+
 def _find_texture(environment: Any, name: str):
     matches = []
     for obj in environment.objects:
@@ -820,6 +852,7 @@ def repack_collection(
             f"재질 게이트를 통과하지 않은 대상이 있어요: {sorted(missing_material_validation)}"
         )
     material_review_hashes: dict[str, str] = {}
+    material_contract_maps: dict[str, dict[str, Any]] = {}
     for target_id in sorted(expected_targets):
         value = validated[target_id]
         target = profile.target_by_id(target_id)
@@ -835,6 +868,13 @@ def repack_collection(
         if value.get("material_review_sha256") != current_material_hash:
             raise ValueError(f"{target.id} 파생 뒤 재질 검증 단계가 변경됐어요")
         material_review_hashes[target_id] = current_material_hash
+        contract = current_review["stages"]["material_validation"]["data"].get(
+            "auxiliary_contract"
+        )
+        maps = contract.get("maps") if isinstance(contract, dict) else None
+        if not isinstance(maps, dict):
+            raise ValueError(f"{target.id} 보조맵 source-base 계약이 없어요")
+        material_contract_maps[target_id] = maps
     auxiliary_plans = {
         (value.get("texture_bundle_key"), int(value.get("path_id", 0)), value.get("role")): value
         for value in derived.get("auxiliary_plans", [])
@@ -852,11 +892,43 @@ def repack_collection(
     ]
     for output in selected_outputs:
         target = profile.target_by_id(output["target_id"])
+        matching_contracts = [
+            entry
+            for entry in material_contract_maps[target.id].values()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("identity"), dict)
+            and entry["identity"].get("texture_bundle_key") == output.get("bundle_key")
+            and entry["identity"].get("path_id") == output.get("path_id")
+            and entry["identity"].get("texture") == output.get("texture")
+            and entry["identity"].get("role") == output.get("role")
+        ]
+        channel_sets = {
+            tuple(entry.get("channel_contract", {}).get("used_channels", []))
+            for entry in matching_contracts
+        }
+        if len(matching_contracts) < 1 or len(channel_sets) != 1:
+            raise ValueError(f"{target.id}::{output.get('texture')} 재질 채널 계약이 모호해요")
+        source_map = Path(output["source_png"])
+        for entry in matching_contracts:
+            source_descriptor = entry.get("source_map")
+            if (
+                not isinstance(source_descriptor, dict)
+                or source_descriptor.get("sha256") != output.get("source_sha256")
+            ):
+                raise ValueError(f"{target.id}::{output.get('texture')} source-map 계약이 달라요")
+            relative = Path(str(source_descriptor.get("path", "")))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError(f"{target.id}::{output.get('texture')} source-map 경로가 잘못됐어요")
+            if (paths.root / relative).resolve() != source_map.resolve():
+                raise ValueError(f"{target.id}::{output.get('texture')} source-map 경로가 달라요")
+        _validate_derived_material_output(
+            output,
+            expected_channels=list(next(iter(channel_sets))),
+        )
         approved = paths.approved / f"{target.id}.png"
         source_record = record_for_target(inventory, target)
         verify_approval(paths, target, Path(source_record["source_png"]), approved)
         source = Path(output["derived_png"])
-        source_map = Path(output["source_png"])
         checks = {
             "approved_sha256": sha256_file(approved),
             "approval_sha256": sha256_file(approval_path(paths, target.id)),
@@ -923,6 +995,8 @@ def repack_collection(
     payload = {
         "schema_version": 1,
         "collection": profile.id,
+        "derived_manifest": str(paths.derived_manifest),
+        "derived_manifest_sha256": sha256_file(paths.derived_manifest),
         "partial": target_ids is not None,
         "target_ids": sorted(target_ids) if target_ids is not None else None,
         "bundle_count": len(reports),

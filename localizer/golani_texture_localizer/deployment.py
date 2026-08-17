@@ -37,6 +37,12 @@ def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str,
     repack = json.loads(repack_path.read_text(encoding="utf-8"))
     if repack.get("passed") is not True or repack.get("partial") is not False:
         raise ValueError("전체 재패킹 게이트가 통과되지 않았어요")
+    if (
+        not paths.derived_manifest.is_file()
+        or repack.get("derived_manifest_sha256") != _sha256(paths.derived_manifest)
+    ):
+        raise ValueError("재패킹 뒤 D/N/G derived manifest가 변경됐어요")
+    derived_manifest_sha256 = _sha256(paths.derived_manifest)
     bundles: dict[str, str] = {}
     for report in repack.get("bundles", []):
         key = report.get("bundle_key")
@@ -91,6 +97,7 @@ def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str,
             or existing.get("server_files") != server_files
             or existing.get("profile_sha256") != profile_sha256
             or existing.get("repack_report_sha256") != _sha256(repack_path)
+            or existing.get("derived_manifest_sha256") != derived_manifest_sha256
         ):
             raise ValueError(f"같은 release ID의 내용이 달라요: {release_root}")
         return existing
@@ -118,6 +125,7 @@ def create_release(profile: CollectionProfile, paths: ProjectPaths) -> dict[str,
             "profile_sha256": profile_sha256,
             "repack_report": str(repack_path),
             "repack_report_sha256": _sha256(repack_path),
+            "derived_manifest_sha256": derived_manifest_sha256,
             "bundle_count": len(bundles),
             "bundles": bundles,
             "review_hashes": reviews,
@@ -161,6 +169,7 @@ def _load_release(paths: ProjectPaths, release_id: str) -> tuple[Path, dict[str,
     current_inputs = {
         "profile_sha256": paths.root / "profiles" / "food" / "collection.json",
         "repack_report_sha256": paths.reports / "repack.json",
+        "derived_manifest_sha256": paths.derived_manifest,
     }
     for field, path in current_inputs.items():
         if not path.is_file() or manifest.get(field) != _sha256(path):

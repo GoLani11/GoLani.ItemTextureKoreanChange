@@ -250,6 +250,115 @@ def _complete_candidate(root: Path, record: dict[str, object]) -> None:
     }
 
 
+def _complete_material(
+    root: Path,
+    record: dict[str, object],
+) -> tuple[Path, Path, dict[str, object]]:
+    key = "item::_SpecMap"
+    mask = _write(root / "material-mask.png", b"mask")
+    patch = _write(root / "material-patch.png", b"patch")
+    source_map = _write(root / "source-spec.png", b"source-map")
+    channel_evidence = _write(root / "channel-evidence.json", b"channel-evidence")
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    new_text = record["stages"]["edit_plan"]["data"]["masks"]["new_text"]
+    material_mask = {
+        "path": mask.relative_to(root).as_posix(),
+        "sha256": review_record._sha256(mask),
+        "method": "patch",
+        "patch": patch.relative_to(root).as_posix(),
+        "patch_sha256": review_record._sha256(patch),
+    }
+    contract_map: dict[str, object] = {
+        "policy": "neutralize_old_text",
+        "identity": {
+            "texture_bundle_key": "assets/mayo.bundle",
+            "path_id": 23,
+            "texture": "item_food_mayo_G",
+            "role": "gloss",
+            "width": 64,
+            "height": 64,
+            "format": 10,
+            "uv_scale": [1.0, 1.0],
+            "uv_offset": [0.0, 0.0],
+        },
+        "source_map": {
+            "path": source_map.relative_to(root).as_posix(),
+            "sha256": review_record._sha256(source_map),
+        },
+        "whole_map_generated": False,
+        "shared_effect_compatible": True,
+        "effect_kind": "remove-only",
+        "channel_contract": {
+            "semantics_verified": True,
+            "verification_method": "controlled-render",
+            "evidence": {
+                "path": channel_evidence.relative_to(root).as_posix(),
+                "sha256": review_record._sha256(channel_evidence),
+            },
+            "packing": "custom-spec-rgb",
+            "used_channels": ["R", "G", "B"],
+            "linear_data": True,
+        },
+        "source_effect_mask_sha256": review_record._sha256(mask),
+        "neutralization_signature": "patch-copy:v1",
+    }
+    contract_map["base_cache_fingerprint"] = review_record._neutralized_base_fingerprint(
+        contract_map, material_mask
+    )
+    record["stages"]["material_validation"] = {
+        "status": "pass",
+        "evidence": [_evidence(root, "material-validation")],
+        "data": {
+            "graph_scope": "resolved",
+            "bindings": [
+                {
+                    "material_bundle_key": "assets/mayo.bundle",
+                    "material": "item",
+                    "property": "_SpecMap",
+                    "texture_bundle_key": "assets/mayo.bundle",
+                    "path_id": 23,
+                    "texture": "item_food_mayo_G",
+                    "scale": [1.0, 1.0],
+                    "offset": [0.0, 0.0],
+                }
+            ],
+            "policies": {key: "neutralize_old_text"},
+            "material_masks": {key: material_mask},
+            "shared_consumers": {
+                key: [
+                    {
+                        "material": "item",
+                        "material_bundle_key": "assets/mayo.bundle",
+                        "material_path_id": 17,
+                        "property": "_SpecMap",
+                        "scale": [1.0, 1.0],
+                        "offset": [0.0, 0.0],
+                    }
+                ]
+            },
+            "shared_consumers_resolved": True,
+            "text_mask_sha256": new_text["sha256"],
+            "auxiliary_contract": {
+                "schema_version": 1,
+                "mode": "source-base+master-lettering-alpha-v1",
+                "master_geometry": "selected-lettering-continuous-alpha",
+                "whole_map_generation_used": False,
+                "binary_new_text_resampled": False,
+                "source_maps_immutable_outside_effect_masks": True,
+                "master_lettering": [
+                    {
+                        "region_id": region["region_id"],
+                        "selected_lettering_sha256": region["selected_lettering"]["sha256"],
+                        "lettering_mask_sha256": region["lettering_mask"]["sha256"],
+                    }
+                ],
+                "maps": {key: contract_map},
+            },
+        },
+    }
+    return patch, source_map, contract_map
+
+
 def test_init_record_uses_profile_and_never_overwrites(tmp_path: Path) -> None:
     destination = tmp_path / "review.json"
     created = review_record.init_record(PROJECT_ROOT, "mayo", destination)
@@ -441,34 +550,149 @@ def test_candidate_gate_binds_selected_ai_lettering_hash(tmp_path: Path) -> None
 def test_material_patch_is_bound_to_current_file_hash(tmp_path: Path) -> None:
     record = _analysis_record(tmp_path)
     _complete_candidate(tmp_path, record)
-    mask = _write(tmp_path / "material-mask.png", b"mask")
-    patch = _write(tmp_path / "material-patch.png", b"patch")
-    record["stages"]["material_validation"] = {
-        "status": "pass",
-        "evidence": [_evidence(tmp_path, "material-validation")],
-        "data": {
-            "graph_scope": "resolved",
-            "bindings": [{"material": "item", "property": "_SpecMap"}],
-            "policies": {"item::_SpecMap": "neutralize_old_text"},
-            "material_masks": {
-                "item::_SpecMap": {
-                    "path": mask.relative_to(tmp_path).as_posix(),
-                    "sha256": review_record._sha256(mask),
-                    "method": "patch",
-                    "patch": patch.relative_to(tmp_path).as_posix(),
-                    "patch_sha256": review_record._sha256(patch),
-                }
-            },
-            "shared_consumers_resolved": True,
-            "text_mask_sha256": "a" * 64,
-            "alignment_passed": True,
-            "foreign_relief_detected": False,
-            "changed_outside_masks": 0,
-        },
-    }
+    patch, _, _ = _complete_material(tmp_path, record)
 
     assert review_record.validate_record(record, "material", project_root=tmp_path) == []
+    assert review_record.validate_record(record, "material") == []
 
     patch.write_bytes(b"changed")
     errors = review_record.validate_record(record, "material", project_root=tmp_path)
-    assert any("patch: 현재 파일 SHA-256이 달라요" in error for error in errors)
+    assert any("patch: 현재 파일 SHA가 기록과 달라요" in error for error in errors)
+
+
+def test_material_gate_rejects_whole_map_generation(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _, _, contract_map = _complete_material(tmp_path, record)
+
+    contract_map["whole_map_generated"] = True
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("whole_map_generated: false여야 해요" in error for error in errors)
+
+
+def test_material_gate_allows_byte_preserve_without_channel_guessing(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _, _, contract_map = _complete_material(tmp_path, record)
+    data = record["stages"]["material_validation"]["data"]
+    data["policies"]["item::_SpecMap"] = "preserve"
+    contract_map["policy"] = "preserve"
+    contract_map["effect_kind"] = "none"
+    contract_map["shared_effect_compatible"] = False
+    contract_map.pop("channel_contract")
+
+    assert review_record.validate_record(record, "material", project_root=tmp_path) == []
+
+
+def test_material_gate_binds_master_continuous_alpha(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    master = record["stages"]["material_validation"]["data"]["auxiliary_contract"][
+        "master_lettering"
+    ][0]
+
+    master["selected_lettering_sha256"] = "d" * 64
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("승인된 selected_lettering/lettering_mask와 달라요" in error for error in errors)
+
+
+def test_material_gate_reports_malformed_master_artifact_without_crashing(
+    tmp_path: Path,
+) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    region = record["stages"]["edit_plan"]["data"]["compositor"]["regions"][0]
+    region["selected_lettering"] = "not-an-artifact"
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("selected_lettering: 파일 명세가 없어요" in error for error in errors)
+    assert any("승인된 selected_lettering/lettering_mask와 달라요" in error for error in errors)
+
+
+def test_master_lettering_handles_malformed_stage_containers() -> None:
+    assert review_record._master_lettering({"edit_plan": None}) == {}
+    assert review_record._master_lettering({"edit_plan": {"data": []}}) == {}
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [None, {"status": "pass", "evidence": [], "data": []}],
+)
+def test_material_validation_handles_malformed_edit_plan_stage(
+    tmp_path: Path,
+    malformed: object,
+) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    record["stages"]["edit_plan"] = malformed
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert errors
+
+
+def test_material_gate_binds_map_identity_to_material_slot(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _, _, contract_map = _complete_material(tmp_path, record)
+    contract_map["identity"]["uv_offset"] = [0.25, 0.0]
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("identity.uv_offset: binding과 달라요" in error for error in errors)
+
+
+def test_material_gate_rejects_color_channels_for_packed_normal(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _, _, contract_map = _complete_material(tmp_path, record)
+    contract_map["identity"]["role"] = "normal"
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("Normal은 DXT5nm의 G/A 채널만 사용해야 해요" in error for error in errors)
+
+
+def test_material_gate_rejects_unimplemented_effect_derivation(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    data = record["stages"]["material_validation"]["data"]
+    data["policies"]["item::_SpecMap"] = "neutralize_and_derive"
+    data["auxiliary_contract"]["maps"]["item::_SpecMap"]["policy"] = (
+        "neutralize_and_derive"
+    )
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("지원하지 않는 정책이에요" in error for error in errors)
+
+
+def test_material_source_map_is_hash_pinned(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _, source_map, _ = _complete_material(tmp_path, record)
+
+    source_map.write_bytes(b"changed-source")
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("source_map: 현재 파일 SHA가 기록과 달라요" in error for error in errors)
+
+
+def test_material_base_cache_fingerprint_covers_neutralization_recipe(
+    tmp_path: Path,
+) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _, _, contract_map = _complete_material(tmp_path, record)
+
+    contract_map["neutralization_signature"] = "patch-copy:v2"
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("base_cache_fingerprint: 현재 입력 계약과 달라요" in error for error in errors)

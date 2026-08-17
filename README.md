@@ -76,8 +76,9 @@ work\.venv\Scripts\python.exe localize.py candidate-check mayo
 work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 ```
 
-7. 모든 품목의 실제 D/N/G·밉·압축·번들·게임 렌더 기록까지 통과하면
-   `2_적용.bat`이 해시 고정 release를 만들어요.
+7. Normal·Gloss는 원본 맵을 불변 base로 두고, 평면 인쇄는 보존하며 실제 외국어 재질 효과만
+   맵 전용 마스크 안에서 제거해요. map identity·UV ST·source SHA와 승인 글자 SHA를 고정한 뒤
+   모든 D/N/G·밉·압축·번들·게임 렌더 기록까지 통과하면 `2_적용.bat`이 release를 만들어요.
 8. `3_배포.bat`은 그 release만 기존 설치 백업 후 배포해요.
 
 실제 세부 필드와 중단 조건은
@@ -87,6 +88,8 @@ work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 ## 중요한 제한
 
 - 전체 이미지를 재생성하거나 크기를 맞추기 위해 리사이즈하지 않아요.
+- Normal·Gloss 전체를 이미지 생성하거나 맵마다 글자 위치를 다시 추측하지 않아요. 새 한글
+  재질 효과는 결정적 producer가 구현되기 전까지 추가하지 않아요.
 - 예전 `work/2_edited`, 루트 `bundles/`, `tools/auto.py build/deploy` 결과는 새 release로
   간주하지 않아요.
 - OCR 무검출은 “문자가 없음”의 증거가 아니며, OCR 결과만으로 승인하지 않아요.

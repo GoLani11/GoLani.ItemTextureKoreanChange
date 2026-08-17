@@ -7,12 +7,15 @@ from PIL import Image
 from golani_texture_localizer.materials import (
     _all_consumers,
     _auxiliary_slots,
+    _binding_signature,
     _material_mask_descriptor,
     _neutralize_map,
     _packed_normal_lighting,
     _register_auxiliary_plan,
     _slot_consumers,
+    _verify_auxiliary_contract_entry,
 )
+from golani_texture_localizer.review import sha256_file
 
 
 def test_packed_normal_lighting_uses_alpha_and_green_channels() -> None:
@@ -75,6 +78,61 @@ def test_actual_material_binding_keeps_shared_ratcola_maps() -> None:
         ("normal", "tar_nrm"),
         ("gloss", "tar_gloss"),
     }
+
+
+def test_material_binding_signature_includes_uv_st() -> None:
+    bindings = [
+        {
+            "bundle_key": "items.bundle",
+            "material": "label",
+            "texture_slots": [
+                {
+                    "property": "_SpecMap",
+                    "path_id": 3,
+                    "texture": "label_G",
+                    "texture_bundle_key": "items.bundle",
+                    "scale": [1.0, 1.0],
+                    "offset": [0.0, 0.0],
+                }
+            ],
+        }
+    ]
+    original = _binding_signature(bindings)
+
+    bindings[0]["texture_slots"][0]["offset"] = [0.25, 0.0]
+
+    assert _binding_signature(bindings) != original
+
+
+def test_auxiliary_slots_reject_same_texture_with_two_material_roles() -> None:
+    bindings = [
+        {
+            "bundle_key": "items.bundle",
+            "material": "ambiguous",
+            "path_id": 10,
+            "texture_slots": [
+                {
+                    "property": "_BumpMap",
+                    "path_id": 7,
+                    "texture": "shared_map",
+                    "texture_bundle_key": "maps.bundle",
+                    "scale": [1.0, 1.0],
+                    "offset": [0.0, 0.0],
+                },
+                {
+                    "property": "_SpecMap",
+                    "path_id": 7,
+                    "texture": "shared_map",
+                    "texture_bundle_key": "maps.bundle",
+                    "scale": [1.0, 1.0],
+                    "offset": [0.0, 0.0],
+                },
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="Normal/Gloss 역할"):
+        _auxiliary_slots(bindings)
 
 
 def test_unassigned_optional_auxiliary_slots_are_ignored() -> None:
@@ -165,6 +223,65 @@ def test_auxiliary_consumer_lookup_uses_auxiliary_bundle_not_diffuse_bundle() ->
     assert [value["material"] for value in _slot_consumers(inventory, slot)] == ["shared"]
 
 
+def test_auxiliary_contract_is_bound_to_source_identity_and_uv_st(tmp_path) -> None:
+    source = tmp_path / "normal.png"
+    source.write_bytes(b"packed-normal")
+    slot = {
+        "texture_bundle_key": "maps.bundle",
+        "path_id": 7,
+        "texture": "item_N",
+        "role": "normal",
+        "scale": [1.0, 1.0],
+        "offset": [0.0, 0.0],
+    }
+    record = {
+        "bundle_key": "maps.bundle",
+        "path_id": 7,
+        "texture": "item_N",
+        "width": 512,
+        "height": 512,
+        "format": 12,
+    }
+    entry = {
+        "identity": {
+            "texture_bundle_key": "maps.bundle",
+            "path_id": 7,
+            "texture": "item_N",
+            "role": "normal",
+            "width": 512,
+            "height": 512,
+            "format": 12,
+            "uv_scale": [1.0, 1.0],
+            "uv_offset": [0.0, 0.0],
+        },
+        "source_map": {"path": "normal.png", "sha256": sha256_file(source)},
+        "whole_map_generated": False,
+    }
+
+    _verify_auxiliary_contract_entry(entry, slot, record, source, None, tmp_path)
+
+    entry["identity"]["uv_offset"] = [0.25, 0.0]
+    with pytest.raises(ValueError, match="identity나 UV ST"):
+        _verify_auxiliary_contract_entry(entry, slot, record, source, None, tmp_path)
+
+    entry["identity"]["uv_offset"] = [0.0, 0.0]
+    entry["channel_contract"] = {
+        "packing": "dxt5nm-x-a-y-g",
+        "used_channels": ["G", "A"],
+    }
+    entry["neutralization_signature"] = "opencv-telea:v1:radius=1"
+    material_mask = {"method": "patch"}
+    with pytest.raises(ValueError, match="중립화 알고리즘 계약"):
+        _verify_auxiliary_contract_entry(
+            entry,
+            slot,
+            record,
+            source,
+            material_mask,
+            tmp_path,
+        )
+
+
 def test_shared_auxiliary_map_rejects_different_target_masks() -> None:
     plans = {}
     slot = {"texture_bundle_key": "maps.bundle", "path_id": 9, "role": "normal"}
@@ -183,6 +300,29 @@ def test_shared_auxiliary_map_rejects_different_target_masks() -> None:
             target_id="tarcola",
             policy="neutralize_old_text",
             old_text_mask_sha256="b" * 64,
+        )
+
+
+def test_shared_auxiliary_map_rejects_different_channel_contracts() -> None:
+    plans = {}
+    slot = {"texture_bundle_key": "maps.bundle", "path_id": 9, "role": "gloss"}
+
+    _register_auxiliary_plan(
+        plans,
+        slot,
+        target_id="first",
+        policy="neutralize_old_text",
+        old_text_mask_sha256="a" * 64,
+        operation_signature="channels=R",
+    )
+    with pytest.raises(ValueError, match="정책/마스크가 target마다 달라요"):
+        _register_auxiliary_plan(
+            plans,
+            slot,
+            target_id="second",
+            policy="neutralize_old_text",
+            old_text_mask_sha256="a" * 64,
+            operation_signature="channels=RGB",
         )
 
 
@@ -254,4 +394,29 @@ def test_neutralize_map_applies_patch_only_inside_mask(tmp_path) -> None:
     assert np.all(values[mask] == 200)
     assert np.array_equal(values[~mask], source[~mask])
     assert metrics["changed_outside_mask"] == 0
+    assert metrics["changed_unselected_channels"] == 0
     assert metrics["method"] == "patch"
+
+
+def test_neutralize_map_changes_only_verified_gloss_channels(tmp_path) -> None:
+    source = np.full((4, 4, 4), 100, dtype=np.uint8)
+    source[..., 3] = 255
+    source_path = tmp_path / "source.png"
+    Image.fromarray(source, "RGBA").save(source_path)
+    patch = np.full((4, 4, 4), 200, dtype=np.uint8)
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1:3, 1:3] = True
+
+    result, metrics = _neutralize_map(
+        source_path,
+        mask,
+        "gloss",
+        patch=patch,
+        channels=(0,),
+    )
+    values = np.asarray(result)
+
+    assert np.all(values[mask, 0] == 200)
+    assert np.array_equal(values[..., 1:], source[..., 1:])
+    assert metrics["selected_channels"] == ["R"]
+    assert metrics["changed_unselected_channels"] == 0

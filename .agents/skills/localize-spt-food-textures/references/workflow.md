@@ -121,11 +121,15 @@ seam guard 변경 0을 요구한다. OCR 통과만으로 시각 품질을 통과
 
 ## 8. D/N/G 정렬
 
-실제 Material graph에 연결된 맵을 대상으로 한다. 평면 인쇄는 normal/gloss 원본을 보존한다.
-편집 대상의 기존 외국어 relief나 광택이 있을 때만 각 보조맵의 재질 전용 `old_text` 마스크
-안에서 중립화하고, 새 한글 효과가 필요하면 diffuse와 같은 `new_text` 좌표·회전을 사용한다.
-보호 미세 인쇄의 relief와 광택은 원본 그대로 둔다.
-공유 맵 소비자가 충돌하면 자동 파생하지 않는다.
+[auxiliary-maps.md](auxiliary-maps.md)를 따른다. 실제 Material graph에 연결된 원본 맵을 불변
+base로 사용하고 보조맵 전체를 이미지 생성하지 않는다. 평면 인쇄는 normal/gloss payload를
+보존한다. 기존 외국어 relief나 광택이 있을 때만 맵별 old-effect 안에서 중립화한다.
+
+새 한글 효과는 승인된 `selected_lettering` 연속 알파를 유일한 master geometry로 삼아 Mesh
+UV에서 target 보조맵 해상도로 다시 래스터화하고 절차적으로 만든다. binary `new_text` resize,
+보조맵별 OCR·독립 생성과 색 이미지식 합성을 금지한다. 보호 미세 인쇄 효과는 원본 그대로
+두고 공유 맵 소비자가 충돌하면 자동 파생하지 않는다. 현재 `derive`가 지원하지 않는
+`neutralize_and_derive`는 구현된 producer와 manifest 검증이 생길 때까지 `block`한다.
 
 ## 9. 밉·압축·번들 검증
 

@@ -19,6 +19,8 @@ description: Safely analyze, translate, generate, review, validate, and package 
 - 번역 전 [translation-rules.md](references/translation-rules.md)를 읽어라.
 - 이미지 생성 전 [ai-lettering.md](references/ai-lettering.md)를 끝까지 읽어라.
 - 이미지 승인·보조맵·번들 작업 전 [quality-gates.md](references/quality-gates.md)를 읽어라.
+- Normal·Gloss를 판정하거나 수정하기 전
+  [auxiliary-maps.md](references/auxiliary-maps.md)를 끝까지 읽어라.
 
 ## 실행 원칙
 
@@ -96,9 +98,12 @@ description: Safely analyze, translate, generate, review, validate, and package 
 <python> localize.py stage <target-id> <candidate.png>
 ```
 
-13. 파일명 추정이 아니라 실제 Material의 Texture PPtr를 따라 D/N/G를 매핑하라. 평면 인쇄면
-    N/G를 보존하고 기존 외국어 요철·광택이 있을 때만 재질 전용 `old_text` 마스크 안에서
-    제거하라. Diffuse의 넓은 복원 마스크를 Normal·Gloss에 자동 재사용하지 마라.
+13. 파일명 추정이 아니라 실제 Material의 Texture PPtr를 따라 D/N/G를 매핑하라. 보조맵
+    전체를 이미지 생성하지 말고 원본을 불변 base로 사용하라. 평면 인쇄면 N/G를 byte 보존하고,
+    기존 외국어 요철·광택이 있을 때만 재질 전용 old-effect 마스크 안에서 제거하라. 새 효과가
+    필요하면 승인된 `selected_lettering`의 연속 알파 하나를 Mesh UV·texel-center 규칙으로 각
+    해상도에 재래스터화해 절차 파생하라. Diffuse의 넓은 복원 마스크나 binary `new_text` resize를
+    Normal·Gloss에 사용하지 마라. 현재 producer가 지원하지 않는 파생 정책은 `block`하라.
 14. 공유 보조맵의 모든 소비자를 확정하지 못했거나 서로 다른 디자인이 하나의 맵을 요구하면
     자동 파생하지 마라.
 15. 재질 게이트 통과 후에만 임시 번들을 만들고, 모든 밉·압축 왕복·실제 렌더를 검사한 뒤
@@ -115,6 +120,9 @@ description: Safely analyze, translate, generate, review, validate, and package 
 - 글꼴 인상·스타일·실루엣·크기·점유율·기준선·정렬·방향·효과 중 하나라도 허용 오차를
   벗어나거나 원문 로고 실루엣이 남았다.
 - 결과 OCR과 최종 Codex 시각 비교 중 하나라도 누락되거나 현재 후보 SHA와 묶이지 않았다.
+- N/G 전체 생성, 보조맵별 독립 글자 검출·생성 또는 binary 글자 마스크 resize 이력이 있다.
+- 보조맵 원본 base, master lettering SHA, UV/ST·texel-center 변환, 실제 channel semantics 또는
+  effect 마스크 밖 불변성을 증명하지 못했다.
 - D/N/G 실제 연결·공유 소비자·좌표 정렬, 필수 밉·압축·번들·실제 렌더를 증명하지 못했다.
 - 현재 코드가 필수 게이트를 구현하지 않았다. 약한 검사를 대신 통과로 간주하지 마라.
 

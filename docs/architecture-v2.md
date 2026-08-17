@@ -40,8 +40,10 @@ mod/                                 향후 C# 게임 적용 코드를 이관할
    폰트 조판은 최종물로 사용하지 않는다.
 6. 생성 후 검증: 결과 OCR과 별도 Codex 시각 비교로 누락·오자·중복·잔상, typography lock과
    비문자 구조 보존을 확인한다.
-7. 보조맵 생성: 실제 Material 연결을 따라 D/N/G를 정렬하고, 맵별 재질 전용 마스크와 공유
-   소비자 정책이 모두 고정된 경우에만 외국어 효과를 제거한다.
+7. 보조맵 처리: 실제 Material 연결을 따라 원본 N/G identity·UV ST·공유 소비자를 고정한다.
+   평면 인쇄는 byte 보존하고, 외국어 효과만 맵별 old-effect 안에서 제거한다. 보조맵 전체를
+   생성하거나 binary 글자 마스크를 resize하지 않는다. 새 효과 producer가 구현되면 승인된
+   `selected_lettering` 연속 알파 하나에서 UV 기준으로 절차 파생한다.
 8. 밉·재패킹: 맵 역할별 밉과 원본 포맷을 유지해 동일 크기 payload만 교체한다.
 9. 검증: 모든 밉, 압축 왕복, 번들 레이아웃과 실제 조명 렌더를 확인한다.
 10. 설치: 모든 해시 고정 게이트 통과 후 별도 사용자 승인과 백업을 거쳐 적용한다.
@@ -66,7 +68,9 @@ mod/                                 향후 C# 게임 적용 코드를 이관할
 - 원본·판독·번역·마스크·후보·보조맵·밉·렌더·번들의 해시와 백업 기록이 있다.
 
 `stage`는 작업 기록·마스크 SHA와 후보 SHA를 다시 계산하고 마스크 밖 변경을 실측한다.
-`derive`는 actual Material graph와 기록이 같을 때만 명시된 보조맵 영역을 처리한다. `repack`은
+`derive`는 actual Material graph, map identity·UV ST, source SHA와 source-base 계약이 기록과
+같을 때만 명시된 보조맵 영역을 처리한다. 현재는 `preserve`와 `neutralize_old_text`만 지원하며
+새 한글 요철·광택 파생은 producer와 산출물 실측 게이트가 구현될 때까지 차단한다. `repack`은
 승인·derived SHA가 오래되었거나 어떤 품목이라도 실패하면 중단한다. 전역 edge F1과 전체 평균
 MAE는 참고 지표일 뿐 위 조건을 대신하지 않으며, 실제 렌더 기록까지 있는 작업 기록만
 `release`로 승격한다.
