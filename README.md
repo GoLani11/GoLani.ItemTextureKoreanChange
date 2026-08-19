@@ -101,3 +101,10 @@ work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 - 원본보다 큰 4096 업스케일은 실제 디테일을 늘리지 않고 흐림·메모리 사용을 키워 사용하지 않아요.
 
 소스 코드는 출처와 주소를 남기면 자유롭게 활용할 수 있어요.
+
+## Krita + Codex 선택 영역 AI 편집
+
+Krita에서 영역을 선택하고 한국어로 지시하면 Codex CLI의 기본 `$imagegen` 결과를 원래
+마스크로 잘라 새 미리보기 레이어에 넣는 도구를 함께 제공해요. 설치·안전 제한과 SPT 후보
+게이트가 연결되기 전의 사용 금지는 [Krita Codex 선택 영역 편집](docs/krita-codex-image-edit.md)에
+있어요.

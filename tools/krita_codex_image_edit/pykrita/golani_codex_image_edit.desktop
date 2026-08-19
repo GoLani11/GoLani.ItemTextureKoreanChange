@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=golani_codex_image_edit
+X-Python-2-Compatible=false
+Name=Codex Selection AI Edit
+Name[ko]=Codex 선택 영역 AI 편집
+Comment=Edit a Krita selection with the built-in Codex imagegen skill
+Comment[ko]=Codex 기본 imagegen 스킬로 Krita 선택 영역을 비파괴 편집해요
