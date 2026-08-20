@@ -209,6 +209,86 @@ def validate_projection_invariants(
         )
 
 
+def validate_spt_mask_contract(
+    old_text: bytes,
+    new_text: bytes,
+    editable: bytes,
+    protected: bytes,
+    seam_guard: bytes,
+    width: int,
+    height: int,
+) -> None:
+    pixel_count = width * height
+    masks = (old_text, new_text, editable, protected, seam_guard)
+    if width < 1 or height < 1 or any(len(mask) != pixel_count for mask in masks):
+        raise ValueError("SPT 마스크 픽셀 길이가 원본 크기와 달라요")
+    if not any(editable):
+        raise ValueError("SPT editable 마스크가 비어 있어요")
+    old_outside = new_outside = editable_protected = seam_unprotected = 0
+    for index in range(pixel_count):
+        if old_text[index] and not editable[index]:
+            old_outside += 1
+        if new_text[index] and not editable[index]:
+            new_outside += 1
+        if editable[index] and protected[index]:
+            editable_protected += 1
+        if seam_guard[index] and not protected[index]:
+            seam_unprotected += 1
+    if old_outside or new_outside or editable_protected or seam_unprotected:
+        raise ValueError(
+            "SPT 마스크 포함 관계가 올바르지 않아요: "
+            f"old_text 밖 {old_outside}px, new_text 밖 {new_outside}px, "
+            f"editable/protected 겹침 {editable_protected}px, "
+            f"보호되지 않은 seam {seam_unprotected}px"
+        )
+
+
+def spt_panel_mask(
+    editable: bytes,
+    width: int,
+    height: int,
+    region_bboxes: list[tuple[int, int, int, int]],
+    padding: int,
+) -> bytes:
+    if len(editable) != width * height:
+        raise ValueError("SPT editable 마스크 픽셀 길이가 원본 크기와 달라요")
+    if not region_bboxes:
+        raise ValueError("SPT 라벨 면에 번역 영역이 없어요")
+    if padding < 0:
+        raise ValueError("SPT 라벨 면 마스크 여백은 0 이상이어야 해요")
+    x0 = max(0, min(box[0] for box in region_bboxes) - padding)
+    y0 = max(0, min(box[1] for box in region_bboxes) - padding)
+    x1 = min(width, max(box[2] for box in region_bboxes) + padding)
+    y1 = min(height, max(box[3] for box in region_bboxes) + padding)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("SPT 라벨 면 bbox가 원본 밖에 있어요")
+    result = bytearray(width * height)
+    for y in range(y0, y1):
+        row_start = y * width + x0
+        row_end = y * width + x1
+        result[row_start:row_end] = editable[row_start:row_end]
+    if not any(result):
+        raise ValueError("이 라벨 면 bbox와 겹치는 editable 픽셀이 없어요")
+    return bytes(result)
+
+
+def ensure_selection_is_spt_subset(selection: bytes, allowed: bytes) -> bool:
+    if len(selection) != len(allowed) or not selection:
+        raise ValueError("현재 선택과 SPT 허용 마스크 크기가 달라요")
+    if not any(selection):
+        raise ValueError("현재 SPT 선택 영역이 비어 있어요")
+    reduced = False
+    for selectedness, allowedness in zip(selection, allowed):
+        if selectedness > allowedness:
+            raise ValueError(
+                "현재 선택이 검증된 SPT editable 라벨 면 밖으로 넓어졌어요. "
+                "선택을 줄이는 것만 허용돼요"
+            )
+        if selectedness != allowedness:
+            reduced = True
+    return reduced
+
+
 def build_edit_prompt(
     instruction: str,
     width: int,

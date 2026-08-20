@@ -17,11 +17,14 @@ from golani_codex_image_edit.core import (  # noqa: E402
     CropRect,
     build_edit_prompt,
     context_crop,
+    ensure_selection_is_spt_subset,
     ensure_selected_pixels_are_opaque,
     find_spt_project_root,
     is_supported_srgb_profile,
     masked_bgra_layer,
     safe_stem,
+    spt_panel_mask,
+    validate_spt_mask_contract,
     validate_projection_invariants,
 )
 
@@ -158,6 +161,40 @@ def test_spt_repository_workspace_or_document_is_detected(tmp_path: Path) -> Non
     assert find_spt_project_root(tmp_path / "generic", "") is None
 
 
+def test_spt_mask_contract_and_panel_subset_are_fail_closed() -> None:
+    editable = bytes([0, 255, 0, 0, 255, 0, 0, 0, 0])
+    protected = bytes([255, 0, 255, 255, 0, 255, 255, 255, 255])
+    seam = bytes([255, 0, 0, 0, 0, 0, 0, 0, 0])
+    old_text = bytes([0, 255, 0, 0, 0, 0, 0, 0, 0])
+    new_text = bytes([0, 0, 0, 0, 255, 0, 0, 0, 0])
+
+    validate_spt_mask_contract(
+        old_text,
+        new_text,
+        editable,
+        protected,
+        seam,
+        3,
+        3,
+    )
+    panel = spt_panel_mask(editable, 3, 3, [(1, 0, 2, 1)], 0)
+    assert panel == bytes([0, 255, 0, 0, 0, 0, 0, 0, 0])
+    assert ensure_selection_is_spt_subset(bytes([0, 128, 0, 0, 0, 0, 0, 0, 0]), panel)
+
+    with pytest.raises(ValueError, match="밖으로 넓어졌어요"):
+        ensure_selection_is_spt_subset(editable, panel)
+    with pytest.raises(ValueError, match="editable/protected 겹침 1px"):
+        validate_spt_mask_contract(
+            old_text,
+            new_text,
+            editable,
+            bytes([255, 255, 255, 255, 0, 255, 255, 255, 255]),
+            seam,
+            3,
+            3,
+        )
+
+
 def test_plugin_package_has_krita_import_layout(tmp_path: Path) -> None:
     module_path = ROOT / "tools/krita_codex_image_edit/package.py"
     spec = importlib.util.spec_from_file_location("krita_codex_packager", module_path)
@@ -173,5 +210,6 @@ def test_plugin_package_has_krita_import_layout(tmp_path: Path) -> None:
     assert "golani_codex_image_edit/__init__.py" in names
     assert "golani_codex_image_edit/docker.py" in names
     assert "golani_codex_image_edit/app_server.py" in names
+    assert "golani_codex_image_edit/spt.py" in names
     assert "LICENSE" in names
     assert all("__pycache__" not in name for name in names)

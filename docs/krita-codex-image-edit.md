@@ -5,7 +5,7 @@ OpenAI API 키나 별도 이미지 API 코드는 쓰지 않고, 사용자가 Cha
 Codex CLI의 기본 `$imagegen` 스킬을 사용해요. 다만 완전 오프라인 기능은 아니며 생성은
 Codex 사용량에 포함돼요.
 
-검증 기준은 Codex CLI 0.147.0과 Krita 5.2/5.3의 Qt 5.14 이상 빌드·Krita 6(Qt6)의
+검증 기준은 Codex CLI 0.148.0과 Krita 5.2/5.3의 Qt 5.14 이상 빌드·Krita 6(Qt6)의
 RGBA/U8, `sRGB-elle-V2-srgbtrc.icc` 문서예요. Qt 5.12/5.13은 색공간을 확인할
 `QColorSpace` API가 없어 지원하지 않아요.
 
@@ -82,6 +82,39 @@ Krita에서 다음 순서로 설치해요.
 6. 결과는 `[검증 전 AI 미리보기] ...` 레이어로 생겨요. 마음에 들지 않으면 Ctrl+Z 한 번으로
    지워요.
 
+## SPT 준비 작업 모드
+
+SPT 텍스처에서는 파일과 선택 영역을 직접 찾지 않아도 돼요. 도커 상단 모드를
+`SPT 준비 작업`으로 바꾸고 다음 순서를 사용해요.
+
+1. `SPT 프로젝트`에서 이 저장소 루트를 선택하고 `새로고침`을 눌러요.
+2. 품목을 고른 뒤 `SPT 원본·추천 선택 불러오기`를 눌러요.
+3. 플러그인이 공식 `review_record.py`의 analysis 게이트, profile의 bundle/Texture2D identity,
+   원본·review·5종 마스크 SHA를 다시 검사해요. 하나라도 다르면 원본을 열지 않고 이유를
+   표시해요.
+4. 통과하면 불변 원본 Diffuse를 열고 현재 라벨 면의 `editable` 픽셀만 Krita 선택으로
+   적용해요. `라벨 면` 목록을 바꾸면 같은 품목의 다음 연결 면으로 이동해요.
+5. 추천 선택은 줄여도 되지만 검증된 panel `editable` 밖으로 넓힐 수 없어요. 확장이 필요하면
+   Krita에서 우회하지 말고 분석·마스크 기록을 먼저 갱신해야 해요.
+6. 확정 한국어는 `review.json`에서 구조적으로 고정돼요. 프롬프트 칸에는 이번 시도의 추가
+   시각 보정만 적고 `선택 영역 수정`을 눌러요.
+7. 회전된 문구는 기록된 `rotation_deg`의 역각으로 임시 작업 패널만 정방향화해 생성하고,
+   생성 패치를 원본 각도로 되돌린 뒤 저장된 선택 마스크로 잘라 미리보기 레이어에 넣어요.
+   원본 또는 최종 Texture2D 전체는 회전·리사이즈하지 않아요.
+8. 원본 배율에서 결과를 보고 `초안 채택 → OCR 대기` 또는 `초안 거절`을 눌러요. 채택은
+   `decision.json`에 현재 review/source/mask/generated SHA를 묶어 기록할 뿐 후보를 승인하거나
+   stage하지 않아요.
+
+SPT 생성 기록은
+`workspace/krita-spt/<target-id>/<panel-id>/<request-id>/`에 저장돼요. 연결 면당 현재 review에
+기록된 시도와 플러그인 시도를 합쳐 기본 2회까지만 허용해요. 두 번째도 부적합하거나 이미
+예산을 쓴 품목은 자동 반복하지 않으며, 추가 생성은 사용자의 명시적 요청을 review 증거로
+남긴 뒤 Codex 작업에서 열어야 해요.
+
+`초안 채택` 뒤에도 패널 OCR, 승인 문자 패치 분리, 공식 compositor, 후보 OCR, Codex 시각
+비교와 D/N/G·밉·번들 게이트가 남아요. 현재 도커는 그 다음 단계가 소비할 해시 고정
+`decision.json`까지 만들며 OCR이나 stage를 Krita 프로세스 안에서 임의로 실행하지 않아요.
+
 프롬프트 예시는 다음처럼 대상과 불변 조건을 짧게 적어요.
 
 ```text
@@ -107,7 +140,7 @@ Krita에서 다음 순서로 설치해요.
   에이전트 기능을 끄고, 턴별로 사용자 MCP 설정 전체를 `enabled: false`로 덮은 뒤 실제 노출
   도구가 0개인지 확인해요. 이벤트에서 imagegen 이외 도구 호출이나 사용자 입력 요청이 보이면
   즉시 interrupt하고 연결을 닫아요.
-- Codex 0.147.0의 실험적 권한 프로필을 요청마다 새 이름으로 만들어 사용자 설정과 병합되지
+- Codex 0.148.0의 실험적 권한 프로필을 요청마다 새 이름으로 만들어 사용자 설정과 병합되지
   않게 해요. 프로필에는 filesystem root 거부, 플랫폼 최소 경로와 해당 요청의 `source.png`,
   `mask.png` 읽기만 요청해요. App Server가 그 요청 전용 프로필을 실제로 활성화했다고
   응답하지 않으면 생성 전에 차단해요. Linux/WSL의 지원 sandbox에서는 이 경로 범위를
@@ -121,7 +154,7 @@ Krita에서 다음 순서로 설치해요.
   사용자 홈·작업 폴더 전체 읽기 ACL을 추가하지 않게 해요. 취소하거나 준비에 실패하면 넓은
   파일 권한으로 대체하지 않고 fail-closed로 중단해요.
 - Native Windows의 sandbox 계정과 ACL은 다른 Codex 세션과 공유되고 지속될 수 있어요.
-  Codex 0.147.0에서 filesystem root 거부는 과거에 추가된 넓은 읽기 allow ACL을 상쇄하지
+  Codex 0.148.0에서 filesystem root 거부는 과거에 추가된 넓은 읽기 allow ACL을 상쇄하지
   않으므로, 활성 권한 프로필만으로 “두 파일 외에는 OS 수준에서 절대 읽을 수 없다”고 보장할
   수 없어요. 민감한 파일에 강한 격리가 필요하면 Codex 전용 VM·Windows Sandbox·별도 머신을
   사용해야 해요. 별도 Windows 사용자 계정만으로는 고정 sandbox 그룹/계정이 공유돼 충분하지
@@ -133,14 +166,10 @@ Krita에서 다음 순서로 설치해요.
 
 ## SPT 텍스처에서의 위치
 
-현재 MVP는 일반 이미지 편집기이며 **SPT 자산 생성에는 사용할 수 없어요**. 작업 폴더나 열린
-문서가 이 저장소 아래에 있으면 생성 전에 fail-closed로 차단해요. 단순 선택만으로는 profile의
-`exact_text`, analysis 통과, 5종 마스크와 SHA, 임의 각도 deskew/역변환, 연결 면별 2회 생성
-예산을 증명할 수 없기 때문이에요.
-
-향후 SPT 모드를 연결할 때는 이 레이어를 곧바로 후보로 쓰는 방식이 아니라, 분석 게이트를
-통과한 `generated_panel` 작업에만 호출하고 채택 패널 OCR·승인 문자 패치·공식 compositor·
-후보 OCR·별도 시각 비교를 그대로 거쳐야 해요.
+일반 모드는 저장소 아래 SPT 문서를 계속 fail-closed로 차단해요. SPT 문서는 위 전용 모드에서
+공식 analysis 검사와 5종 마스크 계약을 통과했을 때만 생성할 수 있어요. 결과 레이어는
+`generated_panel`의 원본 배율 시각 검토용이며 곧바로 후보나 승인본으로 사용할 수 없어요.
+채택 패널 OCR·승인 문자 패치·공식 compositor·후보 OCR·별도 시각 비교를 그대로 거쳐야 해요.
 
 상세 게이트는 [저장소 전용 스킬](../.agents/skills/localize-spt-food-textures/SKILL.md)과
 [비전 패널 합성 계약](vision-panel-compositor.md)을 따라요.
