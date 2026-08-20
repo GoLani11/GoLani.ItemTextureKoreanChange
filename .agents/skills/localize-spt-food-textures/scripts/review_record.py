@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -68,10 +69,14 @@ TYPOGRAPHY_BOOLEAN_CHECKS = (
     "effects_matched",
     "surface_matched",
 )
-MATERIAL_POLICIES = {"preserve", "neutralize_old_text"}
+MATERIAL_POLICIES = {"preserve", "neutralize_old_text", "neutralize_and_derive"}
 MATERIAL_ROLES = {"normal", "gloss"}
+MATERIAL_DIFFUSE_PROPERTIES = {"_MainTex", "_BaseMap", "_BaseColorMap"}
 MATERIAL_NORMAL_PROPERTIES = {"_BumpMap", "_NormalMap"}
 MATERIAL_GLOSS_PROPERTIES = {"_SpecMap", "_GlossMap", "_MetallicGlossMap"}
+MATERIAL_PROJECTION_SIGNATURE = "continuous-alpha-same-st-integer-area:v1"
+MATERIAL_NORMAL_SIGNATURE = "dxt5nm-rnm-height-from-master-alpha:v1"
+MATERIAL_GLOSS_SIGNATURE = "linear-gloss-delta-from-master-alpha:v1"
 
 
 def _project_root(start: Path) -> Path:
@@ -674,6 +679,7 @@ def _numeric_pair(value: Any) -> bool:
         and len(value) == 2
         and all(
             isinstance(item, (int, float)) and not isinstance(item, bool)
+            and math.isfinite(float(item))
             for item in value
         )
     )
@@ -724,6 +730,51 @@ def _neutralized_base_fingerprint(
     return hashlib.sha256(packed.encode("utf-8")).hexdigest()
 
 
+def _validate_effect_measurement(
+    descriptor: Any,
+    location: str,
+    project_root: Path | None,
+    *,
+    role: Any,
+    parameters: Any,
+    contract_map: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    if project_root is None or not isinstance(descriptor, dict) or not isinstance(
+        parameters, dict
+    ):
+        return errors
+    path, path_errors = _project_file(project_root, descriptor.get("path"), f"{location}.path")
+    if path_errors or path is None or not path.is_file():
+        return errors
+    try:
+        measurement = _read_json(path)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return [f"{location}: UTF-8 JSON이어야 해요"]
+    source_map = contract_map.get("source_map")
+    expected = {
+        "schema_version": 1,
+        "role": role,
+        "method": (
+            "controlled-lighting-fit" if role == "normal" else "source-effect-sampling"
+        ),
+        "source_map_sha256": (
+            source_map.get("sha256") if isinstance(source_map, dict) else None
+        ),
+        "source_effect_mask_sha256": contract_map.get("source_effect_mask_sha256"),
+        "measured_parameters": parameters,
+    }
+    if not isinstance(measurement, dict) or any(
+        measurement.get(field) != value for field, value in expected.items()
+    ):
+        errors.append(f"{location}: source/effect_parameters 계약과 내용이 달라요")
+        return errors
+    sample_count = measurement.get("sample_count")
+    if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 1:
+        errors.append(f"{location}.sample_count: 1 이상이어야 해요")
+    return errors
+
+
 def _validate_material_metrics(
     data: Any,
     stages: dict[str, Any],
@@ -745,6 +796,7 @@ def _validate_material_metrics(
                 continue
             for field in (
                 "material_bundle_key",
+                "material_assets_file",
                 "material",
                 "property",
                 "texture_bundle_key",
@@ -755,6 +807,15 @@ def _validate_material_metrics(
             path_id = binding.get("path_id")
             if not isinstance(path_id, int) or isinstance(path_id, bool) or path_id == 0:
                 errors.append(f"{location}.path_id: 0이 아닌 정수여야 해요")
+            material_path_id = binding.get("material_path_id")
+            if (
+                not isinstance(material_path_id, int)
+                or isinstance(material_path_id, bool)
+                or material_path_id == 0
+            ):
+                errors.append(
+                    f"{location}.material_path_id: 0이 아닌 정수여야 해요"
+                )
             for field in ("scale", "offset"):
                 if not _numeric_pair(binding.get(field)):
                     errors.append(f"{location}.{field}: 숫자 두 개 배열이어야 해요")
@@ -830,7 +891,12 @@ def _validate_material_metrics(
                     if not isinstance(consumer, dict):
                         errors.append(f"{item}: 객체가 아니에요")
                         continue
-                    for field in ("material", "material_bundle_key", "property"):
+                    for field in (
+                        "material",
+                        "material_bundle_key",
+                        "material_assets_file",
+                        "property",
+                    ):
                         if not _nonempty_string(consumer.get(field)):
                             errors.append(f"{item}.{field}: 비어 있어요")
                     material_path_id = consumer.get("material_path_id")
@@ -943,10 +1009,9 @@ def _validate_material_metrics(
                 and binding.get("material") == material_name
                 and binding.get("property") == property_name
             ] if isinstance(bindings, list) and separator else []
-            if len(matching_bindings) != 1:
-                errors.append(f"{location}: 같은 material/property binding이 정확히 하나여야 해요")
+            if not matching_bindings:
+                errors.append(f"{location}: 같은 material/property binding이 없어요")
             else:
-                binding = matching_bindings[0]
                 expected_role = (
                     "normal"
                     if property_name in MATERIAL_NORMAL_PROPERTIES
@@ -954,17 +1019,20 @@ def _validate_material_metrics(
                     if property_name in MATERIAL_GLOSS_PROPERTIES
                     else None
                 )
-                comparisons = {
-                    "texture_bundle_key": binding.get("texture_bundle_key"),
-                    "path_id": binding.get("path_id"),
-                    "texture": binding.get("texture"),
-                    "role": expected_role,
-                    "uv_scale": binding.get("scale"),
-                    "uv_offset": binding.get("offset"),
-                }
-                for field, expected_value in comparisons.items():
-                    if identity.get(field) != expected_value:
-                        errors.append(f"{identity_location}.{field}: binding과 달라요")
+                for binding in matching_bindings:
+                    comparisons = {
+                        "texture_bundle_key": binding.get("texture_bundle_key"),
+                        "path_id": binding.get("path_id"),
+                        "texture": binding.get("texture"),
+                        "role": expected_role,
+                        "uv_scale": binding.get("scale"),
+                        "uv_offset": binding.get("offset"),
+                    }
+                    for field, expected_value in comparisons.items():
+                        if identity.get(field) != expected_value:
+                            errors.append(
+                                f"{identity_location}.{field}: binding과 달라요"
+                            )
         errors.extend(
             _validate_artifact(item.get("source_map"), f"{location}.source_map", project_root)
         )
@@ -1012,13 +1080,25 @@ def _validate_material_metrics(
                 or any(value not in {"R", "G", "B", "A"} for value in used_channels)
             ):
                 errors.append(f"{channel_location}.used_channels: 고유한 RGBA 채널 배열이어야 해요")
-            if isinstance(identity, dict) and identity.get("role") == "normal" and (
-                channel.get("packing") != "dxt5nm-x-a-y-g"
-                or used_channels != ["G", "A"]
-            ):
-                errors.append(
-                    f"{channel_location}: Normal은 DXT5nm의 G/A 채널만 사용해야 해요"
-                )
+            if isinstance(identity, dict) and identity.get("role") == "normal":
+                if (
+                    identity.get("format") != 12
+                    or channel.get("packing") != "dxt5nm-x-a-y-g"
+                    or used_channels != ["G", "A"]
+                ):
+                    errors.append(
+                        f"{channel_location}: Normal은 DXT5(12) DXT5nm의 G/A만 사용해야 해요"
+                    )
+            if isinstance(identity, dict) and identity.get("role") == "gloss":
+                texture_format = identity.get("format")
+                if texture_format not in {10, 12}:
+                    errors.append(
+                        f"{channel_location}: Gloss v1은 DXT1(10)/DXT5(12)만 지원해요"
+                    )
+                elif texture_format == 10 and isinstance(used_channels, list) and "A" in used_channels:
+                    errors.append(
+                        f"{channel_location}: DXT1 Gloss는 RGB 채널만 수정해야 해요"
+                    )
             if channel.get("linear_data") is not True:
                 errors.append(f"{channel_location}.linear_data: true여야 해요")
         descriptor = material_masks.get(key) if isinstance(material_masks, dict) else None
@@ -1060,6 +1140,211 @@ def _validate_material_metrics(
             if item.get("effect_kind") != "remove-only":
                 errors.append(f"{location}.effect_kind: 'remove-only'여야 해요")
             continue
+        if policy != "neutralize_and_derive":
+            continue
+
+        role = identity.get("role") if isinstance(identity, dict) else None
+        expected_effect = (
+            "master-alpha-relief" if role == "normal" else "master-alpha-gloss"
+        )
+        expected_producer = (
+            MATERIAL_NORMAL_SIGNATURE if role == "normal" else MATERIAL_GLOSS_SIGNATURE
+        )
+        if item.get("effect_kind") != expected_effect:
+            errors.append(f"{location}.effect_kind: {expected_effect!r}여야 해요")
+        derivation = item.get("derivation")
+        derivation_location = f"{location}.derivation"
+        if not isinstance(derivation, dict):
+            errors.append(f"{derivation_location}: v1 파생 계약이 없어요")
+            continue
+        if derivation.get("schema_version") != 1:
+            errors.append(f"{derivation_location}.schema_version: 1이어야 해요")
+        if derivation.get("producer") != expected_producer:
+            errors.append(f"{derivation_location}.producer: 현재 역할 producer와 달라요")
+        if derivation.get("physical_component") != "all-selected-lettering-alpha":
+            errors.append(
+                f"{derivation_location}.physical_component: 전체 lettering alpha의 물리 효과 검증이 필요해요"
+            )
+        expected_region_ids = sorted(expected_master)
+        if derivation.get("master_region_ids") != expected_region_ids:
+            errors.append(
+                f"{derivation_location}.master_region_ids: 승인된 master 영역 전체와 달라요"
+            )
+        errors.extend(
+            _validate_artifact(
+                derivation.get("effect_measurement"),
+                f"{derivation_location}.effect_measurement",
+                project_root,
+            )
+        )
+        if derivation.get("alignment_limits") != {
+            "center_error_texels": 0.5,
+            "bbox_edge_error_texels": 1.0,
+            "rotation_error_deg": 0.0,
+        }:
+            errors.append(f"{derivation_location}.alignment_limits: 안전 허용치와 달라요")
+
+        projection = derivation.get("projection")
+        projection_location = f"{derivation_location}.projection"
+        projection_keys = {
+            "signature",
+            "source_size",
+            "target_size",
+            "diffuse_uv_scale",
+            "diffuse_uv_offset",
+            "auxiliary_uv_scale",
+            "auxiliary_uv_offset",
+            "v_axis",
+            "texel_center_sampling",
+        }
+        if not isinstance(projection, dict) or set(projection) != projection_keys:
+            errors.append(f"{projection_location}: 필수 투영 계약 필드와 정확히 일치해야 해요")
+        else:
+            if projection.get("signature") != MATERIAL_PROJECTION_SIGNATURE:
+                errors.append(f"{projection_location}.signature: 현재 producer와 달라요")
+            source_size = projection.get("source_size")
+            target_size = projection.get("target_size")
+            for field, value in (("source_size", source_size), ("target_size", target_size)):
+                if not (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and all(
+                        isinstance(part, int) and not isinstance(part, bool) and part > 0
+                        for part in value
+                    )
+                ):
+                    errors.append(f"{projection_location}.{field}: 양의 정수 [width,height]여야 해요")
+            if isinstance(identity, dict) and target_size != [
+                identity.get("width"),
+                identity.get("height"),
+            ]:
+                errors.append(f"{projection_location}.target_size: 보조맵 identity와 달라요")
+            if all(
+                isinstance(value, list)
+                and len(value) == 2
+                    and all(
+                        isinstance(part, int) and not isinstance(part, bool) and part > 0
+                        for part in value
+                    )
+                for value in (source_size, target_size)
+            ):
+                source_width, source_height = source_size
+                target_width, target_height = target_size
+                if source_width % target_width or source_height % target_height:
+                    errors.append(f"{projection_location}: source/target이 정수 축소 관계가 아니에요")
+                else:
+                    factor_x = source_width // target_width
+                    factor_y = source_height // target_height
+                    if factor_x != factor_y or factor_x < 1 or factor_x & (factor_x - 1):
+                        errors.append(f"{projection_location}: 2^n 동일 종횡비 축소가 아니에요")
+            for field in (
+                "diffuse_uv_scale",
+                "diffuse_uv_offset",
+                "auxiliary_uv_scale",
+                "auxiliary_uv_offset",
+            ):
+                if not _numeric_pair(projection.get(field)):
+                    errors.append(f"{projection_location}.{field}: 유한수 두 개 배열이어야 해요")
+            if projection.get("auxiliary_uv_scale") != (
+                identity.get("uv_scale") if isinstance(identity, dict) else None
+            ) or projection.get("auxiliary_uv_offset") != (
+                identity.get("uv_offset") if isinstance(identity, dict) else None
+            ):
+                errors.append(f"{projection_location}: auxiliary UV ST가 identity와 달라요")
+            diffuse_candidates = [
+                binding
+                for binding in bindings
+                if isinstance(binding, dict)
+                and binding.get("material") == str(key).rpartition("::")[0]
+                and binding.get("property") in MATERIAL_DIFFUSE_PROPERTIES
+            ] if isinstance(bindings, list) else []
+            diffuse_st = {
+                (
+                    tuple(binding.get("scale", [])),
+                    tuple(binding.get("offset", [])),
+                )
+                for binding in diffuse_candidates
+            }
+            if len(diffuse_candidates) < 1 or len(diffuse_st) != 1:
+                errors.append(f"{projection_location}: 같은 Material의 Diffuse UV ST가 모호해요")
+            else:
+                diffuse_binding = diffuse_candidates[0]
+                if (
+                    projection.get("diffuse_uv_scale") != diffuse_binding.get("scale")
+                    or projection.get("diffuse_uv_offset")
+                    != diffuse_binding.get("offset")
+                ):
+                    errors.append(f"{projection_location}: Diffuse UV ST가 binding과 달라요")
+            if (
+                projection.get("diffuse_uv_scale") != projection.get("auxiliary_uv_scale")
+                or projection.get("diffuse_uv_offset") != projection.get("auxiliary_uv_offset")
+            ):
+                errors.append(f"{projection_location}: v1은 Diffuse/보조맵 ST가 같아야 해요")
+            diffuse_scale = projection.get("diffuse_uv_scale")
+            if _numeric_pair(diffuse_scale) and (
+                diffuse_scale[0] <= 0 or diffuse_scale[1] <= 0
+            ):
+                errors.append(
+                    f"{projection_location}.diffuse_uv_scale: v1은 양수 scale만 지원해요"
+                )
+            if projection.get("v_axis") != "png-top-left+unity-v-up":
+                errors.append(f"{projection_location}.v_axis: 좌표계 계약이 달라요")
+            if projection.get("texel_center_sampling") is not True:
+                errors.append(f"{projection_location}.texel_center_sampling: true여야 해요")
+
+        parameters = derivation.get("effect_parameters")
+        parameter_location = f"{derivation_location}.effect_parameters"
+        if not isinstance(parameters, dict):
+            errors.append(f"{parameter_location}: 객체가 없어요")
+        elif role == "normal":
+            if set(parameters) != {"height_scale_texels", "polarity", "bevel_passes"}:
+                errors.append(f"{parameter_location}: Normal 파라미터 필드가 달라요")
+            height = parameters.get("height_scale_texels")
+            if not (
+                isinstance(height, (int, float))
+                and not isinstance(height, bool)
+                and math.isfinite(float(height))
+                and 0 < float(height) <= 8
+            ):
+                errors.append(f"{parameter_location}.height_scale_texels: 0 초과 8 이하여야 해요")
+            if parameters.get("polarity") not in {-1, 1}:
+                errors.append(f"{parameter_location}.polarity: -1 또는 1이어야 해요")
+            passes = parameters.get("bevel_passes")
+            if not isinstance(passes, int) or isinstance(passes, bool) or not 0 <= passes <= 8:
+                errors.append(f"{parameter_location}.bevel_passes: 0~8 정수여야 해요")
+        else:
+            deltas = parameters.get("channel_deltas")
+            used_channels = channel.get("used_channels") if isinstance(channel, dict) else None
+            if set(parameters) != {"channel_deltas"} or not isinstance(deltas, dict):
+                errors.append(f"{parameter_location}.channel_deltas: 객체가 없어요")
+            elif list(deltas) != used_channels:
+                errors.append(f"{parameter_location}.channel_deltas: used_channels와 달라요")
+            else:
+                numeric_deltas = [
+                    value
+                    for value in deltas.values()
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and -255 <= float(value) <= 255
+                ]
+                if len(numeric_deltas) != len(deltas) or not any(
+                    float(value) != 0 for value in numeric_deltas
+                ):
+                    errors.append(
+                        f"{parameter_location}.channel_deltas: "
+                        "-255~255의 non-zero 유한수가 필요해요"
+                    )
+        errors.extend(
+            _validate_effect_measurement(
+                derivation.get("effect_measurement"),
+                f"{derivation_location}.effect_measurement",
+                project_root,
+                role=role,
+                parameters=parameters,
+                contract_map=item,
+            )
+        )
     return errors
 
 

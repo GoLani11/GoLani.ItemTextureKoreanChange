@@ -105,6 +105,7 @@ from .spt import (
     SptPanel,
     SptPreparation,
     SptTarget,
+    build_preview_choice_record,
     build_spt_prompt,
     current_generation_attempts,
     inspect_spt_target,
@@ -194,7 +195,7 @@ class CodexSelectionEditDocker(DockWidget):
         warning = QLabel(
             "SPT 준비가 덜 된 품목도 원본과 기존 editable 참고 선택은 열 수 있어요. "
             "analysis와 현재 SHA의 5종 마스크가 모두 통과하기 전에는 생성이 잠기며, "
-            "결과는 패널 OCR 전 검증 전 미리보기예요."
+            "결과는 후속 검증 전 미리보기예요."
         )
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #c58a35;")
@@ -285,16 +286,16 @@ class CodexSelectionEditDocker(DockWidget):
         layout.addLayout(button_row)
 
         decision_row = QHBoxLayout()
-        self._spt_accept_button = QPushButton("초안 채택 → OCR 대기")
+        self._spt_accept_button = QPushButton("이 결과 선택")
         self._spt_accept_button.setEnabled(False)
         self._spt_accept_button.clicked.connect(
-            lambda: self._record_spt_decision("selected-for-panel-ocr")
+            lambda: self._record_spt_preview_choice("selected-for-validation")
         )
         decision_row.addWidget(self._spt_accept_button)
-        self._spt_reject_button = QPushButton("초안 거절")
+        self._spt_reject_button = QPushButton("결과 제외")
         self._spt_reject_button.setEnabled(False)
         self._spt_reject_button.clicked.connect(
-            lambda: self._record_spt_decision("rejected")
+            lambda: self._record_spt_preview_choice("discarded")
         )
         decision_row.addWidget(self._spt_reject_button)
         layout.addLayout(decision_row)
@@ -1033,7 +1034,7 @@ class CodexSelectionEditDocker(DockWidget):
             self._spt_reject_button.setEnabled(True)
             message = (
                 "SPT 검증 전 미리보기를 추가했어요. 원본 배율로 확인한 뒤 "
-                "초안 채택 또는 거절을 기록해 주세요. 채택은 후보 승인이 아니라 패널 OCR 대기예요."
+                "사용할 결과인지 제외할 결과인지 기록해 주세요. 선택은 아직 후보 승인이 아니에요."
                 f"\n{snapshot.job_dir}"
             )
         else:
@@ -1115,7 +1116,7 @@ class CodexSelectionEditDocker(DockWidget):
 
         if snapshot.spt is not None:
             layer_name = (
-                f"[SPT 패널 OCR 전 미리보기] {snapshot.spt['target_id']} · "
+                f"[SPT 검증 전 미리보기] {snapshot.spt['target_id']} · "
                 f"{snapshot.spt['panel_id']}"
             )
         else:
@@ -1203,7 +1204,7 @@ class CodexSelectionEditDocker(DockWidget):
 
         threading.Thread(target=run, name="krita-codex-cancel", daemon=True).start()
 
-    def _record_spt_decision(self, decision: str) -> None:
+    def _record_spt_preview_choice(self, decision: str) -> None:
         job_dir = self._last_spt_job_dir
         if job_dir is None:
             self._operation_failed("판정할 SPT 미리보기가 없어요")
@@ -1215,42 +1216,27 @@ class CodexSelectionEditDocker(DockWidget):
             generation = request.get("generation")
             if not isinstance(spt, dict) or not isinstance(generation, dict):
                 raise ValueError("SPT 생성 기록이 완전하지 않아요")
-            artifact = generation.get("artifact")
-            if not isinstance(artifact, dict) or not isinstance(artifact.get("sha256"), str):
-                raise ValueError("SPT 생성 이미지 SHA 기록이 없어요")
-            decision_record = {
-                "schema_version": 1,
-                "status": decision,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "target_id": spt.get("target_id"),
-                "panel_id": spt.get("panel_id"),
-                "review_sha256": spt.get("review_sha256"),
-                "source_sha256": spt.get("source_sha256"),
-                "mask_sha256": spt.get("mask_sha256"),
-                "generated_sha256": artifact["sha256"],
-                "request": "request.json",
-                "next_gate": (
-                    "panel-ocr-and-official-compositor"
-                    if decision == "selected-for-panel-ocr"
-                    else "none"
-                ),
-                "candidate_approved": False,
-            }
+            decision_record = build_preview_choice_record(
+                spt,
+                generation,
+                status=decision,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
             _write_json(job_dir / "decision.json", decision_record)
             _update_request(request_path, spt={**spt, "decision": decision})
         except Exception as exc:
-            self._operation_failed(f"SPT 초안 판정을 기록하지 못했어요: {exc}")
+            self._operation_failed(f"SPT 결과 선택을 기록하지 못했어요: {exc}")
             return
         self._spt_accept_button.setEnabled(False)
         self._spt_reject_button.setEnabled(False)
-        if decision == "selected-for-panel-ocr":
+        if decision == "selected-for-validation":
             self._set_status(
-                "초안을 패널 OCR 대기로 기록했어요. 아직 후보 승인이 아니며 Codex의 "
-                f"공식 합성·후보 OCR·시각 비교가 남아 있어요.\n{job_dir}"
+                "이 결과를 후속 검증 대상으로 기록했어요. 아직 후보 승인은 아니며 "
+                f"프로젝트의 공식 합성·검증 단계가 남아 있어요.\n{job_dir}"
             )
         else:
             self._set_status(
-                "초안을 거절로 기록했어요. 레이어는 비교를 위해 남겨 두었고 "
+                "이 결과를 제외 대상으로 기록했어요. 레이어는 비교를 위해 남겨 두었고 "
                 f"Ctrl+Z로 제거할 수 있어요.\n{job_dir}"
             )
 

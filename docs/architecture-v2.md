@@ -69,10 +69,17 @@ mod/                                 향후 C# 게임 적용 코드를 이관할
 
 `stage`는 작업 기록·마스크 SHA와 후보 SHA를 다시 계산하고 마스크 밖 변경을 실측한다.
 `derive`는 actual Material graph, map identity·UV ST, source SHA와 source-base 계약이 기록과
-같을 때만 명시된 보조맵 영역을 처리한다. 현재는 `preserve`와 `neutralize_old_text`만 지원하며
-새 한글 요철·광택 파생은 producer와 산출물 실측 게이트가 구현될 때까지 차단한다. `repack`은
-승인·derived SHA가 오래되었거나 어떤 품목이라도 실패하면 중단한다. 전역 edge F1과 전체 평균
-MAE는 참고 지표일 뿐 위 조건을 대신하지 않으며, 실제 렌더 기록까지 있는 작업 기록만
+같을 때만 명시된 보조맵 영역을 처리한다. `neutralize_and_derive`는 승인된
+`selected_lettering` 연속 알파 하나를 동일한 양수 UV scale·동일 offset·U/V Repeat의 보조맵으로
+2^n 정수 area 재래스터화한 뒤, Normal은 height/RNM/DXT5nm G·A로, Gloss는 검증된 선형 채널
+delta로만 절차 파생한다. 다른 UV ST·wrap·비정수 해상도·다른 Diffuse를 함께 쓰는 공유 PPtr는
+자동 차단한다. inventory schema 3은 `Windows.json`, target Diffuse와 그 Material에서
+도달한 Normal/Gloss PPtr의 전체 역의존 후보 bundle, serialized assets file까지 포함한
+Material identity와 source override의 raw Material PPtr/ST graph SHA를 고정한다. `repack`은 이 외부
+graph가 현재 파일과
+같은지 다시 확인하고, 승인·derived SHA가 오래되었거나 어떤 품목이라도 실패하면
+중단한다. 전역 edge F1과 전체 평균 MAE는 참고 지표일 뿐 위 조건을 대신하지
+않으며, 실제 렌더 기록까지 있는 작업 기록만
 `release`로 승격한다.
 
 ## 현재 범위

@@ -313,6 +313,8 @@ def _complete_material(
             "bindings": [
                 {
                     "material_bundle_key": "assets/mayo.bundle",
+                    "material_assets_file": "CAB-MAYO",
+                    "material_path_id": 17,
                     "material": "item",
                     "property": "_SpecMap",
                     "texture_bundle_key": "assets/mayo.bundle",
@@ -329,6 +331,7 @@ def _complete_material(
                     {
                         "material": "item",
                         "material_bundle_key": "assets/mayo.bundle",
+                        "material_assets_file": "CAB-MAYO",
                         "material_path_id": 17,
                         "property": "_SpecMap",
                         "scale": [1.0, 1.0],
@@ -585,6 +588,41 @@ def test_material_gate_allows_byte_preserve_without_channel_guessing(tmp_path: P
     assert review_record.validate_record(record, "material", project_root=tmp_path) == []
 
 
+def test_material_gate_groups_duplicate_material_property_only_with_same_aux_st(
+    tmp_path: Path,
+) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    data = record["stages"]["material_validation"]["data"]
+    duplicate = dict(data["bindings"][0])
+    duplicate["material_assets_file"] = "CAB-MAYO-DUPLICATE"
+    duplicate["material_path_id"] = 19
+    data["bindings"].append(duplicate)
+
+    assert review_record.validate_record(
+        record, "material", project_root=tmp_path
+    ) == []
+
+    duplicate["offset"] = [0.25, 0.0]
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+    assert any("identity.uv_offset: binding과 달라요" in error for error in errors)
+
+
+def test_material_gate_requires_serialized_material_identity(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    data = record["stages"]["material_validation"]["data"]
+    data["bindings"][0].pop("material_assets_file")
+    data["shared_consumers"]["item::_SpecMap"][0].pop("material_assets_file")
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("bindings[0].material_assets_file: 비어 있어요" in error for error in errors)
+    assert any("shared_consumers.item::_SpecMap[0].material_assets_file" in error for error in errors)
+
+
 def test_material_gate_binds_master_continuous_alpha(tmp_path: Path) -> None:
     record = _analysis_record(tmp_path)
     _complete_candidate(tmp_path, record)
@@ -656,10 +694,13 @@ def test_material_gate_rejects_color_channels_for_packed_normal(tmp_path: Path) 
 
     errors = review_record.validate_record(record, "material", project_root=tmp_path)
 
-    assert any("Normal은 DXT5nm의 G/A 채널만 사용해야 해요" in error for error in errors)
+    assert any(
+        "Normal은 DXT5(12) DXT5nm의 G/A만 사용해야 해요" in error
+        for error in errors
+    )
 
 
-def test_material_gate_rejects_unimplemented_effect_derivation(tmp_path: Path) -> None:
+def test_material_gate_rejects_effect_derivation_without_v1_contract(tmp_path: Path) -> None:
     record = _analysis_record(tmp_path)
     _complete_candidate(tmp_path, record)
     _complete_material(tmp_path, record)
@@ -671,7 +712,165 @@ def test_material_gate_rejects_unimplemented_effect_derivation(tmp_path: Path) -
 
     errors = review_record.validate_record(record, "material", project_root=tmp_path)
 
-    assert any("지원하지 않는 정책이에요" in error for error in errors)
+    assert any("v1 파생 계약이 없어요" in error for error in errors)
+
+
+def test_material_gate_accepts_hash_pinned_master_alpha_derivation(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    data = record["stages"]["material_validation"]["data"]
+    key = "item::_SpecMap"
+    contract_map = data["auxiliary_contract"]["maps"][key]
+    parameters = {"channel_deltas": {"R": 24.0, "G": 24.0, "B": 24.0}}
+    measurement = _write(
+        tmp_path / "effect-measurement.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "role": "gloss",
+                "method": "source-effect-sampling",
+                "source_map_sha256": contract_map["source_map"]["sha256"],
+                "source_effect_mask_sha256": contract_map["source_effect_mask_sha256"],
+                "measured_parameters": parameters,
+                "sample_count": 32,
+            }
+        ).encode("utf-8"),
+    )
+    region_id = data["auxiliary_contract"]["master_lettering"][0]["region_id"]
+    data["policies"][key] = "neutralize_and_derive"
+    data["bindings"].append(
+        {
+            "material_bundle_key": "assets/mayo.bundle",
+            "material_assets_file": "CAB-MAYO",
+            "material_path_id": 17,
+            "material": "item",
+            "property": "_MainTex",
+            "texture_bundle_key": "assets/mayo.bundle",
+            "path_id": 11,
+            "texture": "item_food_mayo_D",
+            "scale": [1.0, 1.0],
+            "offset": [0.0, 0.0],
+        }
+    )
+    contract_map.update(
+        {
+            "policy": "neutralize_and_derive",
+            "effect_kind": "master-alpha-gloss",
+            "derivation": {
+                "schema_version": 1,
+                "producer": "linear-gloss-delta-from-master-alpha:v1",
+                "physical_component": "all-selected-lettering-alpha",
+                "master_region_ids": [region_id],
+                "projection": {
+                    "signature": "continuous-alpha-same-st-integer-area:v1",
+                    "source_size": [64, 64],
+                    "target_size": [64, 64],
+                    "diffuse_uv_scale": [1.0, 1.0],
+                    "diffuse_uv_offset": [0.0, 0.0],
+                    "auxiliary_uv_scale": [1.0, 1.0],
+                    "auxiliary_uv_offset": [0.0, 0.0],
+                    "v_axis": "png-top-left+unity-v-up",
+                    "texel_center_sampling": True,
+                },
+                "effect_parameters": parameters,
+                "effect_measurement": {
+                    "path": measurement.relative_to(tmp_path).as_posix(),
+                    "sha256": review_record._sha256(measurement),
+                },
+                "alignment_limits": {
+                    "center_error_texels": 0.5,
+                    "bbox_edge_error_texels": 1.0,
+                    "rotation_error_deg": 0.0,
+                },
+            },
+        }
+    )
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert errors == []
+
+    contract_map["derivation"]["effect_parameters"]["channel_deltas"]["R"] = 25.0
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+    assert any("source/effect_parameters 계약과 내용이 달라요" in error for error in errors)
+
+
+def test_material_gate_rejects_different_diffuse_and_auxiliary_st(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    _complete_candidate(tmp_path, record)
+    _complete_material(tmp_path, record)
+    data = record["stages"]["material_validation"]["data"]
+    key = "item::_SpecMap"
+    contract_map = data["auxiliary_contract"]["maps"][key]
+    parameters = {"channel_deltas": {"R": 24.0, "G": 24.0, "B": 24.0}}
+    measurement = _write(
+        tmp_path / "effect-measurement.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "role": "gloss",
+                "method": "source-effect-sampling",
+                "source_map_sha256": contract_map["source_map"]["sha256"],
+                "source_effect_mask_sha256": contract_map["source_effect_mask_sha256"],
+                "measured_parameters": parameters,
+                "sample_count": 32,
+            }
+        ).encode("utf-8"),
+    )
+    region_id = data["auxiliary_contract"]["master_lettering"][0]["region_id"]
+    data["policies"][key] = "neutralize_and_derive"
+    data["bindings"].append(
+        {
+            "material_bundle_key": "assets/mayo.bundle",
+            "material_assets_file": "CAB-MAYO",
+            "material_path_id": 17,
+            "material": "item",
+            "property": "_MainTex",
+            "texture_bundle_key": "assets/mayo.bundle",
+            "path_id": 11,
+            "texture": "item_food_mayo_D",
+            "scale": [2.0, 2.0],
+            "offset": [0.0, 0.0],
+        }
+    )
+    contract_map.update(
+        {
+            "policy": "neutralize_and_derive",
+            "effect_kind": "master-alpha-gloss",
+            "derivation": {
+                "schema_version": 1,
+                "producer": "linear-gloss-delta-from-master-alpha:v1",
+                "physical_component": "all-selected-lettering-alpha",
+                "master_region_ids": [region_id],
+                "projection": {
+                    "signature": "continuous-alpha-same-st-integer-area:v1",
+                    "source_size": [64, 64],
+                    "target_size": [64, 64],
+                    "diffuse_uv_scale": [2.0, 2.0],
+                    "diffuse_uv_offset": [0.0, 0.0],
+                    "auxiliary_uv_scale": [1.0, 1.0],
+                    "auxiliary_uv_offset": [0.0, 0.0],
+                    "v_axis": "png-top-left+unity-v-up",
+                    "texel_center_sampling": True,
+                },
+                "effect_parameters": parameters,
+                "effect_measurement": {
+                    "path": measurement.relative_to(tmp_path).as_posix(),
+                    "sha256": review_record._sha256(measurement),
+                },
+                "alignment_limits": {
+                    "center_error_texels": 0.5,
+                    "bbox_edge_error_texels": 1.0,
+                    "rotation_error_deg": 0.0,
+                },
+            },
+        }
+    )
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+
+    assert any("v1은 Diffuse/보조맵 ST가 같아야 해요" in error for error in errors)
 
 
 def test_material_source_map_is_hash_pinned(tmp_path: Path) -> None:

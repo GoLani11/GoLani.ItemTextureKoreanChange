@@ -36,6 +36,18 @@ def test_normal_mip_renormalizes_dxt5nm_xy() -> None:
     assert abs(y) < 0.01
 
 
+def test_normal_mip_quantization_stays_inside_dxt5nm_unit_disk() -> None:
+    values = np.full((2, 2, 4), 128, dtype=np.uint8)
+    values[..., 1] = 218
+    values[..., 3] = 218
+
+    mip = np.asarray(_next_mip(Image.fromarray(values, "RGBA"), "normal"))
+    x = float(mip[0, 0, 3]) / 127.5 - 1.0
+    y = float(mip[0, 0, 1]) / 127.5 - 1.0
+
+    assert np.sqrt(x * x + y * y) <= 1.0
+
+
 def test_unknown_mip_role_is_blocked() -> None:
     import pytest
 

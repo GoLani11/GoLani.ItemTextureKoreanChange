@@ -145,8 +145,10 @@ base로 사용하고 보조맵 전체를 이미지 생성하지 않는다. 평�
 새 한글 효과는 승인된 `selected_lettering` 연속 알파를 유일한 master geometry로 삼아 Mesh
 UV에서 target 보조맵 해상도로 다시 래스터화하고 절차적으로 만든다. binary `new_text` resize,
 보조맵별 OCR·독립 생성과 색 이미지식 합성을 금지한다. 보호 미세 인쇄 효과는 원본 그대로
-두고 공유 맵 소비자가 충돌하면 자동 파생하지 않는다. 현재 `derive`가 지원하지 않는
-`neutralize_and_derive`는 구현된 producer와 manifest 검증이 생길 때까지 `block`한다.
+두고 공유 맵 소비자가 충돌하면 자동 파생하지 않는다. 현재 `neutralize_and_derive` v1은 같은
+Material의 Diffuse/보조맵 UV scale이 동일한 양수이고 offset도 같으며 해상도가 동일하거나
+같은 종횡비의 2^n 축소이고 양쪽 U/V wrap이 Repeat일 때만 허용한다. 다른 ST·wrap·비정수
+축소·다른 Diffuse target을 함께 쓰는 PPtr는 `block`한다.
 
 ## 9. 밉·압축·번들 검증
 

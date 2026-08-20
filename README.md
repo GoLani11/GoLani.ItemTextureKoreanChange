@@ -77,8 +77,15 @@ work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 ```
 
 7. Normal·Gloss는 원본 맵을 불변 base로 두고, 평면 인쇄는 보존하며 실제 외국어 재질 효과만
-   맵 전용 마스크 안에서 제거해요. map identity·UV ST·source SHA와 승인 글자 SHA를 고정한 뒤
-   모든 D/N/G·밉·압축·번들·게임 렌더 기록까지 통과하면 `2_적용.bat`이 release를 만들어요.
+   맵 전용 마스크 안에서 제거해요. 한글에도 같은 효과가 필요하면 승인된
+   `selected_lettering` 연속 알파 하나를 동일한 양수 UV scale·동일 offset·U/V Repeat의 보조맵
+   해상도로 재래스터화해 Normal은 height/RNM, Gloss는 검증된 선형 채널 delta로 절차
+   파생해요. 맵 identity·UV ST·source SHA와 승인 글자 SHA를 고정한 뒤 모든
+   D/N/G·밉·압축·번들·게임 렌더 기록까지 통과하면 `2_적용.bat`이 release를
+   만들어요.
+   이 기능을 처음 사용하는 기존 작업은 `1_준비.bat`을 다시 실행해 inventory schema 3의
+   `Windows.json`·Diffuse에서 도달한 모든 Normal/Gloss 역의존 bundle·raw PPtr/ST
+   증거를 새로 만들어야 해요.
 8. `3_배포.bat`은 그 release만 기존 설치 백업 후 배포해요.
 
 실제 세부 필드와 중단 조건은
@@ -89,7 +96,9 @@ work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
 
 - 전체 이미지를 재생성하거나 크기를 맞추기 위해 리사이즈하지 않아요.
 - Normal·Gloss 전체를 이미지 생성하거나 맵마다 글자 위치를 다시 추측하지 않아요. 새 한글
-  재질 효과는 결정적 producer가 구현되기 전까지 추가하지 않아요.
+  재질 효과는 동일한 양수 UV scale·동일 offset·U/V Repeat와 동일/2^n 축소를 검증한 v1 producer
+  범위에서만 추가해요. 다른 UV, 비정수 축소와 서로 다른 Diffuse가 공유하는 보조맵은 자동
+  차단해요.
 - 예전 `work/2_edited`, 루트 `bundles/`, `tools/auto.py build/deploy` 결과는 새 release로
   간주하지 않아요.
 - OCR 무검출은 “문자가 없음”의 증거가 아니며, OCR 결과만으로 승인하지 않아요.

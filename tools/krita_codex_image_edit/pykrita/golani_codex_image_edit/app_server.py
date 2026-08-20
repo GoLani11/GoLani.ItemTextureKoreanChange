@@ -18,7 +18,7 @@ from uuid import uuid4
 
 CLIENT_NAME = "golani_krita_codex_image_edit"
 CLIENT_TITLE = "GoLani Krita Codex Image Edit"
-CLIENT_VERSION = "0.2.1"
+CLIENT_VERSION = "0.3.0"
 PERMISSION_PROFILE_PREFIX = "krita-imagegen-scoped-read"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_GENERATED_PNG_BYTES = 100 * 1024 * 1024

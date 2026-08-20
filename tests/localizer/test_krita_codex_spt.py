@@ -136,6 +136,88 @@ def _project(tmp_path: Path) -> Path:
     return root
 
 
+def test_preview_choice_record_has_no_plugin_ocr_state() -> None:
+    mask_sha256 = {name: f"{index + 1:x}" * 64 for index, name in enumerate(spt.MASK_NAMES)}
+    record = spt.build_preview_choice_record(
+        {
+            "target_id": "can",
+            "panel_id": "front",
+            "review_sha256": "a" * 64,
+            "source_sha256": "b" * 64,
+            "mask_sha256": mask_sha256,
+        },
+        {"artifact": {"sha256": "d" * 64}},
+        status="selected-for-validation",
+        created_at="2026-08-20T00:00:00+00:00",
+    )
+
+    assert record["schema_version"] == 2
+    assert record["purpose"] == "human-visual-selection"
+    assert record["next_gate"] == "external-project-validation"
+    assert record["candidate_approved"] is False
+    assert "ocr" not in json.dumps(record).lower()
+    assert record["mask_sha256"] == mask_sha256
+
+
+def test_preview_choice_record_supports_discard_without_next_gate() -> None:
+    record = spt.build_preview_choice_record(
+        {
+            "target_id": "can",
+            "panel_id": "front",
+            "review_sha256": "a" * 64,
+            "source_sha256": "b" * 64,
+            "mask_sha256": {name: "c" * 64 for name in spt.MASK_NAMES},
+        },
+        {"artifact": {"sha256": "d" * 64}},
+        status="discarded",
+        created_at="2026-08-20T00:00:00+00:00",
+    )
+
+    assert record["next_gate"] == "none"
+    assert record["candidate_approved"] is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("target_id", "", "target_id"),
+        ("review_sha256", "not-a-sha", "review"),
+        ("mask_sha256", {"editable": "c" * 64}, "5종 mask"),
+    ],
+)
+def test_preview_choice_record_rejects_unpinned_identity(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    spt_data = {
+        "target_id": "can",
+        "panel_id": "front",
+        "review_sha256": "a" * 64,
+        "source_sha256": "b" * 64,
+        "mask_sha256": {name: "c" * 64 for name in spt.MASK_NAMES},
+    }
+    spt_data[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        spt.build_preview_choice_record(
+            spt_data,
+            {"artifact": {"sha256": "d" * 64}},
+            status="selected-for-validation",
+            created_at="2026-08-20T00:00:00+00:00",
+        )
+
+
+def test_preview_choice_record_rejects_legacy_ocr_status() -> None:
+    with pytest.raises(ValueError, match="지원하지 않는"):
+        spt.build_preview_choice_record(
+            {},
+            {"artifact": {"sha256": "d" * 64}},
+            status="selected-for-panel-ocr",
+            created_at="2026-08-20T00:00:00+00:00",
+        )
+
+
 def test_scan_shows_preflight_readiness(tmp_path: Path) -> None:
     root = _project(tmp_path)
     summaries = spt.scan_spt_targets(root)
@@ -183,8 +265,23 @@ def test_load_target_binds_profile_hashes_panels_and_prompt(
     prompt = spt.build_spt_prompt(target, target.panels[0], "낡은 인쇄 유지", 512, 512)
     assert prompt.startswith("$imagegen\nUse case: text-localization")
     assert '"TEST" -> "시험"' in prompt
-    assert "pre-OCR visual preview only" in prompt
+    assert "unvalidated visual preview only" in prompt
+    assert "ocr" not in prompt.lower()
     assert "num_last_images_to_include=2" in prompt
+
+
+def test_docker_selection_ui_has_no_plugin_ocr_wording() -> None:
+    source = (
+        ROOT
+        / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'QPushButton("이 결과 선택")' in source
+    assert 'QPushButton("결과 제외")' in source
+    assert '_record_spt_preview_choice("selected-for-validation")' in source
+    assert '_record_spt_preview_choice("discarded")' in source
+    assert "[SPT 검증 전 미리보기]" in source
+    assert "ocr" not in source.lower()
 
 
 def test_load_target_rejects_official_analysis_failure(

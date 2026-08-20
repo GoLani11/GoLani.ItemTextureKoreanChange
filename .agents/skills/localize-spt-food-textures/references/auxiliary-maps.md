@@ -95,10 +95,12 @@ old-effect mask SHA, method, patch SHA와 이 signature를 정렬된 compact JSO
 PPtr가 Normal과 Gloss 역할에 동시에 연결되거나 diffuse 등 다른 역할에도 연결되면 자동
 derive하지 않는다. `preserve`만은 payload를 바꾸지 않으므로 디자인·ST 충돌과 무관하게 안전하다.
 
-현재 `localize.py derive`는 `preserve`와 `neutralize_old_text`만 구현한다.
-`neutralize_and_derive`의 결정적 producer, manifest 실측값과 재패킹 검증이 구현되기 전에는
-해당 정책을 `pass`로 기록하지 말고 `block`한다. 수동 생성 Normal/Gloss로 이 제한을 우회하지
-않는다.
+현재 `localize.py derive`의 `neutralize_and_derive` v1은 같은 Material의 Diffuse/보조맵 UV
+scale이 동일한 양수이고 offset도 같으며, 보조맵이 동일 크기 또는 같은 종횡비의 2^n
+축소이고 양쪽 U/V wrap이 Repeat일 때만 처리한다. 연속 알파는 정수 block-area 평균으로 한 번
+투영하고, 경계의 Normal 미분도 Repeat로 연결한다. 다른
+ST·비정수/비등방 해상도·다른 Diffuse target을 공유하는 PPtr는 mesh triangle 충돌을 증명할
+수 없으므로 `block`한다. 수동 생성 Normal/Gloss로 이 제한을 우회하지 않는다.
 
 ## 검증 기록
 
@@ -111,12 +113,26 @@ derive하지 않는다. `preserve`만은 payload를 바꾸지 않으므로 디�
 - 맵별 bundle/path ID/texture/role/크기/포맷/UV ST, source-map 경로·SHA, policy와 공유 효과 호환 여부
 - 변경 맵의 channel semantics 확인 방식·증거 SHA, packing·사용 채널과 neutralization signature
 - old-effect mask SHA와 base-cache fingerprint
-- 미래의 새 효과 producer에는 UV transform, target size, resampling 허용치와 algorithm signature
+- `neutralize_and_derive`의 `derivation` v1: producer signature, 전체 master region ID,
+  `physical_component`, Diffuse/target 크기와 양쪽 UV ST, V축·texel-center·area projection,
+  hash-pinned 효과 측정, 역할별 파라미터와 중심 0.5/bbox 1 texel/회전 0° 허용치
 
-재질 사전 게이트는 위 입력·정책·증거를 검사한다. 현재 `derive`는 실제 출력의 마스크 밖 변경
-0, packing·정규화와 untouched-channel 변경 수를 manifest에 기록하고 `repack`이 다시 검사한다.
-미래의 새 효과 producer는 여기에 중심·bbox·회전 오차를 추가해야 한다. release는 현재 review
-SHA와 manifest·출력 SHA가 일치할 때만 진행하고 repack 보고서가 derived manifest SHA를
+`effect_measurement`는 임의 이미지나 메모가 아니라 UTF-8 JSON이어야 한다. `schema_version: 1`,
+role, source-map SHA, old-effect mask SHA, 1 이상의 `sample_count`, 그리고 계약의
+`effect_parameters`와 byte-for-byte 같은 `measured_parameters`를 기록한다. Normal은
+`method: controlled-lighting-fit`, Gloss는 `method: source-effect-sampling`만 허용한다.
+
+재질 사전 게이트는 위 입력·정책·증거를 검사한다. `derive`는 schema 3 manifest에 중립 base,
+projected master alpha와 effect mask SHA, 마스크 밖 변경 0, packing·정규화, untouched-channel
+변경 수와 영역별 중심·bbox·회전 오차를 기록하고 `repack`이 다시 검사한다. release는 현재
+review SHA와 manifest·출력 SHA가 일치할 때만 진행하고 repack 보고서가 derived manifest SHA를
 release·배포까지 고정한다. 변경하지 않은 채널은 같은 source mip 0의 no-op mip chain과
 pre-compression 값이 같아야 한다. 압축 뒤에는 effect 마스크와 교차하는 4×4 BC 블록을 별도
 허용 영역으로 보고, 그 밖의 블록과 seam guard 오차를 검사한다.
+
+inventory schema 3은 `Windows.json` SHA, target Diffuse와 그 Material에서 직접 도달한
+Normal/Gloss PPtr를 역의존하는 모든 Material 후보 bundle SHA, serialized assets file을
+포함한 Material identity와 각 source override의 raw Material PPtr/ST graph SHA를 기록한다.
+재패킹은 이를 현재 파일에서 다시 계산해 간접 공유 소비자·format·wrap·ST가
+생겼거나 override graph가 달라지면 중단한다. 한 bundle의 서로 다른 serialized
+assets file에서 Texture2D path ID가 충돌하면 오연결을 추측하지 않고 `block`한다.

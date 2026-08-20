@@ -86,8 +86,10 @@
 - 공유 보조맵 소비자를 모두 확인하고 사광 진단에서 편집 대상의 기존 외국어가 보이지 않아야
   한다. 보호 미세 인쇄 효과는 원본과 같아야 한다.
 
-현재 producer가 `neutralize_and_derive`를 구현하지 않았다면 수동 생성 맵을 대신 통과시키지
-않고 material을 `block`한다.
+`neutralize_and_derive`는 현재 v1 producer signature, hash-pinned 효과 측정, 동일한 양수 UV
+scale·동일 offset·U/V Repeat의 정수 area projection, 역할별 파라미터와 실측 manifest가 모두
+맞을 때만 통과한다. 범위 밖 작업을 수동 생성 맵으로 대신 통과시키지 않고 material을
+`block`한다.
 
 ## G6 밉·압축
 

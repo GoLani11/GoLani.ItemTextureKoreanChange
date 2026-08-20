@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import re
 from types import ModuleType
-from typing import Any
+from typing import Any, Mapping
 
 
 MASK_NAMES = ("old_text", "new_text", "editable", "protected", "seam_guard")
@@ -73,6 +73,59 @@ class SptPreparation:
     @property
     def ready(self) -> bool:
         return not self.analysis_errors and self.mask_error is None
+
+
+def build_preview_choice_record(
+    spt: Mapping[str, Any],
+    generation: Mapping[str, Any],
+    *,
+    status: str,
+    created_at: str,
+) -> dict[str, Any]:
+    def required_text(value: Any, label: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"SPT {label} 기록이 없어요")
+        return value.strip()
+
+    def required_sha256(value: Any, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None
+        ):
+            raise ValueError(f"SPT {label} SHA-256 기록이 잘못됐어요")
+        return value.lower()
+
+    if status not in {"selected-for-validation", "discarded"}:
+        raise ValueError("지원하지 않는 SPT 미리보기 선택 상태예요")
+    artifact = generation.get("artifact")
+    if not isinstance(artifact, Mapping):
+        raise ValueError("SPT 생성 이미지 SHA 기록이 없어요")
+    mask_values = spt.get("mask_sha256")
+    if not isinstance(mask_values, Mapping) or set(mask_values) != set(MASK_NAMES):
+        raise ValueError("SPT 5종 mask SHA-256 기록이 완전하지 않아요")
+    mask_sha256 = {
+        name: required_sha256(mask_values.get(name), f"{name} mask")
+        for name in MASK_NAMES
+    }
+    if not isinstance(created_at, str) or not created_at:
+        raise ValueError("SPT 미리보기 선택 시간이 없어요")
+    return {
+        "schema_version": 2,
+        "status": status,
+        "purpose": "human-visual-selection",
+        "created_at": created_at,
+        "target_id": required_text(spt.get("target_id"), "target_id"),
+        "panel_id": required_text(spt.get("panel_id"), "panel_id"),
+        "review_sha256": required_sha256(spt.get("review_sha256"), "review"),
+        "source_sha256": required_sha256(spt.get("source_sha256"), "source"),
+        "mask_sha256": mask_sha256,
+        "generated_sha256": required_sha256(artifact.get("sha256"), "generated image"),
+        "request": "request.json",
+        "next_gate": (
+            "external-project-validation" if status == "selected-for-validation" else "none"
+        ),
+        "candidate_approved": False,
+    }
 
 
 @dataclass(frozen=True)
@@ -359,7 +412,7 @@ Preserve every non-text pixel, small legal/ingredient/nutrition/address/barcode/
 Match font character, stroke, proportions, ink size, baseline, spacing, outline, shadow, layering, and print wear. Render every Korean string verbatim with no extra, missing, or duplicated characters.
 Do not draw the guide, selection tint, labels, explanations, borders, or watermarks. Do not regenerate the full texture.
 Do not use an API/SDK fallback, OPENAI_API_KEY, shell command, or local image-generation script.
-This is a pre-OCR visual preview only. Do not modify project files and do not claim candidate approval."""
+This is an unvalidated visual preview only. Do not modify project files and do not claim candidate approval."""
 
 
 def _load_profile(root: Path) -> dict[str, Any]:
