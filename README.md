@@ -83,7 +83,7 @@ work\.venv\Scripts\python.exe localize.py stage mayo 후보.png
    파생해요. 맵 identity·UV ST·source SHA와 승인 글자 SHA를 고정한 뒤 모든
    D/N/G·밉·압축·번들·게임 렌더 기록까지 통과하면 `2_적용.bat`이 release를
    만들어요.
-   이 기능을 처음 사용하는 기존 작업은 `1_준비.bat`을 다시 실행해 inventory schema 3의
+   이 기능을 처음 사용하는 기존 작업은 `1_추출.bat`을 다시 실행해 inventory schema 3의
    `Windows.json`·Diffuse에서 도달한 모든 Normal/Gloss 역의존 bundle·raw PPtr/ST
    증거를 새로 만들어야 해요.
 8. `3_배포.bat`은 그 release만 기존 설치 백업 후 배포해요.

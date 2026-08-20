@@ -15,6 +15,7 @@ from golani_texture_localizer.inventory import (
     _material_pointer_graph_evidence,
     _material_pointer_identity,
     _material_targets,
+    _portable_path_value,
     _slot,
     scan_collection,
     sha256_file,
@@ -22,6 +23,18 @@ from golani_texture_localizer.inventory import (
     verify_source_override_material_graph,
 )
 from golani_texture_localizer.paths import ProjectPaths
+
+
+def test_source_override_path_translates_between_windows_and_wsl() -> None:
+    assert _portable_path_value(
+        r"C:\Users\gomim\project\original.bundle", "posix"
+    ) == "/mnt/c/Users/gomim/project/original.bundle"
+    assert _portable_path_value(
+        "/mnt/d/SPT/original.bundle", "nt"
+    ) == "D:/SPT/original.bundle"
+    assert _portable_path_value("relative/original.bundle", "posix") == (
+        "relative/original.bundle"
+    )
 
 
 def test_source_override_survives_inventory_rescan(tmp_path: Path) -> None:

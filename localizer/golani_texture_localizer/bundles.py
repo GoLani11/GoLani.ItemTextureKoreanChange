@@ -23,6 +23,7 @@ from .images import validate_approved
 from .inventory import (
     _material_identity,
     _material_targets,
+    _resolve_portable_path,
     load_inventory,
     record_for_target,
     verify_material_dependency_snapshot,
@@ -1846,7 +1847,7 @@ def _verified_source_bundle(
         expected_sha256 = override.get("sha256")
         if not all(isinstance(value, str) and value for value in (source_value, expected_sha256)):
             raise ValueError(f"source override 필수 필드가 누락됐어요: {bundle_key}")
-        source = Path(source_value).expanduser().resolve()
+        source = _resolve_portable_path(source_value)
         fallback = (bundle_root / Path(bundle_key)).expanduser().resolve()
         if (
             (not source.is_file() or _sha256_file(source) != expected_sha256)

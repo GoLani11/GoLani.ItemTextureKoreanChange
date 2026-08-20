@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
@@ -19,6 +21,28 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _portable_path_value(value: str, platform: str) -> str:
+    """Windows drive 경로와 WSL `/mnt/<drive>` 경로를 실행 OS에 맞춰요."""
+
+    windows = re.fullmatch(r"([A-Za-z]):[\\/](.*)", value)
+    wsl = re.fullmatch(r"/mnt/([A-Za-z])(?:/(.*))?", value)
+    if platform == "nt" and wsl is not None:
+        drive, remainder = wsl.groups()
+        suffix = (remainder or "").replace("\\", "/")
+        return f"{drive.upper()}:/{suffix}"
+    if platform != "nt" and windows is not None:
+        drive, remainder = windows.groups()
+        suffix = remainder.replace("\\", "/")
+        return f"/mnt/{drive.lower()}/{suffix}"
+    return value
+
+
+def _resolve_portable_path(value: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError("경로가 비어 있어요")
+    return Path(_portable_path_value(value, os.name)).expanduser().resolve()
 
 
 def _material_identity(material: Any) -> tuple[str, str, int]:
@@ -581,7 +605,7 @@ def _apply_source_overrides(
                 f"(현재 {len(matches)}개)"
             )
 
-        bundle_path = Path(bundle_value).expanduser().resolve()
+        bundle_path = _resolve_portable_path(bundle_value)
         if not bundle_path.is_file():
             raise FileNotFoundError(f"source override bundle을 찾지 못했어요: {bundle_path}")
         if sha256_file(bundle_path) != bundle_sha256:
