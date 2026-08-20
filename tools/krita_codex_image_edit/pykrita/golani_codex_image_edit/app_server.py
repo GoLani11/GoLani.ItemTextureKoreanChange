@@ -18,7 +18,7 @@ from uuid import uuid4
 
 CLIENT_NAME = "golani_krita_codex_image_edit"
 CLIENT_TITLE = "GoLani Krita Codex Image Edit"
-CLIENT_VERSION = "0.3.0"
+CLIENT_VERSION = "0.4.0"
 PERMISSION_PROFILE_PREFIX = "krita-imagegen-scoped-read"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_GENERATED_PNG_BYTES = 100 * 1024 * 1024
@@ -239,6 +239,7 @@ class CodexAppServer:
         self._cancel_requested = threading.Event()
         self._current_turn_lock = threading.Lock()
         self._current_turn: tuple[str, str] | None = None
+        self._terminal_shutdown = threading.Event()
 
     @property
     def running(self) -> bool:
@@ -246,8 +247,12 @@ class CodexAppServer:
 
     def start(self, cwd: Path) -> None:
         cwd = cwd.expanduser().resolve()
-        cwd.mkdir(parents=True, exist_ok=True)
         with self._start_lock:
+            if self._terminal_shutdown.is_set():
+                raise AppServerError(
+                    "Krita 도커가 종료되어 Codex App Server를 다시 시작할 수 없어요"
+                )
+            cwd.mkdir(parents=True, exist_ok=True)
             if self.running:
                 return
             try:
@@ -651,6 +656,11 @@ class CodexAppServer:
             self._fail_pending("Codex App Server가 종료됐어요")
             with self._notification_condition:
                 self._notification_condition.notify_all()
+
+    def shutdown(self) -> None:
+        """Permanently stop this client so a late worker cannot restart it."""
+        self._terminal_shutdown.set()
+        self.close()
 
     def _raise_if_cancelled(self) -> None:
         with self._notification_condition:

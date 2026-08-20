@@ -105,12 +105,15 @@ from .spt import (
     SptPanel,
     SptPreparation,
     SptTarget,
+    SptTargetSummary,
     build_preview_choice_record,
     build_spt_prompt,
     current_generation_attempts,
+    first_available_spt_panel,
     inspect_spt_target,
     load_spt_target,
     scan_spt_targets,
+    write_spt_preparation_request,
 )
 
 
@@ -151,6 +154,7 @@ class _Snapshot:
 
 class _Signals(QObject):
     status = pyqtSignal(str)
+    spt_targets_ready = pyqtSignal(object)
     connection_ready = pyqtSignal(object)
     generation_ready = pyqtSignal(str)
     failed = pyqtSignal(str)
@@ -162,14 +166,19 @@ class CodexSelectionEditDocker(DockWidget):
         self.setWindowTitle("Codex 선택 영역 AI 편집")
         self._signals = _Signals()
         self._signals.status.connect(self._set_status)
+        self._signals.spt_targets_ready.connect(self._spt_targets_ready)
         self._signals.connection_ready.connect(self._connection_ready)
         self._signals.generation_ready.connect(self._generation_ready)
         self._signals.failed.connect(self._operation_failed)
         self._session_lock = threading.Lock()
+        self._shutting_down = False
         self._session: CodexAppServer | None = None
         self._session_executable: str | None = None
         self._pending_snapshot: _Snapshot | None = None
         self._spt_preparation: SptPreparation | None = None
+        self._spt_summaries: tuple[SptTargetSummary, ...] = ()
+        self._spt_scan_root: Path | None = None
+        self._spt_preparation_request_path: Path | None = None
         self._spt_target: SptTarget | None = None
         self._spt_panel: SptPanel | None = None
         self._spt_allowed_mask: bytes | None = None
@@ -231,6 +240,11 @@ class CodexSelectionEditDocker(DockWidget):
         self._spt_open = QPushButton("SPT 원본·추천 선택 불러오기")
         self._spt_open.clicked.connect(self._load_spt_work)
         layout.addWidget(self._spt_open)
+
+        self._spt_prepare_all = QPushButton("전체 준비 요청 기록")
+        self._spt_prepare_all.setEnabled(False)
+        self._spt_prepare_all.clicked.connect(self._record_spt_preparation_request)
+        layout.addWidget(self._spt_prepare_all)
 
         self._prompt = QPlainTextEdit()
         self._prompt.setPlaceholderText(
@@ -322,6 +336,11 @@ class CodexSelectionEditDocker(DockWidget):
             self._spt_open,
         ):
             widget.setEnabled(spt_mode and not self._busy)
+        self._spt_prepare_all.setEnabled(
+            spt_mode
+            and not self._busy
+            and any(item.preparation_required for item in self._spt_summaries)
+        )
         self._workspace.setEnabled(not spt_mode and not self._busy)
         self._edit_button.setEnabled(
             not self._busy and (not spt_mode or self._spt_allowed_mask is not None)
@@ -364,11 +383,32 @@ class CodexSelectionEditDocker(DockWidget):
             return
         try:
             root = Path(self._spt_root.text().strip()).expanduser().resolve()
-            summaries = scan_spt_targets(root)
         except Exception as exc:
             self._operation_failed(str(exc))
             return
+        selected_target = self._spt_target_box.currentData()
+        self._set_busy(True, cancellable=False)
+        self._set_status("전체 SPT 품목의 공식 analysis와 현재 파일 SHA를 확인하고 있어요")
+
+        def run() -> None:
+            try:
+                summaries = scan_spt_targets(root)
+                self._signals.spt_targets_ready.emit((root, summaries, selected_target))
+            except Exception as exc:
+                self._signals.failed.emit(str(exc))
+
+        threading.Thread(target=run, name="krita-spt-scan", daemon=True).start()
+
+    def _spt_targets_ready(self, value: object) -> None:
+        root, summaries, selected_target = value
+        if not isinstance(root, Path) or not isinstance(summaries, tuple):
+            self._operation_failed("SPT 품목 검사 결과 형식이 올바르지 않아요")
+            return
+        self._set_busy(False)
         self._write_setting("spt_root", str(root))
+        self._spt_scan_root = root
+        self._spt_summaries = summaries
+        self._spt_preparation_request_path = None
         self._spt_target_box.blockSignals(True)
         self._spt_target_box.clear()
         for item in summaries:
@@ -376,9 +416,45 @@ class CodexSelectionEditDocker(DockWidget):
                 f"{item.name_ko} ({item.target_id}) · {item.state}",
                 item.target_id,
             )
+        if isinstance(selected_target, str):
+            selected_index = self._spt_target_box.findData(selected_target)
+            if selected_index >= 0:
+                self._spt_target_box.setCurrentIndex(selected_index)
         self._spt_target_box.blockSignals(False)
         self._clear_spt_context(clear_panels=True)
-        self._set_status(f"SPT 품목 {len(summaries)}개를 확인했어요")
+        ready = sum(item.ready for item in summaries)
+        blocked = sum(item.preparation_required for item in summaries)
+        preserved = sum(item.status == "preserve" for item in summaries)
+        exhausted = sum(item.attempt_budget_exhausted for item in summaries)
+        self._set_status(
+            f"SPT {len(summaries)}개 확인 · 생성 준비 {ready} · 준비 필요 {blocked} · "
+            f"예산 소진 {exhausted} · 보존 {preserved}. 준비 필요 품목은 "
+            "‘전체 준비 요청 기록’ 한 번으로 묶을 수 있어요"
+        )
+
+    def _record_spt_preparation_request(self) -> None:
+        if self._busy:
+            return
+        if self._spt_scan_root is None or not self._spt_summaries:
+            self._operation_failed("먼저 SPT 품목을 새로고침해 주세요")
+            return
+        try:
+            request_path = write_spt_preparation_request(
+                self._spt_scan_root,
+                self._spt_summaries,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as exc:
+            self._operation_failed(str(exc))
+            return
+        self._spt_preparation_request_path = request_path
+        relative = request_path.relative_to(self._spt_scan_root).as_posix()
+        count = sum(item.preparation_required for item in self._spt_summaries)
+        self._set_status(
+            f"준비 필요 품목 {count}개를 현재 review SHA에 묶어 기록했어요: {relative}. "
+            "Codex에 ‘이 전체 준비 요청을 순서대로 처리해 줘’라고 한 번만 요청해 주세요. "
+            "이 기록 자체는 추가 생성 시도 승인이 아니에요"
+        )
 
     def _load_spt_work(self) -> None:
         if self._busy:
@@ -400,7 +476,7 @@ class CodexSelectionEditDocker(DockWidget):
                 self._operation_failed(str(exc))
             return
         try:
-            target = load_spt_target(root, target_id)
+            target = load_spt_target(root, target_id, preparation=preparation)
             self._spt_target = target
             self._spt_panel_box.blockSignals(True)
             self._spt_panel_box.clear()
@@ -409,8 +485,14 @@ class CodexSelectionEditDocker(DockWidget):
             self._spt_panel_box.blockSignals(False)
             if not target.panels:
                 raise ValueError("통과한 번역 기록에 불러올 라벨 면이 없어요")
-            self._spt_panel_box.setCurrentIndex(0)
-            self._open_spt_panel(target, target.panels[0])
+            first_panel = first_available_spt_panel(target)
+            if first_panel is None:
+                raise ValueError("모든 라벨 면의 기본 생성 예산을 이미 사용했어요")
+            first_index = self._spt_panel_box.findData(first_panel.panel_id)
+            self._spt_panel_box.blockSignals(True)
+            self._spt_panel_box.setCurrentIndex(first_index)
+            self._spt_panel_box.blockSignals(False)
+            self._open_spt_panel(target, first_panel)
         except Exception as exc:
             self._operation_failed(str(exc))
 
@@ -468,11 +550,16 @@ class CodexSelectionEditDocker(DockWidget):
             reasons.append(f"analysis 기록 갱신 필요: {preview}{suffix}")
         if reference_error:
             reasons.append(f"마스크 준비 필요: {reference_error}")
+        if preparation.attempt_budget_exhausted:
+            reasons.append(
+                f"생성 예산 승인 필요: 기록 {preparation.recorded_generation_attempts}/"
+                f"{MAX_GENERATION_ATTEMPTS}회"
+            )
         opened = "원본과 기존 editable 참고 선택" if reference_mask else "원본"
         detail = " · ".join(reasons) or "안전 게이트 준비 필요"
         self._set_status(
             f"{preparation.name_ko} {opened}을 열었어요. 생성은 잠겨 있어요. "
-            f"{detail}. Codex에 ‘{preparation.target_id} analysis·마스크 최신화’를 요청해 주세요"
+            f"{detail}. 위의 ‘전체 준비 요청 기록’으로 다른 잠긴 품목과 한 번에 묶을 수 있어요"
         )
 
     def _spt_panel_changed(self) -> None:
@@ -485,6 +572,13 @@ class CodexSelectionEditDocker(DockWidget):
         )
         if panel is None:
             return
+        self._spt_preparation = None
+        self._spt_panel = None
+        self._spt_allowed_mask = None
+        self._last_spt_job_dir = None
+        self._spt_accept_button.setEnabled(False)
+        self._spt_reject_button.setEnabled(False)
+        self._mode_changed()
         try:
             self._open_spt_panel(self._spt_target, panel)
         except Exception as exc:
@@ -1242,6 +1336,8 @@ class CodexSelectionEditDocker(DockWidget):
 
     def _session_for(self, executable: str) -> CodexAppServer:
         with self._session_lock:
+            if self._shutting_down:
+                raise RuntimeError("Krita 도커가 종료되어 새 Codex 작업을 시작할 수 없어요")
             if self._session is not None and self._session_executable != executable:
                 self._session.close()
                 self._session = None
@@ -1282,10 +1378,11 @@ class CodexSelectionEditDocker(DockWidget):
 
     def _shutdown(self) -> None:
         with self._session_lock:
+            self._shutting_down = True
             session = self._session
             self._session = None
         if session is not None:
-            session.close()
+            session.shutdown()
 
 
 def _default_workspace() -> Path:

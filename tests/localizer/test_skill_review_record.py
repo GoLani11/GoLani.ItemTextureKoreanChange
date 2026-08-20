@@ -386,6 +386,22 @@ def test_analysis_gate_is_fail_closed_and_binds_evidence_hash(tmp_path: Path) ->
     assert any("현재 파일 SHA가 기록과 달라요" in error for error in errors)
 
 
+def test_analysis_gate_ignores_stale_downstream_evidence(tmp_path: Path) -> None:
+    record = _analysis_record(tmp_path)
+    downstream = _evidence(tmp_path, "material-downstream")
+    record["stages"]["material_validation"] = {
+        "status": "pass",
+        "evidence": [downstream],
+        "data": {},
+    }
+    (tmp_path / downstream["path"]).write_bytes(b"changed-after-material-review")
+
+    assert review_record.validate_record(record, "analysis", project_root=tmp_path) == []
+
+    errors = review_record.validate_record(record, "material", project_root=tmp_path)
+    assert any("현재 파일 SHA가 기록과 달라요" in error for error in errors)
+
+
 def test_analysis_gate_uses_source_ocr_only_for_ambiguous_regions(tmp_path: Path) -> None:
     record = _analysis_record(tmp_path)
     visual = record["stages"]["source_visual"]["data"]["regions"][0]

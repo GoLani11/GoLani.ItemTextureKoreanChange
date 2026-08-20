@@ -284,6 +284,21 @@ def test_app_server_refuses_api_key_login_mode(tmp_path: Path) -> None:
         client.close()
 
 
+def test_terminal_shutdown_prevents_late_worker_restart(tmp_path: Path) -> None:
+    client = CodexAppServer(
+        server_command=_fake_command(tmp_path),
+        request_timeout=3,
+    )
+    client.check_connection(tmp_path)
+    client.shutdown()
+
+    with pytest.raises(AppServerError, match="다시 시작할 수 없어요"):
+        client.check_connection(tmp_path)
+
+    methods = (tmp_path / "server.log").read_text(encoding="utf-8").splitlines()
+    assert methods.count("initialize") == 1
+
+
 def test_app_server_removes_api_key_from_child_environment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

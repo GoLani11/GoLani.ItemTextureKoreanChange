@@ -1436,6 +1436,7 @@ def validate_record(
     stages = record.get("stages")
     if not isinstance(stages, dict):
         return errors + ["stages: 객체가 아니에요"]
+    scoped_stages = set(THROUGH[through])
     for name in STAGES:
         stage = stages.get(name)
         if not isinstance(stage, dict):
@@ -1443,14 +1444,17 @@ def validate_record(
             continue
         if stage.get("status") not in STATUSES:
             errors.append(f"stages.{name}.status: 지원하는 상태가 아니에요")
-        errors.extend(
-            _validate_evidence(
-                stage.get("evidence"),
-                f"stages.{name}.evidence",
-                project_root=project_root,
-                required=name in THROUGH[through] and stage.get("status") == "pass",
+        if name in scoped_stages:
+            errors.extend(
+                _validate_evidence(
+                    stage.get("evidence"),
+                    f"stages.{name}.evidence",
+                    project_root=project_root,
+                    required=stage.get("status") == "pass",
+                )
             )
-        )
+        elif not isinstance(stage.get("evidence"), list):
+            errors.append(f"stages.{name}.evidence: 배열이 아니에요")
         if not isinstance(stage.get("data"), dict):
             errors.append(f"stages.{name}.data: 객체가 아니에요")
     for name in THROUGH[through]:
