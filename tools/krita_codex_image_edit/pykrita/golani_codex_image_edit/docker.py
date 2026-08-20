@@ -103,9 +103,11 @@ from .core import (
 from .spt import (
     MAX_GENERATION_ATTEMPTS,
     SptPanel,
+    SptPreparation,
     SptTarget,
     build_spt_prompt,
     current_generation_attempts,
+    inspect_spt_target,
     load_spt_target,
     scan_spt_targets,
 )
@@ -166,6 +168,7 @@ class CodexSelectionEditDocker(DockWidget):
         self._session: CodexAppServer | None = None
         self._session_executable: str | None = None
         self._pending_snapshot: _Snapshot | None = None
+        self._spt_preparation: SptPreparation | None = None
         self._spt_target: SptTarget | None = None
         self._spt_panel: SptPanel | None = None
         self._spt_allowed_mask: bytes | None = None
@@ -189,8 +192,9 @@ class CodexSelectionEditDocker(DockWidget):
         layout.addWidget(explanation)
 
         warning = QLabel(
-            "SPT 모드는 analysis 통과 기록과 현재 SHA의 5종 마스크가 있는 품목만 열어요. "
-            "결과는 패널 OCR 전 검증 전 미리보기이며 후보 승인본이 아니에요."
+            "SPT 준비가 덜 된 품목도 원본과 기존 editable 참고 선택은 열 수 있어요. "
+            "analysis와 현재 SHA의 5종 마스크가 모두 통과하기 전에는 생성이 잠기며, "
+            "결과는 패널 OCR 전 검증 전 미리보기예요."
         )
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #c58a35;")
@@ -216,6 +220,7 @@ class CodexSelectionEditDocker(DockWidget):
         spt_root_row.addWidget(self._spt_refresh)
         spt_form.addRow("SPT 프로젝트", spt_root_row)
         self._spt_target_box = QComboBox()
+        self._spt_target_box.currentIndexChanged.connect(self._spt_target_changed)
         spt_form.addRow("품목", self._spt_target_box)
         self._spt_panel_box = QComboBox()
         self._spt_panel_box.currentIndexChanged.connect(self._spt_panel_changed)
@@ -317,7 +322,31 @@ class CodexSelectionEditDocker(DockWidget):
         ):
             widget.setEnabled(spt_mode and not self._busy)
         self._workspace.setEnabled(not spt_mode and not self._busy)
+        self._edit_button.setEnabled(
+            not self._busy and (not spt_mode or self._spt_allowed_mask is not None)
+        )
         self._write_setting("mode", "spt" if spt_mode else "generic")
+
+    def _spt_target_changed(self) -> None:
+        if self._busy:
+            return
+        self._clear_spt_context(clear_panels=True)
+        if self._is_spt_mode() and self._spt_target_box.currentData():
+            self._set_status("품목을 선택했어요. 원본·추천 선택 불러오기를 눌러 주세요")
+
+    def _clear_spt_context(self, *, clear_panels: bool) -> None:
+        self._spt_preparation = None
+        self._spt_target = None
+        self._spt_panel = None
+        self._spt_allowed_mask = None
+        self._last_spt_job_dir = None
+        self._spt_accept_button.setEnabled(False)
+        self._spt_reject_button.setEnabled(False)
+        if clear_panels:
+            self._spt_panel_box.blockSignals(True)
+            self._spt_panel_box.clear()
+            self._spt_panel_box.blockSignals(False)
+        self._mode_changed()
 
     def _browse_spt_root(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -347,10 +376,7 @@ class CodexSelectionEditDocker(DockWidget):
                 item.target_id,
             )
         self._spt_target_box.blockSignals(False)
-        self._spt_target = None
-        self._spt_panel = None
-        self._spt_allowed_mask = None
-        self._spt_panel_box.clear()
+        self._clear_spt_context(clear_panels=True)
         self._set_status(f"SPT 품목 {len(summaries)}개를 확인했어요")
 
     def _load_spt_work(self) -> None:
@@ -362,11 +388,18 @@ class CodexSelectionEditDocker(DockWidget):
             return
         try:
             root = Path(self._spt_root.text().strip()).expanduser().resolve()
-            target = load_spt_target(root, target_id)
+            preparation = inspect_spt_target(root, target_id)
         except Exception as exc:
             self._operation_failed(str(exc))
             return
+        if not preparation.ready:
+            try:
+                self._open_spt_preparation(preparation)
+            except Exception as exc:
+                self._operation_failed(str(exc))
+            return
         try:
+            target = load_spt_target(root, target_id)
             self._spt_target = target
             self._spt_panel_box.blockSignals(True)
             self._spt_panel_box.clear()
@@ -379,6 +412,67 @@ class CodexSelectionEditDocker(DockWidget):
             self._open_spt_panel(target, target.panels[0])
         except Exception as exc:
             self._operation_failed(str(exc))
+
+    def _open_spt_preparation(self, preparation: SptPreparation) -> None:
+        document = _open_or_activate_document(preparation.source.path)
+        if (
+            document.width() != preparation.source.width
+            or document.height() != preparation.source.height
+        ):
+            raise ValueError("Krita에 열린 SPT 원본 크기가 review.json과 달라요")
+        _verify_document_matches_source(document, preparation.source.path)
+
+        reference_mask: bytes | None = None
+        reference_error = preparation.mask_error
+        if preparation.masks:
+            try:
+                mask_pixels = {
+                    name: _read_mask_bytes(artifact.path, artifact.width, artifact.height)
+                    for name, artifact in preparation.masks.items()
+                }
+                validate_spt_mask_contract(
+                    mask_pixels["old_text"],
+                    mask_pixels["new_text"],
+                    mask_pixels["editable"],
+                    mask_pixels["protected"],
+                    mask_pixels["seam_guard"],
+                    preparation.source.width,
+                    preparation.source.height,
+                )
+                reference_mask = mask_pixels["editable"]
+            except Exception as exc:
+                reference_error = str(exc)
+
+        selection_pixels = reference_mask or bytes(
+            preparation.source.width * preparation.source.height
+        )
+        _set_spt_selection(
+            document,
+            selection_pixels,
+            preparation.source.width,
+            preparation.source.height,
+        )
+        self._clear_spt_context(clear_panels=True)
+        self._spt_preparation = preparation
+        if reference_mask is not None:
+            self._spt_panel_box.addItem("준비 참고 · 전체 editable 선택 (생성 잠김)")
+        else:
+            self._spt_panel_box.addItem("준비 참고 · 원본만 열림 (생성 잠김)")
+
+        reasons: list[str] = []
+        if preparation.analysis_errors:
+            preview = preparation.analysis_errors[0]
+            remaining = len(preparation.analysis_errors) - 1
+            suffix = f" 외 {remaining}건" if remaining > 0 else ""
+            reasons.append(f"analysis 기록 갱신 필요: {preview}{suffix}")
+        if reference_error:
+            reasons.append(f"마스크 준비 필요: {reference_error}")
+        opened = "원본과 기존 editable 참고 선택" if reference_mask else "원본"
+        detail = " · ".join(reasons) or "안전 게이트 준비 필요"
+        self._set_status(
+            f"{preparation.name_ko} {opened}을 열었어요. 생성은 잠겨 있어요. "
+            f"{detail}. Codex에 ‘{preparation.target_id} analysis·마스크 최신화’를 요청해 주세요"
+        )
 
     def _spt_panel_changed(self) -> None:
         if self._busy or self._spt_target is None:
@@ -431,18 +525,14 @@ class CodexSelectionEditDocker(DockWidget):
         if document.width() != current.source.width or document.height() != current.source.height:
             raise ValueError("Krita에 열린 SPT 원본 크기가 review.json과 달라요")
         _verify_document_matches_source(document, current.source.path)
-        selection = Selection()
-        selection.setPixelData(
-            QByteArray(allowed),
-            0,
-            0,
+        _set_spt_selection(
+            document,
+            allowed,
             current.source.width,
             current.source.height,
         )
-        document.setSelection(selection)
-        document.waitForDone()
-        document.refreshProjection()
         self._spt_target = current
+        self._spt_preparation = None
         self._spt_panel = panel
         self._spt_allowed_mask = allowed
         self._last_spt_job_dir = None
@@ -454,6 +544,7 @@ class CodexSelectionEditDocker(DockWidget):
             f"{current.name_ko} · {panel.label} 선택을 적용했어요 · "
             f"생성 {attempts}/{MAX_GENERATION_ATTEMPTS}회 · 확정 문구: {texts}"
         )
+        self._mode_changed()
 
     def _browse_workspace(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -1270,6 +1361,17 @@ def _open_or_activate_document(path: Path) -> Any:
     document.refreshProjection()
     document.waitForDone()
     return document
+
+
+def _set_spt_selection(document: Any, pixels: bytes, width: int, height: int) -> None:
+    if len(pixels) != width * height:
+        raise ValueError("SPT 선택 마스크 픽셀 길이가 원본 크기와 달라요")
+    selection = Selection()
+    selection.setPixelData(QByteArray(pixels), 0, 0, width, height)
+    document.setSelection(selection)
+    document.waitForDone()
+    document.refreshProjection()
+    document.waitForDone()
 
 
 def _verify_document_matches_source(document: Any, source_path: Path) -> None:

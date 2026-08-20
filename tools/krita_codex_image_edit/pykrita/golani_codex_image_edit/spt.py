@@ -60,6 +60,22 @@ class SptTarget:
 
 
 @dataclass(frozen=True)
+class SptPreparation:
+    project_root: Path
+    target_id: str
+    name_ko: str
+    review_path: Path
+    source: SptArtifact
+    masks: dict[str, SptArtifact]
+    analysis_errors: tuple[str, ...]
+    mask_error: str | None
+
+    @property
+    def ready(self) -> bool:
+        return not self.analysis_errors and self.mask_error is None
+
+
+@dataclass(frozen=True)
 class SptTargetSummary:
     target_id: str
     name_ko: str
@@ -95,23 +111,21 @@ def scan_spt_targets(root: Path) -> tuple[SptTargetSummary, ...]:
         else:
             try:
                 record = _read_json(review_path)
-                stages = record.get("stages", {})
-                visual = stages.get("source_visual", {}).get("status")
-                translation = stages.get("translation", {}).get("status")
-                masks = stages.get("edit_plan", {}).get("data", {}).get("masks")
-                if visual != "pass" or translation != "pass":
-                    state = "분석 준비 필요"
-                elif not isinstance(masks, dict) or any(name not in masks for name in MASK_NAMES):
-                    state = "마스크 준비 필요"
+                if record.get("target_id") != target_id:
+                    state = "원본 또는 기록 오류"
+                elif _analysis_preflight_gaps(record):
+                    state = "analysis 갱신 필요 · 원본 확인 가능"
+                elif not _has_all_mask_descriptors(record):
+                    state = "마스크 준비 필요 · 원본 확인 가능"
                 else:
-                    state = "마스크 있음 · 불러올 때 게이트 재검사"
+                    state = "형식 준비됨 · 공식 게이트·SHA 검사 대기"
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                state = "기록 오류"
+                state = "원본 또는 기록 오류"
         summaries.append(SptTargetSummary(target_id, name_ko, state))
     return tuple(summaries)
 
 
-def load_spt_target(root: Path, target_id: str) -> SptTarget:
+def inspect_spt_target(root: Path, target_id: str) -> SptPreparation:
     root = root.expanduser().resolve()
     profile = _load_profile(root)
     profile_target = next(
@@ -127,11 +141,6 @@ def load_spt_target(root: Path, target_id: str) -> SptTarget:
     if not review_path.is_file():
         raise ValueError(f"분석 기록이 없어요: {review_path}")
     record = _read_json(review_path)
-    errors = _validate_analysis_with_project_script(root, record)
-    if errors:
-        preview = "; ".join(errors[:3])
-        suffix = f" 외 {len(errors) - 3}건" if len(errors) > 3 else ""
-        raise ValueError(f"SPT analysis 게이트가 막혔어요: {preview}{suffix}")
     if record.get("target_id") != target_id:
         raise ValueError("review.json의 target_id가 선택한 품목과 달라요")
 
@@ -147,20 +156,57 @@ def load_spt_target(root: Path, target_id: str) -> SptTarget:
     stages = record.get("stages", {})
     edit_data = stages.get("edit_plan", {}).get("data", {})
     mask_data = edit_data.get("masks") if isinstance(edit_data, dict) else None
+    masks: dict[str, SptArtifact] = {}
+    mask_error: str | None = None
     if not isinstance(mask_data, dict):
-        raise ValueError("분석은 통과했지만 5종 편집 마스크가 아직 준비되지 않았어요")
-    masks = {
-        name: _artifact_from_descriptor(
-            root,
-            mask_data.get(name),
-            f"edit_plan.masks.{name}",
-            require_size=True,
+        mask_error = "5종 편집 마스크가 아직 준비되지 않았어요"
+    else:
+        try:
+            masks = {
+                name: _artifact_from_descriptor(
+                    root,
+                    mask_data.get(name),
+                    f"edit_plan.masks.{name}",
+                    require_size=True,
+                )
+                for name in MASK_NAMES
+            }
+            for name, artifact in masks.items():
+                if (artifact.width, artifact.height) != (source.width, source.height):
+                    raise ValueError(f"{name} 마스크 크기가 원본과 달라요")
+        except (OSError, ValueError, TypeError) as exc:
+            masks = {}
+            mask_error = str(exc)
+
+    return SptPreparation(
+        project_root=root,
+        target_id=target_id,
+        name_ko=str(profile_target.get("name_ko", target_id)),
+        review_path=review_path,
+        source=source,
+        masks=masks,
+        analysis_errors=tuple(_validate_analysis_with_project_script(root, record)),
+        mask_error=mask_error,
+    )
+
+
+def load_spt_target(root: Path, target_id: str) -> SptTarget:
+    preparation = inspect_spt_target(root, target_id)
+    if preparation.analysis_errors:
+        preview = "; ".join(preparation.analysis_errors[:3])
+        remaining = len(preparation.analysis_errors) - 3
+        suffix = f" 외 {remaining}건" if remaining > 0 else ""
+        raise ValueError(f"SPT analysis 게이트가 막혔어요: {preview}{suffix}")
+    if preparation.mask_error is not None:
+        raise ValueError(
+            "분석은 통과했지만 편집 마스크를 사용할 수 없어요: "
+            f"{preparation.mask_error}"
         )
-        for name in MASK_NAMES
-    }
-    for name, artifact in masks.items():
-        if (artifact.width, artifact.height) != (source.width, source.height):
-            raise ValueError(f"{name} 마스크 크기가 원본과 달라요")
+
+    root = preparation.project_root
+    record = _read_json(preparation.review_path)
+    stages = record.get("stages", {})
+    edit_data = stages.get("edit_plan", {}).get("data", {})
 
     visual_regions = {
         item.get("region_id"): item
@@ -221,12 +267,12 @@ def load_spt_target(root: Path, target_id: str) -> SptTarget:
     return SptTarget(
         project_root=root,
         target_id=target_id,
-        name_ko=str(profile_target.get("name_ko", target_id)),
-        texture=str(profile_target.get("texture", "")),
-        review_path=review_path,
-        review_sha256=_sha256(review_path),
-        source=source,
-        masks=masks,
+        name_ko=preparation.name_ko,
+        texture=str(record.get("source", {}).get("texture", "")),
+        review_path=preparation.review_path,
+        review_sha256=_sha256(preparation.review_path),
+        source=preparation.source,
+        masks=preparation.masks,
         panels=tuple(panels),
     )
 
@@ -381,6 +427,48 @@ def _validate_analysis_with_project_script(root: Path, record: dict[str, Any]) -
         return ["공식 analysis 검사 함수를 찾지 못했어요"]
     result = validator(record, "analysis", project_root=root)
     return list(result) if isinstance(result, list) else ["analysis 검사 결과 형식이 잘못됐어요"]
+
+
+def _has_all_mask_descriptors(record: dict[str, Any]) -> bool:
+    stages = record.get("stages")
+    if not isinstance(stages, dict):
+        return False
+    edit_plan = stages.get("edit_plan")
+    if not isinstance(edit_plan, dict):
+        return False
+    data = edit_plan.get("data")
+    if not isinstance(data, dict):
+        return False
+    masks = data.get("masks")
+    return isinstance(masks, dict) and all(isinstance(masks.get(name), dict) for name in MASK_NAMES)
+
+
+def _analysis_preflight_gaps(record: dict[str, Any]) -> bool:
+    stages = record.get("stages")
+    if not isinstance(stages, dict):
+        return True
+    visual = stages.get("source_visual")
+    translation = stages.get("translation")
+    if not isinstance(visual, dict) or visual.get("status") != "pass":
+        return True
+    if not isinstance(translation, dict) or translation.get("status") != "pass":
+        return True
+    visual_data = visual.get("data")
+    if not isinstance(visual_data, dict):
+        return True
+    if visual_data.get("vision_first") is not True:
+        return True
+    if not isinstance(visual_data.get("ocr_fallback_required"), bool):
+        return True
+    regions = visual_data.get("regions")
+    if not isinstance(regions, list) or not regions:
+        return True
+    return any(
+        not isinstance(region, dict)
+        or not isinstance(region.get("needs_ocr_fallback"), bool)
+        or not isinstance(region.get("typography"), dict)
+        for region in regions
+    )
 
 
 def _load_module(path: Path) -> ModuleType:

@@ -85,9 +85,19 @@ def _project(tmp_path: Path) -> Path:
             "source_visual": {
                 "status": "pass",
                 "data": {
+                    "vision_first": True,
+                    "ocr_fallback_required": False,
                     "regions": [
-                        {"region_id": "front", "typography": typography},
-                        {"region_id": "side", "typography": typography},
+                        {
+                            "region_id": "front",
+                            "needs_ocr_fallback": False,
+                            "typography": typography,
+                        },
+                        {
+                            "region_id": "side",
+                            "needs_ocr_fallback": False,
+                            "typography": typography,
+                        },
                     ]
                 },
             },
@@ -126,14 +136,36 @@ def _project(tmp_path: Path) -> Path:
     return root
 
 
-def test_scan_shows_readiness_without_claiming_gate_pass(tmp_path: Path) -> None:
+def test_scan_shows_preflight_readiness(tmp_path: Path) -> None:
     root = _project(tmp_path)
     summaries = spt.scan_spt_targets(root)
 
     assert [(item.target_id, item.state) for item in summaries] == [
-        ("can", "마스크 있음 · 불러올 때 게이트 재검사"),
+        ("can", "형식 준비됨 · 공식 게이트·SHA 검사 대기"),
         ("keep", "보존 대상"),
     ]
+
+
+def test_inspection_keeps_safe_source_and_masks_for_blocked_preparation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _project(tmp_path)
+    monkeypatch.setattr(
+        spt,
+        "_validate_analysis_with_project_script",
+        lambda root, record: ["source_visual.data.vision_first: true여야 해요"],
+    )
+
+    preparation = spt.inspect_spt_target(root, "can")
+
+    assert not preparation.ready
+    assert preparation.source.path.name == "can.png"
+    assert set(preparation.masks) == set(spt.MASK_NAMES)
+    assert preparation.mask_error is None
+    assert preparation.analysis_errors == (
+        "source_visual.data.vision_first: true여야 해요",
+    )
 
 
 def test_load_target_binds_profile_hashes_panels_and_prompt(
