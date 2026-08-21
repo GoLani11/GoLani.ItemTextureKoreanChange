@@ -92,6 +92,7 @@ def is_supported_srgb_profile(value: str) -> bool:
 
     normalized = value.strip().lower().replace("_", "-")
     return normalized in {
+        "srgb",
         "srgb built-in",
         "srgb-elle-v2-srgbtrc.icc",
         "srgb-elle-v4-srgbtrc.icc",

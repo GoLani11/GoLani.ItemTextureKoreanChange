@@ -172,8 +172,10 @@ def test_safe_stem_removes_path_syntax() -> None:
 
 
 def test_only_nonlinear_srgb_profiles_are_supported() -> None:
+    assert is_supported_srgb_profile("sRGB")
     assert is_supported_srgb_profile("sRGB-elle-V2-srgbtrc.icc")
     assert is_supported_srgb_profile("sRGB built-in")
+    assert not is_supported_srgb_profile("Linear sRGB")
     assert not is_supported_srgb_profile("sRGB-elle-V2-g10.icc")
     assert not is_supported_srgb_profile("Display P3")
 

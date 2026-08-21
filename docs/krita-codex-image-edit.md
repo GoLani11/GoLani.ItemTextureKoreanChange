@@ -150,8 +150,9 @@ SPT 생성 기록은
 - 생성 중 문서 픽셀 또는 선택이 바뀌면 결과 파일만 보존하고 자동 적용하지 않아요.
 - 선택 밖 픽셀과 알파가 적용 전과 다르면 직전에 추가한 레이어 한 건을 Undo하고 오류로
   처리해요.
-- 현재는 RGBA/U8의 비선형 sRGB 프로필만 지원해요. linear RGB, Display P3와 사용자 ICC는
-  색 변환 경로가 없어 시작 전에 차단해요.
+- 현재는 RGBA/U8의 비선형 sRGB 프로필만 지원해요. Qt 작업 뷰의 embedded `sRGB`,
+  `sRGB built-in`, `sRGB-elle-V2/V4-srgbtrc.icc`를 허용하고, linear RGB, Display P3와
+  사용자 ICC는 색 변환 경로가 없어 시작 전에 차단해요.
 - 범용 모드는 선택 안 원본 알파가 255가 아닌 픽셀이 하나라도 있으면 합성 의미가
   달라지므로 시작 전에 차단해요. SPT 모드는 `material` 알파를 원본에 고정하고
   RGB만 같은 불투명 작업 뷰에서 합성해요. 공식 compositor가 최종 후보의 알파를 원본에서
