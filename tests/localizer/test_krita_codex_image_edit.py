@@ -22,10 +22,12 @@ from golani_codex_image_edit.core import (  # noqa: E402
     find_spt_project_root,
     is_supported_srgb_profile,
     masked_bgra_layer,
+    opaque_bgra_view,
     safe_stem,
     spt_panel_mask,
-    validate_spt_mask_contract,
+    validate_opaque_bgra_view,
     validate_projection_invariants,
+    validate_spt_mask_contract,
 )
 
 
@@ -86,6 +88,41 @@ def test_masked_layer_has_no_generated_bytes_outside_selection() -> None:
 def test_masked_layer_rejects_fully_transparent_result() -> None:
     with pytest.raises(ValueError, match="완전히 투명"):
         masked_bgra_layer(bytes([10, 20, 30, 0]), bytes([255]), 1, 1)
+
+
+def test_opaque_bgra_view_preserves_rgb_and_only_replaces_alpha() -> None:
+    source = bytes([1, 2, 3, 37, 4, 5, 6, 161])
+
+    result = opaque_bgra_view(source, 2, 1)
+
+    assert result == bytes([1, 2, 3, 255, 4, 5, 6, 255])
+    assert source == bytes([1, 2, 3, 37, 4, 5, 6, 161])
+
+
+def test_opaque_bgra_view_rejects_mismatched_pixel_length() -> None:
+    with pytest.raises(ValueError, match="BGRA"):
+        opaque_bgra_view(bytes([1, 2, 3, 4]), 2, 1)
+
+
+def test_opaque_bgra_view_validation_rejects_rgb_or_alpha_drift() -> None:
+    source = bytes([1, 2, 3, 37, 4, 5, 6, 161])
+    valid = bytes([1, 2, 3, 255, 4, 5, 6, 255])
+
+    validate_opaque_bgra_view(source, valid, 2, 1)
+    with pytest.raises(ValueError, match="RGB 변경 1px"):
+        validate_opaque_bgra_view(
+            source,
+            bytes([9, 2, 3, 255, 4, 5, 6, 255]),
+            2,
+            1,
+        )
+    with pytest.raises(ValueError, match="불투명 아님 1px"):
+        validate_opaque_bgra_view(
+            source,
+            bytes([1, 2, 3, 254, 4, 5, 6, 255]),
+            2,
+            1,
+        )
 
 
 def test_selected_translucent_source_pixel_is_blocked() -> None:

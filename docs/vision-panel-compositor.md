@@ -6,15 +6,18 @@
 2. `old_text` 안에서만 복원한 배경판
 3. 원본 좌표로 되돌린 승인 한글 RGBA와 `lettering_mask`
 
-생성 패널의 배경·그림·재질 픽셀은 증거로만 보관하고 최종 후보에 복사하지 않는다. 합성기는
-마지막에 `editable` 밖 RGB와 전체 알파를 원본에서 다시 복원하고 변경 픽셀을 실측한다.
+생성 패널의 배경·그림·재질 픽셀은 증거로만 보관하고 최종 후보에 복사하지 않는다. Krita
+SPT 작업 뷰와 생성 패널의 알파가 표시용 255여도 이를 후보 알파로 사용하지 않는다. 합성기는
+마지막에 `editable` 밖 RGB와 전체 알파를 불변 원본에서 byte 그대로 복원하고 변경 픽셀을
+실측한다.
 
 ## 준비 산출물
 
 - `source`: 불변 원본 RGBA PNG
 - `old_text`, `new_text`, `editable`, `protected`, `seam_guard`: 원본 크기 0/255 L PNG
 - `source_style_reference`: 원본 해상도 스타일 crop
-- `generated_panel`: 연결된 라벨 면을 한 호출에서 편집한 전체 결과
+- `generated_panel`: 연결된 라벨 면을 한 호출에서 편집한 전체 결과. 표시용 불투명 알파는
+  증거 패널에만 유효하며 최종 Texture2D의 재질 알파를 대체하지 않음
 - `panel_ocr`: 생성 패널에서 확정 한글을 NFC 완전일치로 확인한 보고서
 - `selected_lettering`: 원본 크기 RGBA. 승인 글자 밖 알파는 0
 - `lettering_mask`: `selected_lettering`의 0보다 큰 알파와 정확히 같은 원본 크기 마스크

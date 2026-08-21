@@ -82,7 +82,9 @@ def _recipe(root: Path, *, rotation: float = 0) -> Path:
     style = root / "workspace/reviews/sample/source-style.png"
     generated = root / "workspace/reviews/sample/generated-panel.png"
     _save_rgba(style, source_values)
-    _save_rgba(generated, source_values)
+    generated_values = source_values.copy()
+    generated_values[..., 3] = 255
+    _save_rgba(generated, generated_values)
     panel_ocr = root / "workspace/reviews/sample/panel-ocr.json"
     panel_ocr.write_text(
         json.dumps(
@@ -196,6 +198,10 @@ def test_vision_compose_uses_only_approved_lettering_and_reuses_background(
     assert first["changed_inside_protected"] == 0
     assert first["changed_inside_seam_guard"] == 0
     assert (root / "workspace/drafts/sample/lettering-run.json").is_file()
+    candidate_alpha = np.asarray(
+        Image.open(root / "workspace/drafts/sample/candidate.png").convert("RGBA")
+    )[..., 3]
+    assert np.all(candidate_alpha == 173)
 
 
 def test_vision_compose_records_arbitrary_rotation_inverse(tmp_path: Path) -> None:

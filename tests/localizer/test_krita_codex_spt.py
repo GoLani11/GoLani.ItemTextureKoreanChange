@@ -154,41 +154,93 @@ def _update_mask_descriptor(root: Path, name: str) -> None:
     review_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
 
 
-def test_preview_choice_record_has_no_plugin_ocr_state() -> None:
-    mask_sha256 = {name: f"{index + 1:x}" * 64 for index, name in enumerate(spt.MASK_NAMES)}
-    record = spt.build_preview_choice_record(
-        {
-            "target_id": "can",
-            "panel_id": "front",
-            "review_sha256": "a" * 64,
-            "source_sha256": "b" * 64,
-            "mask_sha256": mask_sha256,
+def _preview_spt_identity() -> dict[str, object]:
+    return {
+        "target_id": "can",
+        "panel_id": "front",
+        "review_sha256": "a" * 64,
+        "source_sha256": "b" * 64,
+        "alpha_semantics": "material",
+        "working_view_transform": "source-rgb-force-alpha-255:v1",
+        "working_view": {
+            "path": "workspace/krita-spt/view-sources/can/view.png",
+            "file_sha256": "e" * 64,
         },
+        "model_input": {
+            "source_file_sha256": "1" * 64,
+            "source_pixel_sha256": "2" * 64,
+            "selection_mask_file_sha256": "3" * 64,
+            "selection_mask_pixel_sha256": "4" * 64,
+        },
+        "mask_sha256": {
+            name: f"{index + 1:x}" * 64
+            for index, name in enumerate(spt.MASK_NAMES)
+        },
+    }
+
+
+def test_working_view_path_rejects_symlink_or_hardlink_to_source(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "workspace/source/item.png"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"pinned source")
+    artifact = spt.SptArtifact(
+        path=source_path,
+        project_path="workspace/source/item.png",
+        sha256="a" * 64,
+        width=1,
+        height=1,
+    )
+    working_view = spt.spt_working_view_path(tmp_path, "item", artifact)
+    working_view.parent.mkdir(parents=True)
+
+    try:
+        working_view.symlink_to(source_path)
+    except OSError:
+        pytest.skip("이 파일시스템은 symlink 회귀 검사를 지원하지 않아요")
+    with pytest.raises(ValueError, match="심볼릭 링크|전용 폴더"):
+        spt.spt_working_view_path(tmp_path, "item", artifact)
+    working_view.unlink()
+
+    try:
+        working_view.hardlink_to(source_path)
+    except OSError:
+        pytest.skip("이 파일시스템은 hardlink 회귀 검사를 지원하지 않아요")
+    with pytest.raises(ValueError, match="불변 원본 파일"):
+        spt.spt_working_view_path(tmp_path, "item", artifact)
+
+
+def test_preview_choice_record_has_no_plugin_ocr_state() -> None:
+    spt_identity = _preview_spt_identity()
+    record = spt.build_preview_choice_record(
+        spt_identity,
         {"artifact": {"sha256": "d" * 64}},
         status="selected-for-validation",
         created_at="2026-08-20T00:00:00+00:00",
+        request_sha256="f" * 64,
     )
 
-    assert record["schema_version"] == 2
+    assert record["schema_version"] == 3
     assert record["purpose"] == "human-visual-selection"
     assert record["next_gate"] == "external-project-validation"
     assert record["candidate_approved"] is False
     assert "ocr" not in json.dumps(record).lower()
-    assert record["mask_sha256"] == mask_sha256
+    assert record["mask_sha256"] == spt_identity["mask_sha256"]
+    assert record["alpha_semantics"] == "material"
+    assert record["working_view_transform"] == "source-rgb-force-alpha-255:v1"
+    assert record["working_view_sha256"] == "e" * 64
+    assert record["model_input"] == spt_identity["model_input"]
+    assert record["request_sha256"] == "f" * 64
 
 
 def test_preview_choice_record_supports_discard_without_next_gate() -> None:
     record = spt.build_preview_choice_record(
-        {
-            "target_id": "can",
-            "panel_id": "front",
-            "review_sha256": "a" * 64,
-            "source_sha256": "b" * 64,
-            "mask_sha256": {name: "c" * 64 for name in spt.MASK_NAMES},
-        },
+        _preview_spt_identity(),
         {"artifact": {"sha256": "d" * 64}},
         status="discarded",
         created_at="2026-08-20T00:00:00+00:00",
+        request_sha256="f" * 64,
     )
 
     assert record["next_gate"] == "none"
@@ -200,6 +252,10 @@ def test_preview_choice_record_supports_discard_without_next_gate() -> None:
     [
         ("target_id", "", "target_id"),
         ("review_sha256", "not-a-sha", "review"),
+        ("alpha_semantics", "opacity", "alpha semantics"),
+        ("working_view_transform", "legacy", "작업 뷰 변환"),
+        ("working_view", None, "작업 뷰 기록"),
+        ("model_input", None, "imagegen 입력"),
         ("mask_sha256", {"editable": "c" * 64}, "5종 mask"),
     ],
 )
@@ -208,13 +264,7 @@ def test_preview_choice_record_rejects_unpinned_identity(
     value: object,
     message: str,
 ) -> None:
-    spt_data = {
-        "target_id": "can",
-        "panel_id": "front",
-        "review_sha256": "a" * 64,
-        "source_sha256": "b" * 64,
-        "mask_sha256": {name: "c" * 64 for name in spt.MASK_NAMES},
-    }
+    spt_data = _preview_spt_identity()
     spt_data[field] = value
 
     with pytest.raises(ValueError, match=message):
@@ -223,6 +273,7 @@ def test_preview_choice_record_rejects_unpinned_identity(
             {"artifact": {"sha256": "d" * 64}},
             status="selected-for-validation",
             created_at="2026-08-20T00:00:00+00:00",
+            request_sha256="f" * 64,
         )
 
 
@@ -233,6 +284,18 @@ def test_preview_choice_record_rejects_legacy_ocr_status() -> None:
             {"artifact": {"sha256": "d" * 64}},
             status="selected-for-panel-ocr",
             created_at="2026-08-20T00:00:00+00:00",
+            request_sha256="f" * 64,
+        )
+
+
+def test_preview_choice_record_rejects_unpinned_request() -> None:
+    with pytest.raises(ValueError, match="request"):
+        spt.build_preview_choice_record(
+            _preview_spt_identity(),
+            {"artifact": {"sha256": "d" * 64}},
+            status="selected-for-validation",
+            created_at="2026-08-20T00:00:00+00:00",
+            request_sha256="not-a-sha",
         )
 
 
@@ -794,6 +857,8 @@ def test_load_target_binds_profile_hashes_panels_and_prompt(
     assert "unvalidated visual preview only" in prompt
     assert "ocr" not in prompt.lower()
     assert "num_last_images_to_include=2" in prompt
+    assert "display-only alpha is forced to 255" in prompt
+    assert "source alpha is material data" in prompt
 
 
 def test_docker_selection_ui_has_no_plugin_ocr_wording() -> None:
@@ -804,6 +869,7 @@ def test_docker_selection_ui_has_no_plugin_ocr_wording() -> None:
 
     assert 'QPushButton("이 결과 선택")' in source
     assert 'QPushButton("결과 제외")' in source
+    assert 'QPushButton("SPT RGB 작업 뷰·추천 선택 불러오기")' in source
     assert '_record_spt_preview_choice("selected-for-validation")' in source
     assert '_record_spt_preview_choice("discarded")' in source
     assert 'QPushButton("전체 준비 요청 기록")' in source
@@ -813,6 +879,18 @@ def test_docker_selection_ui_has_no_plugin_ocr_wording() -> None:
     assert "self._shutting_down = True" in source
     assert "session.shutdown()" in source
     assert "[SPT 검증 전 미리보기]" in source
+    assert "_open_spt_working_view(" in source
+    assert "_verify_spt_working_view(" in source
+    assert "source-rgb-force-alpha-255:v1" in source
+    assert '"pixel_sha256": model_source_pixel_sha256' in source
+    assert '"pre_transform_pixel_sha256": sha256_bytes(source_bgra)' in source
+    assert "request_sha256=_sha256_file(request_path)" in source
+    assert "candidate_directory.rename(published_directory)" in source
+    assert "기존 SPT 작업 뷰 디렉터리가 불완전해 덮어쓰지 않았어요" in source
+    assert "time.sleep" not in source
+    assert "os.link(temporary, view_path)" not in source
+    assert "_open_or_activate_document(preparation.source.path)" not in source
+    assert "_open_or_activate_document(current.source.path)" not in source
     assert "ocr" not in source.lower()
 
 

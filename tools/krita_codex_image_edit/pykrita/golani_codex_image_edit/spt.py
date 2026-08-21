@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 from uuid import uuid4
 import zlib
 
-from .core import validate_spt_mask_contract
+from .core import safe_stem, validate_spt_mask_contract
 
 
 MASK_NAMES = ("old_text", "new_text", "editable", "protected", "seam_guard")
@@ -90,12 +90,51 @@ class SptPreparation:
         )
 
 
+def spt_working_view_path(
+    project_root: Path,
+    target_id: str,
+    source: SptArtifact,
+) -> Path:
+    """Return a non-aliased path reserved for a display-only SPT working view."""
+
+    digest = source.sha256.lower()
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError("SPT 원본 SHA-256 기록이 잘못됐어요")
+    root = project_root.resolve()
+    view_root = root / "workspace" / "krita-spt" / "view-sources"
+    path = (
+        view_root
+        / safe_stem(target_id, "target")
+        / f"{safe_stem(source.path.stem, 'source')}.{digest[:16]}.rgb-opaque"
+        / "view.png"
+    )
+    try:
+        path.relative_to(view_root)
+        resolved = path.resolve()
+        resolved.relative_to(view_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("SPT 작업 뷰 경로가 전용 폴더 밖을 가리켜요") from exc
+    if resolved != path:
+        raise ValueError("SPT 작업 뷰 경로에 심볼릭 링크나 junction을 사용할 수 없어요")
+    if path.exists() and source.path.exists():
+        try:
+            aliases_source = path.samefile(source.path)
+        except OSError as exc:
+            raise ValueError("SPT 작업 뷰와 불변 원본의 파일 identity를 확인하지 못했어요") from exc
+        if aliases_source:
+            raise ValueError("SPT 작업 뷰가 불변 원본 파일을 직접 가리킬 수 없어요")
+    return path
+
+
 def build_preview_choice_record(
     spt: Mapping[str, Any],
     generation: Mapping[str, Any],
     *,
     status: str,
     created_at: str,
+    request_sha256: str,
 ) -> dict[str, Any]:
     def required_text(value: Any, label: str) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -115,6 +154,21 @@ def build_preview_choice_record(
     artifact = generation.get("artifact")
     if not isinstance(artifact, Mapping):
         raise ValueError("SPT 생성 이미지 SHA 기록이 없어요")
+    alpha_semantics = required_text(spt.get("alpha_semantics"), "alpha semantics")
+    if alpha_semantics != "material":
+        raise ValueError("SPT 원본 alpha semantics는 material이어야 해요")
+    working_view_transform = required_text(
+        spt.get("working_view_transform"),
+        "working view transform",
+    )
+    if working_view_transform != "source-rgb-force-alpha-255:v1":
+        raise ValueError("SPT 불투명 RGB 작업 뷰 변환 기록이 잘못됐어요")
+    working_view = spt.get("working_view")
+    if not isinstance(working_view, Mapping):
+        raise ValueError("SPT 불투명 RGB 작업 뷰 기록이 없어요")
+    model_input = spt.get("model_input")
+    if not isinstance(model_input, Mapping):
+        raise ValueError("SPT imagegen 입력 해시 기록이 없어요")
     mask_values = spt.get("mask_sha256")
     if not isinstance(mask_values, Mapping) or set(mask_values) != set(MASK_NAMES):
         raise ValueError("SPT 5종 mask SHA-256 기록이 완전하지 않아요")
@@ -125,7 +179,7 @@ def build_preview_choice_record(
     if not isinstance(created_at, str) or not created_at:
         raise ValueError("SPT 미리보기 선택 시간이 없어요")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": status,
         "purpose": "human-visual-selection",
         "created_at": created_at,
@@ -133,9 +187,38 @@ def build_preview_choice_record(
         "panel_id": required_text(spt.get("panel_id"), "panel_id"),
         "review_sha256": required_sha256(spt.get("review_sha256"), "review"),
         "source_sha256": required_sha256(spt.get("source_sha256"), "source"),
+        "alpha_semantics": alpha_semantics,
+        "working_view_transform": working_view_transform,
+        "working_view_path": required_text(
+            working_view.get("path"),
+            "working view path",
+        ),
+        "working_view_sha256": required_sha256(
+            working_view.get("file_sha256"),
+            "working view",
+        ),
+        "model_input": {
+            "source_file_sha256": required_sha256(
+                model_input.get("source_file_sha256"),
+                "model source file",
+            ),
+            "source_pixel_sha256": required_sha256(
+                model_input.get("source_pixel_sha256"),
+                "model source pixels",
+            ),
+            "selection_mask_file_sha256": required_sha256(
+                model_input.get("selection_mask_file_sha256"),
+                "model selection mask file",
+            ),
+            "selection_mask_pixel_sha256": required_sha256(
+                model_input.get("selection_mask_pixel_sha256"),
+                "model selection mask pixels",
+            ),
+        },
         "mask_sha256": mask_sha256,
         "generated_sha256": required_sha256(artifact.get("sha256"), "generated image"),
         "request": "request.json",
+        "request_sha256": required_sha256(request_sha256, "request"),
         "next_gate": (
             "external-project-validation" if status == "selected-for-validation" else "none"
         ),
@@ -842,7 +925,8 @@ Asset type: SPT food or drink Texture2D connected-label-face preview
 Target: {target.target_id} / {target.name_ko}
 Panel: {panel.face}
 
-Image 1 is a temporary, deskewed working panel derived from the immutable source mip 0.
+Image 1 is a temporary, deskewed working panel whose RGB is byte-derived from the immutable source mip 0 and whose display-only alpha is forced to 255.
+The immutable source alpha is material data pinned separately and must be restored byte-for-byte downstream; never treat the working-view alpha as output texture data.
 Image 2 is the same-size edit guide. White and gray are editable; black is protected.
 Replace only the listed source lettering with the exact Korean text in one image edit call:
 {chr(10).join(lines)}

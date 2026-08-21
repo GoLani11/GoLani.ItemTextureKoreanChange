@@ -158,6 +158,50 @@ def masked_bgra_layer(
     return bytes(output)
 
 
+def opaque_bgra_view(source_bgra: bytes, width: int, height: int) -> bytes:
+    """Return source RGB unchanged with display-only alpha forced to 255."""
+
+    pixel_count = width * height
+    if width < 1 or height < 1 or len(source_bgra) != pixel_count * 4:
+        raise ValueError("원본 BGRA 픽셀 길이가 크기와 달라요")
+    output = bytearray(source_bgra)
+    output[3::4] = b"\xff" * pixel_count
+    return bytes(output)
+
+
+def validate_opaque_bgra_view(
+    source_bgra: bytes,
+    view_bgra: bytes,
+    width: int,
+    height: int,
+) -> None:
+    """Require an opaque working view with byte-identical source RGB."""
+
+    pixel_count = width * height
+    expected_bytes = pixel_count * 4
+    if (
+        width < 1
+        or height < 1
+        or len(source_bgra) != expected_bytes
+        or len(view_bgra) != expected_bytes
+    ):
+        raise ValueError("원본 또는 작업 뷰 BGRA 픽셀 길이가 크기와 달라요")
+    if view_bgra == opaque_bgra_view(source_bgra, width, height):
+        return
+    rgb_changes = 0
+    nonopaque_pixels = 0
+    for offset in range(0, expected_bytes, 4):
+        if source_bgra[offset : offset + 3] != view_bgra[offset : offset + 3]:
+            rgb_changes += 1
+        if view_bgra[offset + 3] != 255:
+            nonopaque_pixels += 1
+    if rgb_changes or nonopaque_pixels:
+        raise ValueError(
+            "SPT 불투명 작업 뷰 검증 실패: "
+            f"RGB 변경 {rgb_changes}px, 불투명 아님 {nonopaque_pixels}px"
+        )
+
+
 def ensure_selected_pixels_are_opaque(
     source_bgra: bytes,
     selection_mask: bytes,

@@ -94,14 +94,17 @@ from .core import (
     find_spt_project_root,
     is_supported_srgb_profile,
     masked_bgra_layer,
+    opaque_bgra_view,
     safe_stem,
     sha256_bytes,
     spt_panel_mask,
+    validate_opaque_bgra_view,
     validate_spt_mask_contract,
     validate_projection_invariants,
 )
 from .spt import (
     MAX_GENERATION_ATTEMPTS,
+    SptArtifact,
     SptPanel,
     SptPreparation,
     SptTarget,
@@ -113,6 +116,7 @@ from .spt import (
     inspect_spt_target,
     load_spt_target,
     scan_spt_targets,
+    spt_working_view_path,
     write_spt_preparation_request,
 )
 
@@ -202,7 +206,8 @@ class CodexSelectionEditDocker(DockWidget):
         layout.addWidget(explanation)
 
         warning = QLabel(
-            "SPT 준비가 덜 된 품목도 원본과 기존 editable 참고 선택은 열 수 있어요. "
+            "SPT 준비가 덜 된 품목도 RGB 작업 뷰와 기존 editable 참고 선택은 "
+            "열 수 있어요. "
             "analysis와 현재 SHA의 5종 마스크가 모두 통과하기 전에는 생성이 잠기며, "
             "결과는 후속 검증 전 미리보기예요."
         )
@@ -237,7 +242,7 @@ class CodexSelectionEditDocker(DockWidget):
         spt_form.addRow("라벨 면", self._spt_panel_box)
         layout.addLayout(spt_form)
 
-        self._spt_open = QPushButton("SPT 원본·추천 선택 불러오기")
+        self._spt_open = QPushButton("SPT RGB 작업 뷰·추천 선택 불러오기")
         self._spt_open.clicked.connect(self._load_spt_work)
         layout.addWidget(self._spt_open)
 
@@ -352,7 +357,9 @@ class CodexSelectionEditDocker(DockWidget):
             return
         self._clear_spt_context(clear_panels=True)
         if self._is_spt_mode() and self._spt_target_box.currentData():
-            self._set_status("품목을 선택했어요. 원본·추천 선택 불러오기를 눌러 주세요")
+            self._set_status(
+                "품목을 선택했어요. RGB 작업 뷰·추천 선택 불러오기를 눌러 주세요"
+            )
 
     def _clear_spt_context(self, *, clear_panels: bool) -> None:
         self._spt_preparation = None
@@ -497,13 +504,11 @@ class CodexSelectionEditDocker(DockWidget):
             self._operation_failed(str(exc))
 
     def _open_spt_preparation(self, preparation: SptPreparation) -> None:
-        document = _open_or_activate_document(preparation.source.path)
-        if (
-            document.width() != preparation.source.width
-            or document.height() != preparation.source.height
-        ):
-            raise ValueError("Krita에 열린 SPT 원본 크기가 review.json과 달라요")
-        _verify_document_matches_source(document, preparation.source.path)
+        document = _open_spt_working_view(
+            preparation.project_root,
+            preparation.target_id,
+            preparation.source,
+        )
 
         reference_mask: bytes | None = None
         reference_error = preparation.mask_error
@@ -540,7 +545,7 @@ class CodexSelectionEditDocker(DockWidget):
         if reference_mask is not None:
             self._spt_panel_box.addItem("준비 참고 · 전체 editable 선택 (생성 잠김)")
         else:
-            self._spt_panel_box.addItem("준비 참고 · 원본만 열림 (생성 잠김)")
+            self._spt_panel_box.addItem("준비 참고 · RGB 작업 뷰만 열림 (생성 잠김)")
 
         reasons: list[str] = []
         if preparation.analysis_errors:
@@ -555,7 +560,11 @@ class CodexSelectionEditDocker(DockWidget):
                 f"생성 예산 승인 필요: 기록 {preparation.recorded_generation_attempts}/"
                 f"{MAX_GENERATION_ATTEMPTS}회"
             )
-        opened = "원본과 기존 editable 참고 선택" if reference_mask else "원본"
+        opened = (
+            "RGB 작업 뷰와 기존 editable 참고 선택"
+            if reference_mask
+            else "RGB 작업 뷰"
+        )
         detail = " · ".join(reasons) or "안전 게이트 준비 필요"
         self._set_status(
             f"{preparation.name_ko} {opened}을 열었어요. 생성은 잠겨 있어요. "
@@ -616,10 +625,11 @@ class CodexSelectionEditDocker(DockWidget):
             [region.bbox for region in panel.regions],
             panel_padding,
         )
-        document = _open_or_activate_document(current.source.path)
-        if document.width() != current.source.width or document.height() != current.source.height:
-            raise ValueError("Krita에 열린 SPT 원본 크기가 review.json과 달라요")
-        _verify_document_matches_source(document, current.source.path)
+        document = _open_spt_working_view(
+            current.project_root,
+            current.target_id,
+            current.source,
+        )
         _set_spt_selection(
             document,
             allowed,
@@ -771,7 +781,7 @@ class CodexSelectionEditDocker(DockWidget):
 
     def _validated_spt_context(self) -> tuple[SptTarget, SptPanel, bytes]:
         if self._spt_target is None or self._spt_panel is None or self._spt_allowed_mask is None:
-            raise ValueError("먼저 SPT 원본·추천 선택을 불러와 주세요")
+            raise ValueError("먼저 SPT RGB 작업 뷰·추천 선택을 불러와 주세요")
         target = load_spt_target(
             self._spt_target.project_root,
             self._spt_target.target_id,
@@ -833,11 +843,18 @@ class CodexSelectionEditDocker(DockWidget):
         if spt_target is not None:
             if spt_root != spt_target.project_root:
                 raise ValueError("현재 문서가 선택한 SPT 프로젝트 원본이 아니에요")
-            if Path(document.fileName()).resolve() != spt_target.source.path:
-                raise ValueError("현재 문서가 선택한 SPT 품목의 불변 원본 PNG가 아니에요")
+            working_view_path = _ensure_spt_working_view(
+                spt_target.project_root,
+                spt_target.target_id,
+                spt_target.source,
+            )
+            if Path(document.fileName()).resolve() != working_view_path:
+                raise ValueError(
+                    "현재 문서가 선택한 SPT 품목의 불투명 RGB 작업 뷰가 아니에요"
+                )
             if spt_panel is None or spt_allowed_mask is None:
                 raise ValueError("SPT 라벨 면 선택 증거가 없어요")
-            _verify_document_matches_source(document, spt_target.source.path)
+            _verify_spt_working_view(document, spt_target.source)
         selection = document.selection()
         if selection is None or selection.width() <= 0 or selection.height() <= 0:
             raise ValueError("수정할 영역을 먼저 선택해 주세요")
@@ -958,6 +975,10 @@ class CodexSelectionEditDocker(DockWidget):
         job_dir.mkdir(parents=True, exist_ok=False)
         _save_bgra_png(source_path, model_source_bgra, model_width, model_height)
         _save_mask_png(mask_path, model_selection_mask, model_width, model_height)
+        model_source_file_sha256 = _sha256_file(source_path)
+        model_source_pixel_sha256 = sha256_bytes(model_source_bgra)
+        model_mask_file_sha256 = _sha256_file(mask_path)
+        model_mask_pixel_sha256 = sha256_bytes(model_selection_mask)
 
         root_id = _node_id(document.rootNode())
         request_path = job_dir / "request.json"
@@ -985,12 +1006,16 @@ class CodexSelectionEditDocker(DockWidget):
             },
             "source": {
                 "path": source_path.name,
-                "file_sha256": _sha256_file(source_path),
-                "pixel_sha256": sha256_bytes(source_bgra),
+                "file_sha256": model_source_file_sha256,
+                "pixel_sha256": model_source_pixel_sha256,
+                "pre_transform_pixel_sha256": sha256_bytes(source_bgra),
             },
             "mask": {
                 "path": mask_path.name,
-                "sha256": _sha256_file(mask_path),
+                "sha256": model_mask_file_sha256,
+                "file_sha256": model_mask_file_sha256,
+                "pixel_sha256": model_mask_pixel_sha256,
+                "pre_transform_pixel_sha256": sha256_bytes(selection_mask),
                 "meaning": "0=protected, 1..255=editable selectedness",
             },
             "instruction": self._prompt.toPlainText().strip(),
@@ -1031,6 +1056,23 @@ class CodexSelectionEditDocker(DockWidget):
                 ).as_posix(),
                 "review_sha256": spt_target.review_sha256,
                 "source_sha256": spt_target.source.sha256,
+                "alpha_semantics": "material",
+                "working_view_transform": "source-rgb-force-alpha-255:v1",
+                "working_view": {
+                    "path": working_view_path.relative_to(
+                        spt_target.project_root
+                    ).as_posix(),
+                    "file_sha256": _sha256_file(working_view_path),
+                    "rgb": "byte-identical-to-pinned-source",
+                    "alpha": 255,
+                    "display_only": True,
+                },
+                "model_input": {
+                    "source_file_sha256": model_source_file_sha256,
+                    "source_pixel_sha256": model_source_pixel_sha256,
+                    "selection_mask_file_sha256": model_mask_file_sha256,
+                    "selection_mask_pixel_sha256": model_mask_pixel_sha256,
+                },
                 "mask_sha256": {
                     name: artifact.sha256 for name, artifact in spt_target.masks.items()
                 },
@@ -1113,6 +1155,8 @@ class CodexSelectionEditDocker(DockWidget):
                     "layer_name": layer_name,
                     "outside_selection_changes": 0,
                     "alpha_changes": 0,
+                    "alpha_change_scope": "opaque-working-view",
+                    "canonical_source_modified": False,
                     "undo": "single layer-add command",
                     "transform": transform,
                 },
@@ -1310,14 +1354,16 @@ class CodexSelectionEditDocker(DockWidget):
             generation = request.get("generation")
             if not isinstance(spt, dict) or not isinstance(generation, dict):
                 raise ValueError("SPT 생성 기록이 완전하지 않아요")
+            decided_spt = {**spt, "decision": decision}
+            _update_request(request_path, spt=decided_spt)
             decision_record = build_preview_choice_record(
-                spt,
+                decided_spt,
                 generation,
                 status=decision,
                 created_at=datetime.now(timezone.utc).isoformat(),
+                request_sha256=_sha256_file(request_path),
             )
             _write_json(job_dir / "decision.json", decision_record)
-            _update_request(request_path, spt={**spt, "decision": decision})
         except Exception as exc:
             self._operation_failed(f"SPT 결과 선택을 기록하지 못했어요: {exc}")
             return
@@ -1420,6 +1466,138 @@ def _read_mask_bytes(path: Path, width: int, height: int) -> bytes:
     return _grayscale_image_bytes(image, width, height)
 
 
+def _read_pinned_spt_source(source: SptArtifact) -> bytes:
+    if not source.path.is_file() or _sha256_file(source.path) != source.sha256:
+        raise ValueError("SPT 불변 원본 PNG가 review.json의 SHA-256과 달라요")
+    pixels, width, height = _read_result_bgra(
+        source.path,
+        source.width,
+        source.height,
+    )
+    if (width, height) != (source.width, source.height):
+        raise ValueError("SPT 원본 PNG 크기가 review.json과 달라요")
+    if _sha256_file(source.path) != source.sha256:
+        raise ValueError("SPT 불변 원본 PNG가 픽셀을 읽는 중 바뀌었어요")
+    return pixels
+
+
+def _validate_spt_working_view_file(
+    view_path: Path,
+    canonical_pixels: bytes,
+    source: SptArtifact,
+) -> None:
+    if view_path.exists() and source.path.exists() and view_path.samefile(source.path):
+        raise ValueError("SPT 작업 뷰가 불변 원본 파일을 직접 가리킬 수 없어요")
+    view_pixels, width, height = _read_result_bgra(
+        view_path,
+        source.width,
+        source.height,
+    )
+    if (width, height) != (source.width, source.height):
+        raise ValueError(f"SPT 작업 뷰 크기가 원본과 달라요: {view_path}")
+    try:
+        validate_opaque_bgra_view(
+            canonical_pixels,
+            view_pixels,
+            source.width,
+            source.height,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"기존 SPT 작업 뷰가 고정된 원본 RGB와 달라 덮어쓰지 않았어요: "
+            f"{view_path} ({exc})"
+        ) from exc
+
+
+def _publish_spt_working_view(
+    candidate_directory: Path,
+    view_path: Path,
+    canonical_pixels: bytes,
+    source: SptArtifact,
+) -> None:
+    published_directory = view_path.parent
+    if published_directory.exists():
+        if not view_path.is_file():
+            raise ValueError(
+                "기존 SPT 작업 뷰 디렉터리가 불완전해 덮어쓰지 않았어요: "
+                f"{published_directory}"
+            )
+        _validate_spt_working_view_file(view_path, canonical_pixels, source)
+        return
+    try:
+        candidate_directory.rename(published_directory)
+    except OSError:
+        if not view_path.is_file():
+            raise
+    _validate_spt_working_view_file(view_path, canonical_pixels, source)
+
+
+def _ensure_spt_working_view(
+    project_root: Path,
+    target_id: str,
+    source: SptArtifact,
+) -> Path:
+    view_path = spt_working_view_path(project_root, target_id, source)
+    canonical_pixels = _read_pinned_spt_source(source)
+    expected_pixels = opaque_bgra_view(canonical_pixels, source.width, source.height)
+    if view_path.is_file():
+        _validate_spt_working_view_file(view_path, canonical_pixels, source)
+        return view_path
+
+    published_directory = view_path.parent
+    if published_directory.exists():
+        raise ValueError(
+            "기존 SPT 작업 뷰 디렉터리가 불완전해 덮어쓰지 않았어요: "
+            f"{published_directory}"
+        )
+    published_directory.parent.mkdir(parents=True, exist_ok=True)
+    candidate_directory = published_directory.with_name(
+        f".{published_directory.name}.{uuid4().hex}.tmp"
+    )
+    candidate_directory.mkdir(exist_ok=False)
+    temporary = candidate_directory / view_path.name
+    try:
+        _save_bgra_png(temporary, expected_pixels, source.width, source.height)
+        written_pixels, width, height = _read_result_bgra(
+            temporary,
+            source.width,
+            source.height,
+        )
+        if (width, height) != (source.width, source.height):
+            raise ValueError("SPT 작업 뷰를 원본 크기로 저장하지 못했어요")
+        validate_opaque_bgra_view(
+            canonical_pixels,
+            written_pixels,
+            source.width,
+            source.height,
+        )
+        _publish_spt_working_view(
+            candidate_directory,
+            view_path,
+            canonical_pixels,
+            source,
+        )
+    finally:
+        if temporary.is_file():
+            temporary.unlink()
+        if candidate_directory.is_dir():
+            candidate_directory.rmdir()
+    if spt_working_view_path(project_root, target_id, source) != view_path:
+        raise ValueError("게시된 SPT 작업 뷰 경로 identity가 바뀌었어요")
+    return view_path
+
+
+def _open_spt_working_view(
+    project_root: Path,
+    target_id: str,
+    source: SptArtifact,
+) -> Any:
+    view_path = _ensure_spt_working_view(project_root, target_id, source)
+    document = _open_or_activate_document(view_path)
+    _verify_spt_working_view(document, source)
+    return document
+
+
 def _open_or_activate_document(path: Path) -> Any:
     application = Krita.instance()
     wanted = path.resolve()
@@ -1434,10 +1612,10 @@ def _open_or_activate_document(path: Path) -> Any:
     if document is None:
         document = application.openDocument(str(wanted))
         if document is None:
-            raise ValueError(f"Krita가 SPT 원본을 열지 못했어요: {wanted}")
+            raise ValueError(f"Krita가 SPT 불투명 RGB 작업 뷰를 열지 못했어요: {wanted}")
         window = application.activeWindow()
         if window is None:
-            raise ValueError("SPT 원본을 표시할 Krita 창이 없어요")
+            raise ValueError("SPT 작업 뷰를 표시할 Krita 창이 없어요")
         window.addView(document)
     application.setActiveDocument(document)
     document.waitForDone()
@@ -1457,27 +1635,26 @@ def _set_spt_selection(document: Any, pixels: bytes, width: int, height: int) ->
     document.waitForDone()
 
 
-def _verify_document_matches_source(document: Any, source_path: Path) -> None:
+def _verify_spt_working_view(document: Any, source: SptArtifact) -> None:
     bounds = document.bounds()
     if int(bounds.x()) != 0 or int(bounds.y()) != 0:
-        raise ValueError("SPT 불변 원본 문서의 캔버스 offset이 0이 아니에요")
+        raise ValueError("SPT 작업 뷰의 캔버스 offset이 0이 아니에요")
     width = int(bounds.width())
     height = int(bounds.height())
     if width * height > MAX_CONTEXT_PIXELS:
         raise ValueError("SPT 원본이 안전 픽셀 제한을 초과해 전체 불변성을 확인할 수 없어요")
-    source_pixels, source_width, source_height = _read_result_bgra(
-        source_path,
-        width,
-        height,
-    )
-    if (source_width, source_height) != (width, height):
-        raise ValueError("SPT 원본 PNG 크기와 Krita 문서 크기가 달라요")
+    if (width, height) != (source.width, source.height):
+        raise ValueError("SPT 원본 PNG 크기와 Krita 작업 뷰 크기가 달라요")
+    source_pixels = _read_pinned_spt_source(source)
     document_pixels = bytes(document.pixelData(0, 0, width, height))
-    if document_pixels != source_pixels:
+    try:
+        validate_opaque_bgra_view(source_pixels, document_pixels, width, height)
+    except ValueError as exc:
         raise ValueError(
-            "열린 SPT 문서가 불변 원본과 달라요. 기존 미리보기 레이어를 Ctrl+Z로 "
-            "제거하거나 저장하지 않고 문서를 다시 연 뒤 작업해 주세요"
-        )
+            "열린 SPT 작업 뷰가 불변 원본 RGB와 달라요. 기존 미리보기 레이어를 "
+            "Ctrl+Z로 제거하거나 저장하지 않고 문서를 다시 연 뒤 작업해 주세요. "
+            f"({exc})"
+        ) from exc
 
 
 def _deskew_panel(
