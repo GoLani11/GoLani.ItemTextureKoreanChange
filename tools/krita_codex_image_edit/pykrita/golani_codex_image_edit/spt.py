@@ -64,6 +64,20 @@ class SptTarget:
 
 
 @dataclass(frozen=True)
+class SptFreeEditTarget:
+    project_root: Path
+    target_id: str
+    name_ko: str
+    texture: str
+    bundle_key: str
+    profile_path: Path
+    profile_sha256: str
+    review_path: Path
+    review_sha256: str
+    source: SptArtifact
+
+
+@dataclass(frozen=True)
 class SptPreparation:
     project_root: Path
     target_id: str
@@ -286,7 +300,10 @@ def scan_spt_targets(root: Path) -> tuple[SptTargetSummary, ...]:
         review_sha256 = _sha256(review_path) if review_path.is_file() else None
         try:
             preparation = inspect_spt_target(root, target_id, profile=profile)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        except Exception as exc:
+            # Final-validation diagnostics are advisory in the free-edit picker.
+            # Isolate every target-local failure so one broken analysis cannot hide
+            # unrelated immutable sources from the preview-only workflow.
             recorded_attempts = _recorded_attempts_from_review(review_path)
             budget_exhausted = recorded_attempts >= MAX_GENERATION_ATTEMPTS
             issues = [str(exc)]
@@ -705,6 +722,63 @@ def inspect_spt_target(
         mask_error=mask_error,
         recorded_generation_attempts=recorded_attempts,
         all_panel_budgets_exhausted=all_exhausted,
+    )
+
+
+def load_spt_free_edit_target(root: Path, target_id: str) -> SptFreeEditTarget:
+    """Load only the immutable identity needed for an unvalidated SPT preview."""
+
+    root = root.expanduser().resolve()
+    profile, profile_sha256 = _load_profile_snapshot(root)
+    profile_target = next(
+        (item for item in profile["targets"] if item.get("id") == target_id),
+        None,
+    )
+    if not isinstance(profile_target, dict):
+        raise ValueError(f"SPT profile에 대상이 없어요: {target_id}")
+
+    texture = profile_target.get("texture")
+    bundle_key = profile_target.get("bundle_key")
+    if not isinstance(texture, str) or not texture.strip():
+        raise ValueError("SPT profile의 Texture2D 이름이 없어요")
+    if not isinstance(bundle_key, str) or not bundle_key.strip():
+        raise ValueError("SPT profile의 원본 bundle key가 없어요")
+
+    profile_path = root / "profiles" / "food" / "collection.json"
+    review_path = root / "workspace" / "reviews" / target_id / "review.json"
+    if not review_path.is_file():
+        raise ValueError(f"원본 기록이 없어요: {review_path}")
+    record, review_sha256 = _read_json_snapshot(review_path)
+    if record.get("target_id") != target_id:
+        raise ValueError("review.json의 target_id가 선택한 품목과 달라요")
+
+    source_data = record.get("source")
+    if not isinstance(source_data, dict):
+        raise ValueError("review.json에 원본 명세가 없어요")
+    if source_data.get("bundle_key") != bundle_key:
+        raise ValueError("review.json의 원본 bundle key가 profile과 달라요")
+    if source_data.get("texture") != texture:
+        raise ValueError("review.json의 Texture2D 이름이 profile과 달라요")
+    source = _artifact_from_descriptor(root, source_data, "source", require_size=True)
+
+    if _sha256(profile_path) != profile_sha256:
+        raise ValueError("profile이 검사 중 바뀌었어요. 품목을 다시 불러와 주세요")
+    if _sha256(review_path) != review_sha256:
+        raise ValueError("review.json이 검사 중 바뀌었어요. 품목을 다시 불러와 주세요")
+    if _sha256(source.path) != source.sha256:
+        raise ValueError("source가 검사 중 바뀌었어요. 품목을 다시 불러와 주세요")
+
+    return SptFreeEditTarget(
+        project_root=root,
+        target_id=target_id,
+        name_ko=str(profile_target.get("name_ko", target_id)),
+        texture=texture,
+        bundle_key=bundle_key,
+        profile_path=profile_path,
+        profile_sha256=profile_sha256,
+        review_path=review_path,
+        review_sha256=review_sha256,
+        source=source,
     )
 
 

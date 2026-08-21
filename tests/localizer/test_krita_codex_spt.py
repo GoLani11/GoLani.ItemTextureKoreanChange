@@ -154,6 +154,49 @@ def _update_mask_descriptor(root: Path, name: str) -> None:
     review_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
 
 
+def test_free_edit_loader_ignores_analysis_masks_action_and_budget(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    profile_path = root / "profiles/food/collection.json"
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["targets"][0]["action"] = "preserve"
+    profile_path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+
+    review_path = root / "workspace/reviews/can/review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    review["action"] = "localize"
+    review["expected_text"] = ["stale"]
+    review["stages"] = {
+        "source_visual": {"status": "pending"},
+        "edit_plan": {
+            "status": "pending",
+            "data": {"generation_attempts": 99, "masks": "broken"},
+        },
+    }
+    review_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
+
+    target = spt.load_spt_free_edit_target(root, "can")
+
+    assert target.target_id == "can"
+    assert target.name_ko == "시험 캔"
+    assert target.texture == "can_diff"
+    assert target.bundle_key == "assets/can.bundle"
+    assert target.profile_path == profile_path
+    assert target.profile_sha256 == hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    assert target.review_path == review_path
+    assert target.review_sha256 == hashlib.sha256(review_path.read_bytes()).hexdigest()
+    assert target.source.project_path == "workspace/source/can.png"
+    assert target.source.sha256 == hashlib.sha256(b"source").hexdigest()
+    assert (target.source.width, target.source.height) == (4, 4)
+
+
+def test_free_edit_loader_rejects_source_sha_drift(tmp_path: Path) -> None:
+    root = _project(tmp_path)
+    (root / "workspace/source/can.png").write_bytes(b"changed")
+
+    with pytest.raises(ValueError, match="현재 파일 SHA"):
+        spt.load_spt_free_edit_target(root, "can")
+
+
 def _preview_spt_identity() -> dict[str, object]:
     return {
         "target_id": "can",
@@ -335,6 +378,57 @@ def test_scan_reports_analysis_and_mask_problems_together(
     assert summary.preparation_required
     assert summary.issues[0] == "translation: pending"
     assert "5종 편집 마스크" in summary.issues[1]
+
+
+@pytest.mark.parametrize("malformed_stage", ["stages", "edit_plan", "translation"])
+def test_scan_isolates_malformed_stages_and_keeps_free_preview_target(
+    tmp_path: Path,
+    malformed_stage: str,
+) -> None:
+    root = _project(tmp_path)
+    review_path = root / "workspace/reviews/can/review.json"
+    review = json.loads(review_path.read_text(encoding="utf-8"))
+    if malformed_stage == "stages":
+        review["stages"] = []
+    else:
+        review["stages"][malformed_stage] = []
+    review_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
+
+    summaries = spt.scan_spt_targets(root)
+
+    assert [item.target_id for item in summaries] == ["can", "keep"]
+    summary = summaries[0]
+    assert summary.status == "record-or-source-error"
+    assert summary.state == "원본·기록 확인 필요"
+    assert summary.preparation_required
+    assert not summary.ready
+    assert "record-or-source-error" in summary.issue_codes
+    assert any("attribute 'get'" in issue for issue in summary.issues)
+    assert summaries[1].status == "preserve"
+
+    free_target = spt.load_spt_free_edit_target(root, "can")
+    assert free_target.target_id == "can"
+
+
+def test_scan_isolates_final_validator_runtime_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _project(tmp_path)
+
+    def fail_validation(root: Path, record: dict[str, object]) -> list[str]:
+        del root, record
+        raise RuntimeError("validator crashed")
+
+    monkeypatch.setattr(spt, "_validate_analysis_with_project_script", fail_validation)
+
+    summaries = spt.scan_spt_targets(root)
+
+    assert [item.target_id for item in summaries] == ["can", "keep"]
+    assert summaries[0].status == "record-or-source-error"
+    assert summaries[0].issues[0] == "validator crashed"
+    assert summaries[1].status == "preserve"
+    assert spt.load_spt_free_edit_target(root, "can").target_id == "can"
 
 
 def test_scan_checks_current_mask_sha(
@@ -861,54 +955,152 @@ def test_load_target_binds_profile_hashes_panels_and_prompt(
     assert "source alpha is material data" in prompt
 
 
-def test_docker_selection_ui_has_no_plugin_ocr_wording() -> None:
+def test_docker_exposes_spt_free_selection_preview_without_candidate_approval() -> None:
     source = (
         ROOT
         / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
     ).read_text(encoding="utf-8")
 
-    assert 'QPushButton("이 결과 선택")' in source
-    assert 'QPushButton("결과 제외")' in source
-    assert 'QPushButton("SPT RGB 작업 뷰·추천 선택 불러오기")' in source
-    assert '_record_spt_preview_choice("selected-for-validation")' in source
-    assert '_record_spt_preview_choice("discarded")' in source
-    assert 'QPushButton("전체 준비 요청 기록")' in source
+    assert 'self._mode.addItem("SPT 자유 선택 편집", "spt")' in source
+    assert 'QPushButton("SPT RGB 작업 뷰 열기")' in source
+    assert 'QPushButton("생성형 채우기")' in source
+    assert 'QPushButton("최종 검증 준비 요청 만들기")' in source
     assert "spt_targets_ready = pyqtSignal(object)" in source
     assert "self._shutting_down = False" in source
     assert "if self._shutting_down:" in source
     assert "self._shutting_down = True" in source
     assert "session.shutdown()" in source
-    assert "[SPT 검증 전 미리보기]" in source
+    assert "generation_ready = pyqtSignal(object)" in source
+    assert "[SPT 자유 선택 AI 미리보기]" in source
     assert "_open_spt_working_view(" in source
-    assert "_verify_spt_working_view(" in source
+    assert "_verify_spt_working_document(" in source
+    assert "base.pixelData(" in source
+    assert "base.projectionPixelData(" in source
+    assert '"base_layer_node_id": spt_base_node_id' in source
     assert "source-rgb-force-alpha-255:v1" in source
+    assert '"mode": "free-selection-preview"' in source
+    assert '"selection_policy": "user-krita-selection-v1"' in source
+    assert '"candidate_approved": False' in source
+    assert '"generated_file_sha256": expected_generated_sha256' in source
+    assert '"masked_layer_pixel_sha256": sha256_bytes(layer_pixels)' in source
+    assert '"projection_after_pixel_sha256": sha256_bytes(after)' in source
     assert '"pixel_sha256": model_source_pixel_sha256' in source
     assert '"pre_transform_pixel_sha256": sha256_bytes(source_bgra)' in source
-    assert "request_sha256=_sha256_file(request_path)" in source
     assert "candidate_directory.rename(published_directory)" in source
     assert "기존 SPT 작업 뷰 디렉터리가 불완전해 덮어쓰지 않았어요" in source
     assert "time.sleep" not in source
     assert "os.link(temporary, view_path)" not in source
     assert "_open_or_activate_document(preparation.source.path)" not in source
     assert "_open_or_activate_document(current.source.path)" not in source
-    assert "ocr" not in source.lower()
+    assert "_spt_allowed_mask" not in source
+    assert "ensure_selection_is_spt_subset" not in source
+    assert "spt_panel_mask" not in source
+    assert "_set_spt_selection" not in source
+    assert "build_spt_prompt" not in source
+    assert "OCR 실행" not in source
 
 
-def test_docker_clears_previous_panel_context_before_switching_panel() -> None:
+def test_docker_spt_open_clears_selection_instead_of_applying_editable() -> None:
     source = (
         ROOT
         / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
     ).read_text(encoding="utf-8")
-    start = source.index("    def _spt_panel_changed(self) -> None:")
-    end = source.index("    def _open_spt_panel(", start)
-    handler = source[start:end]
+    start = source.index("    def _load_spt_work(self) -> None:")
+    end = source.index("    def _browse_workspace", start)
+    loader = source[start:end]
 
-    assert handler.index("self._spt_panel = None") < handler.index(
-        "self._open_spt_panel(self._spt_target, panel)"
+    assert "load_spt_free_edit_target" in loader
+    assert "_clear_document_selection(document)" in loader
+    assert "_read_mask_bytes" not in loader
+    assert "_set_spt_selection" not in loader
+    assert "panel" not in loader
+
+
+def test_docker_spt_reuses_preview_projection_but_pins_bottom_source_layer() -> None:
+    source = (
+        ROOT
+        / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("def _verify_spt_working_document(")
+    end = source.index("\ndef _deskew_panel(", start)
+    verifier = source[start:end]
+
+    assert "root = document.rootNode()" in verifier
+    assert "children = root.childNodes()" in verifier
+    assert "base.pixelData(" in verifier
+    assert "base.projectionPixelData(" in verifier
+    assert "validate_opaque_bgra_view(source_pixels, base_pixels" in verifier
+    assert "validate_opaque_bgra_view(source_pixels, base_projection" in verifier
+    assert "document.pixelData(" not in verifier
+    assert 'base.type() != "paintlayer"' in verifier
+    assert "not base.visible()" in verifier
+    assert "int(base.opacity()) != 255" in verifier
+    assert 'base.blendingMode() != "normal"' in verifier
+    assert "base.inheritAlpha()" in verifier
+    assert "base.childNodes()" in verifier
+    assert "channels = base.channels()" in verifier
+    assert "len(channels) != 4" in verifier
+    assert "any(not channel.visible() for channel in channels)" in verifier
+    assert "base.layerStyleToAsl().strip()" in verifier
+    assert "base.animated()" in verifier
+    assert "position = base.position()" in verifier
+    assert "int(position.x()) != 0" in verifier
+    assert 'document.colorModel() != "RGBA"' in verifier
+    assert "base.colorProfile() != document.colorProfile()" in verifier
+    assert verifier.index("document.refreshProjection()") < verifier.index(
+        "base.projectionPixelData("
     )
-    assert handler.index("self._spt_allowed_mask = None") < handler.index(
-        "self._open_spt_panel(self._spt_target, panel)"
+
+
+def test_docker_spt_capture_uses_current_selection_without_subset_gate() -> None:
+    source = (
+        ROOT
+        / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("    def _capture_snapshot(")
+    end = source.index("    def _generation_ready(", start)
+    capture = source[start:end]
+
+    assert "selection.pixelData(" in capture
+    assert '"selection_policy": "user-krita-selection-v1"' in capture
+    assert "build_edit_prompt(" in capture
+    assert "ensure_selection_is_spt_subset" not in capture
+    assert "spt_panel_mask" not in capture
+
+
+def test_docker_revalidates_generated_artifact_before_applying() -> None:
+    source = (
+        ROOT
+        / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("    def _apply_generated(")
+    end = source.index("    def _cancel(", start)
+    apply_generated = source[start:end]
+
+    assert apply_generated.count(
+        "_sha256_file(generated_path) != expected_generated_sha256"
+    ) == 3
+    assert "expected_generated_path = (snapshot.job_dir / \"generated.png\").resolve()" in (
+        apply_generated
     )
+    assert "written_layer_pixels = bytes(" in apply_generated
+    assert "sha256_bytes(written_layer_pixels) != sha256_bytes(layer_pixels)" in (
+        apply_generated
+    )
+    assert apply_generated.count("_validate_snapshot_context(snapshot)") == 2
+
+
+def test_docker_failed_attach_removes_exact_layer_without_global_undo() -> None:
+    source = (
+        ROOT
+        / "tools/krita_codex_image_edit/pykrita/golani_codex_image_edit/docker.py"
+    ).read_text(encoding="utf-8")
+    start = source.index("def _undo_failed_attach(")
+    end = source.index("\ndef _write_json(", start)
+    rollback = source[start:end]
+
+    assert "root.removeChildNode(layer)" in rollback
+    assert 'action("edit_undo")' not in rollback
 
 
 def test_load_target_rejects_official_analysis_failure(

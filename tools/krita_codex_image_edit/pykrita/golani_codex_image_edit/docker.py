@@ -89,7 +89,6 @@ from .core import (
     CropRect,
     build_edit_prompt,
     context_crop,
-    ensure_selection_is_spt_subset,
     ensure_selected_pixels_are_opaque,
     find_spt_project_root,
     is_supported_srgb_profile,
@@ -97,24 +96,14 @@ from .core import (
     opaque_bgra_view,
     safe_stem,
     sha256_bytes,
-    spt_panel_mask,
     validate_opaque_bgra_view,
-    validate_spt_mask_contract,
     validate_projection_invariants,
 )
 from .spt import (
-    MAX_GENERATION_ATTEMPTS,
     SptArtifact,
-    SptPanel,
-    SptPreparation,
-    SptTarget,
+    SptFreeEditTarget,
     SptTargetSummary,
-    build_preview_choice_record,
-    build_spt_prompt,
-    current_generation_attempts,
-    first_available_spt_panel,
-    inspect_spt_target,
-    load_spt_target,
+    load_spt_free_edit_target,
     scan_spt_targets,
     spt_working_view_path,
     write_spt_preparation_request,
@@ -154,13 +143,14 @@ class _Snapshot:
     model_height: int
     deskew_rotation_deg: float
     spt: dict[str, Any] | None
+    spt_target: SptFreeEditTarget | None
 
 
 class _Signals(QObject):
     status = pyqtSignal(str)
     spt_targets_ready = pyqtSignal(object)
     connection_ready = pyqtSignal(object)
-    generation_ready = pyqtSignal(str)
+    generation_ready = pyqtSignal(object)
     failed = pyqtSignal(str)
 
 
@@ -179,14 +169,10 @@ class CodexSelectionEditDocker(DockWidget):
         self._session: CodexAppServer | None = None
         self._session_executable: str | None = None
         self._pending_snapshot: _Snapshot | None = None
-        self._spt_preparation: SptPreparation | None = None
         self._spt_summaries: tuple[SptTargetSummary, ...] = ()
         self._spt_scan_root: Path | None = None
         self._spt_preparation_request_path: Path | None = None
-        self._spt_target: SptTarget | None = None
-        self._spt_panel: SptPanel | None = None
-        self._spt_allowed_mask: bytes | None = None
-        self._last_spt_job_dir: Path | None = None
+        self._spt_edit_target: SptFreeEditTarget | None = None
         self._busy = False
         self._build_ui()
         self.destroyed.connect(self._shutdown)
@@ -206,18 +192,17 @@ class CodexSelectionEditDocker(DockWidget):
         layout.addWidget(explanation)
 
         warning = QLabel(
-            "SPT 준비가 덜 된 품목도 RGB 작업 뷰와 기존 editable 참고 선택은 "
-            "열 수 있어요. "
-            "analysis와 현재 SHA의 5종 마스크가 모두 통과하기 전에는 생성이 잠기며, "
-            "결과는 후속 검증 전 미리보기예요."
+            "SPT 모드는 불변 원본의 RGB만 복사한 작업 뷰를 열어요. "
+            "Krita에서 원하는 영역을 자유롭게 선택해 생성형 채우기를 사용할 수 있고, "
+            "analysis와 5종 마스크는 최종 후보 검증 단계에서만 적용돼요."
         )
         warning.setWordWrap(True)
         warning.setStyleSheet("color: #c58a35;")
         layout.addWidget(warning)
 
         self._mode = QComboBox()
-        self._mode.addItem("일반 이미지 선택 편집", "generic")
-        self._mode.addItem("SPT 준비 작업", "spt")
+        self._mode.addItem("일반 생성형 채우기", "generic")
+        self._mode.addItem("SPT 자유 선택 편집", "spt")
         saved_mode = self._read_setting("mode", "generic")
         self._mode.setCurrentIndex(1 if saved_mode == "spt" else 0)
         self._mode.currentIndexChanged.connect(self._mode_changed)
@@ -237,24 +222,20 @@ class CodexSelectionEditDocker(DockWidget):
         self._spt_target_box = QComboBox()
         self._spt_target_box.currentIndexChanged.connect(self._spt_target_changed)
         spt_form.addRow("품목", self._spt_target_box)
-        self._spt_panel_box = QComboBox()
-        self._spt_panel_box.currentIndexChanged.connect(self._spt_panel_changed)
-        spt_form.addRow("라벨 면", self._spt_panel_box)
         layout.addLayout(spt_form)
 
-        self._spt_open = QPushButton("SPT RGB 작업 뷰·추천 선택 불러오기")
+        self._spt_open = QPushButton("SPT RGB 작업 뷰 열기")
         self._spt_open.clicked.connect(self._load_spt_work)
         layout.addWidget(self._spt_open)
 
-        self._spt_prepare_all = QPushButton("전체 준비 요청 기록")
+        self._spt_prepare_all = QPushButton("최종 검증 준비 요청 만들기")
         self._spt_prepare_all.setEnabled(False)
         self._spt_prepare_all.clicked.connect(self._record_spt_preparation_request)
         layout.addWidget(self._spt_prepare_all)
 
         self._prompt = QPlainTextEdit()
         self._prompt.setPlaceholderText(
-            "일반 모드: 전체 수정 지시\n"
-            "SPT 모드: 확정 번역은 review.json에서 고정되므로 이번 시도의 추가 시각 보정만 입력"
+            "Krita에서 선택한 영역에 적용할 변경 내용을 입력하세요"
         )
         self._prompt.setMinimumHeight(110)
         layout.addWidget(self._prompt)
@@ -295,29 +276,14 @@ class CodexSelectionEditDocker(DockWidget):
         self._check_button = QPushButton("연결 확인")
         self._check_button.clicked.connect(self._check_connection)
         button_row.addWidget(self._check_button)
-        self._edit_button = QPushButton("선택 영역 수정")
+        self._edit_button = QPushButton("생성형 채우기")
         self._edit_button.clicked.connect(self._start_edit)
         button_row.addWidget(self._edit_button)
-        self._cancel_button = QPushButton("취소")
+        self._cancel_button = QPushButton("생성 취소")
         self._cancel_button.setEnabled(False)
         self._cancel_button.clicked.connect(self._cancel)
         button_row.addWidget(self._cancel_button)
         layout.addLayout(button_row)
-
-        decision_row = QHBoxLayout()
-        self._spt_accept_button = QPushButton("이 결과 선택")
-        self._spt_accept_button.setEnabled(False)
-        self._spt_accept_button.clicked.connect(
-            lambda: self._record_spt_preview_choice("selected-for-validation")
-        )
-        decision_row.addWidget(self._spt_accept_button)
-        self._spt_reject_button = QPushButton("결과 제외")
-        self._spt_reject_button.setEnabled(False)
-        self._spt_reject_button.clicked.connect(
-            lambda: self._record_spt_preview_choice("discarded")
-        )
-        decision_row.addWidget(self._spt_reject_button)
-        layout.addLayout(decision_row)
 
         self._status = QLabel("준비됨")
         self._status.setWordWrap(True)
@@ -337,7 +303,6 @@ class CodexSelectionEditDocker(DockWidget):
             self._spt_browse,
             self._spt_refresh,
             self._spt_target_box,
-            self._spt_panel_box,
             self._spt_open,
         ):
             widget.setEnabled(spt_mode and not self._busy)
@@ -348,31 +313,21 @@ class CodexSelectionEditDocker(DockWidget):
         )
         self._workspace.setEnabled(not spt_mode and not self._busy)
         self._edit_button.setEnabled(
-            not self._busy and (not spt_mode or self._spt_allowed_mask is not None)
+            not self._busy and (not spt_mode or self._spt_edit_target is not None)
         )
         self._write_setting("mode", "spt" if spt_mode else "generic")
 
     def _spt_target_changed(self) -> None:
         if self._busy:
             return
-        self._clear_spt_context(clear_panels=True)
+        self._clear_spt_context()
         if self._is_spt_mode() and self._spt_target_box.currentData():
             self._set_status(
-                "품목을 선택했어요. RGB 작업 뷰·추천 선택 불러오기를 눌러 주세요"
+                "품목을 선택했어요. SPT RGB 작업 뷰 열기를 눌러 주세요"
             )
 
-    def _clear_spt_context(self, *, clear_panels: bool) -> None:
-        self._spt_preparation = None
-        self._spt_target = None
-        self._spt_panel = None
-        self._spt_allowed_mask = None
-        self._last_spt_job_dir = None
-        self._spt_accept_button.setEnabled(False)
-        self._spt_reject_button.setEnabled(False)
-        if clear_panels:
-            self._spt_panel_box.blockSignals(True)
-            self._spt_panel_box.clear()
-            self._spt_panel_box.blockSignals(False)
+    def _clear_spt_context(self) -> None:
+        self._spt_edit_target = None
         self._mode_changed()
 
     def _browse_spt_root(self) -> None:
@@ -428,15 +383,15 @@ class CodexSelectionEditDocker(DockWidget):
             if selected_index >= 0:
                 self._spt_target_box.setCurrentIndex(selected_index)
         self._spt_target_box.blockSignals(False)
-        self._clear_spt_context(clear_panels=True)
+        self._clear_spt_context()
         ready = sum(item.ready for item in summaries)
         blocked = sum(item.preparation_required for item in summaries)
         preserved = sum(item.status == "preserve" for item in summaries)
         exhausted = sum(item.attempt_budget_exhausted for item in summaries)
         self._set_status(
-            f"SPT {len(summaries)}개 확인 · 생성 준비 {ready} · 준비 필요 {blocked} · "
-            f"예산 소진 {exhausted} · 보존 {preserved}. 준비 필요 품목은 "
-            "‘전체 준비 요청 기록’ 한 번으로 묶을 수 있어요"
+            f"SPT {len(summaries)}개 확인 · 최종 검증 준비 {ready} · "
+            f"검증 준비 필요 {blocked} · 예산 소진 {exhausted} · 보존 {preserved}. "
+            "이 상태는 자유 선택 미리보기를 막지 않으며, 최종 적용 준비 상태만 나타내요"
         )
 
     def _record_spt_preparation_request(self) -> None:
@@ -472,182 +427,24 @@ class CodexSelectionEditDocker(DockWidget):
             return
         try:
             root = Path(self._spt_root.text().strip()).expanduser().resolve()
-            preparation = inspect_spt_target(root, target_id)
-        except Exception as exc:
-            self._operation_failed(str(exc))
-            return
-        if not preparation.ready:
-            try:
-                self._open_spt_preparation(preparation)
-            except Exception as exc:
-                self._operation_failed(str(exc))
-            return
-        try:
-            target = load_spt_target(root, target_id, preparation=preparation)
-            self._spt_target = target
-            self._spt_panel_box.blockSignals(True)
-            self._spt_panel_box.clear()
-            for panel in target.panels:
-                self._spt_panel_box.addItem(panel.label, panel.panel_id)
-            self._spt_panel_box.blockSignals(False)
-            if not target.panels:
-                raise ValueError("통과한 번역 기록에 불러올 라벨 면이 없어요")
-            first_panel = first_available_spt_panel(target)
-            if first_panel is None:
-                raise ValueError("모든 라벨 면의 기본 생성 예산을 이미 사용했어요")
-            first_index = self._spt_panel_box.findData(first_panel.panel_id)
-            self._spt_panel_box.blockSignals(True)
-            self._spt_panel_box.setCurrentIndex(first_index)
-            self._spt_panel_box.blockSignals(False)
-            self._open_spt_panel(target, first_panel)
-        except Exception as exc:
-            self._operation_failed(str(exc))
-
-    def _open_spt_preparation(self, preparation: SptPreparation) -> None:
-        document = _open_spt_working_view(
-            preparation.project_root,
-            preparation.target_id,
-            preparation.source,
-        )
-
-        reference_mask: bytes | None = None
-        reference_error = preparation.mask_error
-        if preparation.masks:
-            try:
-                mask_pixels = {
-                    name: _read_mask_bytes(artifact.path, artifact.width, artifact.height)
-                    for name, artifact in preparation.masks.items()
-                }
-                validate_spt_mask_contract(
-                    mask_pixels["old_text"],
-                    mask_pixels["new_text"],
-                    mask_pixels["editable"],
-                    mask_pixels["protected"],
-                    mask_pixels["seam_guard"],
-                    preparation.source.width,
-                    preparation.source.height,
-                )
-                reference_mask = mask_pixels["editable"]
-            except Exception as exc:
-                reference_error = str(exc)
-
-        selection_pixels = reference_mask or bytes(
-            preparation.source.width * preparation.source.height
-        )
-        _set_spt_selection(
-            document,
-            selection_pixels,
-            preparation.source.width,
-            preparation.source.height,
-        )
-        self._clear_spt_context(clear_panels=True)
-        self._spt_preparation = preparation
-        if reference_mask is not None:
-            self._spt_panel_box.addItem("준비 참고 · 전체 editable 선택 (생성 잠김)")
-        else:
-            self._spt_panel_box.addItem("준비 참고 · RGB 작업 뷰만 열림 (생성 잠김)")
-
-        reasons: list[str] = []
-        if preparation.analysis_errors:
-            preview = preparation.analysis_errors[0]
-            remaining = len(preparation.analysis_errors) - 1
-            suffix = f" 외 {remaining}건" if remaining > 0 else ""
-            reasons.append(f"analysis 기록 갱신 필요: {preview}{suffix}")
-        if reference_error:
-            reasons.append(f"마스크 준비 필요: {reference_error}")
-        if preparation.attempt_budget_exhausted:
-            reasons.append(
-                f"생성 예산 승인 필요: 기록 {preparation.recorded_generation_attempts}/"
-                f"{MAX_GENERATION_ATTEMPTS}회"
+            target = load_spt_free_edit_target(root, target_id)
+            document = _open_spt_working_view(
+                target.project_root,
+                target.target_id,
+                target.source,
             )
-        opened = (
-            "RGB 작업 뷰와 기존 editable 참고 선택"
-            if reference_mask
-            else "RGB 작업 뷰"
-        )
-        detail = " · ".join(reasons) or "안전 게이트 준비 필요"
-        self._set_status(
-            f"{preparation.name_ko} {opened}을 열었어요. 생성은 잠겨 있어요. "
-            f"{detail}. 위의 ‘전체 준비 요청 기록’으로 다른 잠긴 품목과 한 번에 묶을 수 있어요"
-        )
-
-    def _spt_panel_changed(self) -> None:
-        if self._busy or self._spt_target is None:
-            return
-        panel_id = self._spt_panel_box.currentData()
-        panel = next(
-            (item for item in self._spt_target.panels if item.panel_id == panel_id),
-            None,
-        )
-        if panel is None:
-            return
-        self._spt_preparation = None
-        self._spt_panel = None
-        self._spt_allowed_mask = None
-        self._last_spt_job_dir = None
-        self._spt_accept_button.setEnabled(False)
-        self._spt_reject_button.setEnabled(False)
-        self._mode_changed()
-        try:
-            self._open_spt_panel(self._spt_target, panel)
+            _clear_document_selection(document)
         except Exception as exc:
             self._operation_failed(str(exc))
+            return
 
-    def _open_spt_panel(self, target: SptTarget, panel: SptPanel) -> None:
-        current = load_spt_target(target.project_root, target.target_id)
-        panel = next((item for item in current.panels if item.panel_id == panel.panel_id), None)
-        if panel is None:
-            raise ValueError("review.json이 바뀌어 선택한 라벨 면을 다시 찾지 못했어요")
-        attempts = current_generation_attempts(current, panel)
-        if attempts >= MAX_GENERATION_ATTEMPTS:
-            raise ValueError(
-                f"이 라벨 면은 기본 생성 예산 {MAX_GENERATION_ATTEMPTS}회를 이미 사용했어요. "
-                "추가 시도는 Codex 작업에서 사용자 승인 증거를 먼저 기록해야 해요"
-            )
-        mask_pixels = {
-            name: _read_mask_bytes(artifact.path, artifact.width, artifact.height)
-            for name, artifact in current.masks.items()
-        }
-        validate_spt_mask_contract(
-            mask_pixels["old_text"],
-            mask_pixels["new_text"],
-            mask_pixels["editable"],
-            mask_pixels["protected"],
-            mask_pixels["seam_guard"],
-            current.source.width,
-            current.source.height,
-        )
-        panel_padding = max(4, round(max(current.source.width, current.source.height) * 0.01))
-        allowed = spt_panel_mask(
-            mask_pixels["editable"],
-            current.source.width,
-            current.source.height,
-            [region.bbox for region in panel.regions],
-            panel_padding,
-        )
-        document = _open_spt_working_view(
-            current.project_root,
-            current.target_id,
-            current.source,
-        )
-        _set_spt_selection(
-            document,
-            allowed,
-            current.source.width,
-            current.source.height,
-        )
-        self._spt_target = current
-        self._spt_preparation = None
-        self._spt_panel = panel
-        self._spt_allowed_mask = allowed
-        self._last_spt_job_dir = None
-        self._spt_accept_button.setEnabled(False)
-        self._spt_reject_button.setEnabled(False)
+        self._clear_spt_context()
+        self._spt_edit_target = target
         self._prompt.setPlainText("")
-        texts = ", ".join(region.final_text_ko.replace("\n", " / ") for region in panel.regions)
         self._set_status(
-            f"{current.name_ko} · {panel.label} 선택을 적용했어요 · "
-            f"생성 {attempts}/{MAX_GENERATION_ATTEMPTS}회 · 확정 문구: {texts}"
+            f"{target.name_ko} RGB 작업 뷰를 열었어요. Krita 선택 도구로 원하는 영역을 "
+            "자유롭게 선택하고 전체 수정 지시를 입력한 뒤 생성형 채우기를 누르세요. "
+            "현재 선택은 사전 editable 마스크로 제한되지 않아요"
         )
         self._mode_changed()
 
@@ -686,26 +483,24 @@ class CodexSelectionEditDocker(DockWidget):
         if not self._acknowledge_preview.isChecked():
             self._operation_failed("검증 전 미리보기 확인란을 먼저 선택해 주세요")
             return
-        if not self._is_spt_mode() and not self._prompt.toPlainText().strip():
+        if not self._prompt.toPlainText().strip():
             self._operation_failed("수정 지시를 입력해 주세요")
             return
         try:
             if self._is_spt_mode():
-                target, panel, allowed = self._validated_spt_context()
+                target = self._validated_spt_context()
                 workspace = (
                     target.project_root
                     / "workspace"
                     / "krita-spt"
                     / target.target_id
-                    / panel.panel_id
+                    / "free-selection"
                 )
                 workspace.mkdir(parents=True, exist_ok=True)
                 executable = self._capture_executable()
                 snapshot = self._capture_snapshot(
                     workspace,
                     spt_target=target,
-                    spt_panel=panel,
-                    spt_allowed_mask=allowed,
                 )
             else:
                 workspace, executable = self._capture_settings()
@@ -728,6 +523,7 @@ class CodexSelectionEditDocker(DockWidget):
                     progress=self._signals.status.emit,
                 )
                 generated_path = result.write_image(snapshot.job_dir / "generated.png")
+                generated_sha256 = _sha256_file(generated_path)
                 _update_request(
                     snapshot.request_path,
                     status="generated",
@@ -744,11 +540,13 @@ class CodexSelectionEditDocker(DockWidget):
                         "permission_profile_id": result.permission_profile_id,
                         "artifact": {
                             "path": generated_path.name,
-                            "sha256": _sha256_file(generated_path),
+                            "sha256": generated_sha256,
                         },
                     },
                 )
-                self._signals.generation_ready.emit(str(generated_path))
+                self._signals.generation_ready.emit(
+                    (str(generated_path), generated_sha256)
+                )
             except Exception as exc:  # UI boundary: preserve the generated job evidence
                 try:
                     _update_request(snapshot.request_path, status="error", error=str(exc))
@@ -779,48 +577,26 @@ class CodexSelectionEditDocker(DockWidget):
         self._write_setting("codex", executable)
         return executable
 
-    def _validated_spt_context(self) -> tuple[SptTarget, SptPanel, bytes]:
-        if self._spt_target is None or self._spt_panel is None or self._spt_allowed_mask is None:
-            raise ValueError("먼저 SPT RGB 작업 뷰·추천 선택을 불러와 주세요")
-        target = load_spt_target(
-            self._spt_target.project_root,
-            self._spt_target.target_id,
+    def _validated_spt_context(self) -> SptFreeEditTarget:
+        loaded = self._spt_edit_target
+        if loaded is None:
+            raise ValueError("먼저 SPT RGB 작업 뷰를 열어 주세요")
+        current = load_spt_free_edit_target(
+            loaded.project_root,
+            loaded.target_id,
         )
-        panel = next(
-            (item for item in target.panels if item.panel_id == self._spt_panel.panel_id),
-            None,
-        )
-        if panel is None:
-            raise ValueError("review.json이 바뀌어 현재 라벨 면을 다시 불러와야 해요")
-        attempts = current_generation_attempts(target, panel)
-        if attempts >= MAX_GENERATION_ATTEMPTS:
+        if current != loaded:
             raise ValueError(
-                f"이 라벨 면의 기본 생성 예산 {MAX_GENERATION_ATTEMPTS}회를 모두 사용했어요"
+                "SPT profile, review 또는 불변 원본이 바뀌었어요. "
+                "품목을 새로고침하고 RGB 작업 뷰를 다시 열어 주세요"
             )
-        editable = _read_mask_bytes(
-            target.masks["editable"].path,
-            target.source.width,
-            target.source.height,
-        )
-        padding = max(4, round(max(target.source.width, target.source.height) * 0.01))
-        allowed = spt_panel_mask(
-            editable,
-            target.source.width,
-            target.source.height,
-            [region.bbox for region in panel.regions],
-            padding,
-        )
-        if allowed != self._spt_allowed_mask:
-            raise ValueError("review.json 또는 editable 마스크가 바뀌어 SPT 작업을 다시 불러와야 해요")
-        return target, panel, allowed
+        return current
 
     def _capture_snapshot(
         self,
         workspace: Path,
         *,
-        spt_target: SptTarget | None = None,
-        spt_panel: SptPanel | None = None,
-        spt_allowed_mask: bytes | None = None,
+        spt_target: SptFreeEditTarget | None = None,
     ) -> _Snapshot:
         application = Krita.instance()
         document = application.activeDocument()
@@ -838,8 +614,11 @@ class CodexSelectionEditDocker(DockWidget):
         if spt_root is not None and spt_target is None:
             raise ValueError(
                 "SPT 저장소 자산은 일반 모드로 생성할 수 없어요. "
-                "SPT 준비 작업 모드에서 통과 기록과 마스크를 불러와 주세요"
+                "SPT 자유 선택 편집 모드에서 RGB 작업 뷰를 열어 주세요"
             )
+        working_view_path: Path | None = None
+        spt_base_node_id: str | None = None
+        spt_base_pixel_sha256: str | None = None
         if spt_target is not None:
             if spt_root != spt_target.project_root:
                 raise ValueError("현재 문서가 선택한 SPT 프로젝트 원본이 아니에요")
@@ -852,9 +631,12 @@ class CodexSelectionEditDocker(DockWidget):
                 raise ValueError(
                     "현재 문서가 선택한 SPT 품목의 불투명 RGB 작업 뷰가 아니에요"
                 )
-            if spt_panel is None or spt_allowed_mask is None:
-                raise ValueError("SPT 라벨 면 선택 증거가 없어요")
-            _verify_spt_working_view(document, spt_target.source)
+            spt_base_node_id, spt_base_pixel_sha256 = _verify_spt_working_document(
+                document,
+                spt_target.project_root,
+                spt_target.target_id,
+                spt_target.source,
+            )
         selection = document.selection()
         if selection is None or selection.width() <= 0 or selection.height() <= 0:
             raise ValueError("수정할 영역을 먼저 선택해 주세요")
@@ -902,26 +684,6 @@ class CodexSelectionEditDocker(DockWidget):
             crop.height,
         )
 
-        manual_selection_reduced = False
-        if spt_target is not None and spt_allowed_mask is not None:
-            full_selection = bytes(
-                selection.pixelData(
-                    canvas_x,
-                    canvas_y,
-                    canvas_width,
-                    canvas_height,
-                )
-            )
-            if (canvas_x, canvas_y) != (0, 0) or (
-                canvas_width,
-                canvas_height,
-            ) != (spt_target.source.width, spt_target.source.height):
-                raise ValueError("SPT 원본 문서의 캔버스 좌표 또는 크기가 review.json과 달라요")
-            manual_selection_reduced = ensure_selection_is_spt_subset(
-                full_selection,
-                spt_allowed_mask,
-            )
-
         document_name = document.name() or Path(document.fileName()).stem or "untitled"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         if spt_target is not None:
@@ -939,39 +701,11 @@ class CodexSelectionEditDocker(DockWidget):
         model_width = crop.width
         model_height = crop.height
         deskew_rotation = 0.0
-        if spt_panel is not None and spt_panel.rotation_deg % 360:
-            deskew_rotation = -spt_panel.rotation_deg
-            (
-                model_source_bgra,
-                model_selection_mask,
-                model_width,
-                model_height,
-            ) = _deskew_panel(
-                source_bgra,
-                selection_mask,
-                crop.width,
-                crop.height,
-                deskew_rotation,
-            )
-            if model_width * model_height > MAX_CONTEXT_PIXELS:
-                raise ValueError(
-                    "정방향화한 SPT 작업 패널이 2048×2048 상당의 안전 제한을 넘어요. "
-                    "문맥 여백을 줄여 주세요"
-                )
-        if spt_target is not None and spt_panel is not None:
-            prompt = build_spt_prompt(
-                spt_target,
-                spt_panel,
-                self._prompt.toPlainText(),
-                model_width,
-                model_height,
-            )
-        else:
-            prompt = build_edit_prompt(
-                self._prompt.toPlainText(),
-                model_width,
-                model_height,
-            )
+        prompt = build_edit_prompt(
+            self._prompt.toPlainText(),
+            model_width,
+            model_height,
+        )
         job_dir.mkdir(parents=True, exist_ok=False)
         _save_bgra_png(source_path, model_source_bgra, model_width, model_height)
         _save_mask_png(mask_path, model_selection_mask, model_width, model_height)
@@ -1044,13 +778,23 @@ class CodexSelectionEditDocker(DockWidget):
             },
         }
         spt_metadata: dict[str, Any] | None = None
-        if spt_target is not None and spt_panel is not None:
-            attempts = current_generation_attempts(spt_target, spt_panel)
+        if spt_target is not None:
+            if (
+                working_view_path is None
+                or spt_base_node_id is None
+                or spt_base_pixel_sha256 is None
+            ):
+                raise ValueError("SPT 작업 뷰 identity 기록을 만들지 못했어요")
             spt_metadata = {
-                "mode": "vision-panel-localization-preview",
+                "mode": "free-selection-preview",
+                "selection_policy": "user-krita-selection-v1",
                 "target_id": spt_target.target_id,
-                "panel_id": spt_panel.panel_id,
-                "face": spt_panel.face,
+                "name_ko": spt_target.name_ko,
+                "texture": spt_target.texture,
+                "profile_path": spt_target.profile_path.relative_to(
+                    spt_target.project_root
+                ).as_posix(),
+                "profile_sha256": spt_target.profile_sha256,
                 "review_path": spt_target.review_path.relative_to(
                     spt_target.project_root
                 ).as_posix(),
@@ -1063,9 +807,12 @@ class CodexSelectionEditDocker(DockWidget):
                         spt_target.project_root
                     ).as_posix(),
                     "file_sha256": _sha256_file(working_view_path),
+                    "base_layer_node_id": spt_base_node_id,
+                    "base_layer_pixel_sha256": spt_base_pixel_sha256,
                     "rgb": "byte-identical-to-pinned-source",
                     "alpha": 255,
                     "display_only": True,
+                    "visible_preview_layers_allowed": True,
                 },
                 "model_input": {
                     "source_file_sha256": model_source_file_sha256,
@@ -1073,26 +820,26 @@ class CodexSelectionEditDocker(DockWidget):
                     "selection_mask_file_sha256": model_mask_file_sha256,
                     "selection_mask_pixel_sha256": model_mask_pixel_sha256,
                 },
-                "mask_sha256": {
-                    name: artifact.sha256 for name, artifact in spt_target.masks.items()
+                "user_selection": {
+                    "coordinate_space": "working-view",
+                    "bbox_xywh": selected.as_list(),
+                    "context_crop_xywh": crop.as_list(),
+                    "crop_mask_pixel_sha256": sha256_bytes(selection_mask),
+                    "soft_selection_preserved": True,
                 },
-                "region_ids": [region.region_id for region in spt_panel.regions],
-                "exact_text": [region.final_text_ko for region in spt_panel.regions],
-                "generation_attempt": attempts + 1,
-                "generation_budget": MAX_GENERATION_ATTEMPTS,
-                "manual_selection_reduced": manual_selection_reduced,
-                "panel_transform": {
-                    "coordinate_space": "source-mip0",
+                "working_transform": {
+                    "coordinate_space": "working-view",
                     "crop_bbox_xywh": crop.as_list(),
-                    "source_rotation_deg": spt_panel.rotation_deg,
-                    "deskew_rotation_deg": deskew_rotation,
-                    "inverse_rotation_deg": -deskew_rotation,
-                    "model_panel_size": [model_width, model_height],
-                    "selected_lettering_restored_to_source": False,
+                    "model_input_size": [model_width, model_height],
+                    "rotation_deg": 0,
                     "source_texture_resampled": False,
                     "final_texture_resampled": False,
                 },
-                "decision": "pending-visual-review",
+                "official_validation": {
+                    "status": "not-run",
+                    "candidate_approved": False,
+                    "requires_analysis_masks_ocr_compositor_and_quality_gates": True,
+                },
             }
             record["spt"] = spt_metadata
         _write_json(request_path, record)
@@ -1122,16 +869,29 @@ class CodexSelectionEditDocker(DockWidget):
             model_height=model_height,
             deskew_rotation_deg=deskew_rotation,
             spt=spt_metadata,
+            spt_target=spt_target,
         )
 
-    def _generation_ready(self, generated_value: str) -> None:
+    def _generation_ready(self, generated_value: object) -> None:
         snapshot = self._pending_snapshot
         if snapshot is None:
             self._operation_failed("적용할 선택 영역 스냅샷이 없어요")
             return
-        generated_path = Path(generated_value)
+        if (
+            not isinstance(generated_value, tuple)
+            or len(generated_value) != 2
+            or not all(isinstance(value, str) for value in generated_value)
+        ):
+            self._operation_failed("생성 결과 identity를 확인하지 못했어요")
+            return
+        generated_path = Path(generated_value[0])
+        generated_sha256 = generated_value[1]
         try:
-            layer_name, transform = self._apply_generated(snapshot, generated_path)
+            layer_name, transform = self._apply_generated(
+                snapshot,
+                generated_path,
+                generated_sha256,
+            )
         except Exception as exc:
             try:
                 _update_request(
@@ -1167,12 +927,10 @@ class CodexSelectionEditDocker(DockWidget):
         self._pending_snapshot = None
         self._set_busy(False)
         if snapshot.spt is not None:
-            self._last_spt_job_dir = snapshot.job_dir
-            self._spt_accept_button.setEnabled(True)
-            self._spt_reject_button.setEnabled(True)
             message = (
-                "SPT 검증 전 미리보기를 추가했어요. 원본 배율로 확인한 뒤 "
-                "사용할 결과인지 제외할 결과인지 기록해 주세요. 선택은 아직 후보 승인이 아니에요."
+                "SPT 자유 선택 미리보기 레이어를 추가했어요. 그대로 두면 유지되고 "
+                "Ctrl+Z 한 번으로 제거할 수 있어요. 이 레이어는 아직 공식 후보가 아니며 "
+                "최종 적용 전 프로젝트 검증을 별도로 거쳐야 해요."
                 f"\n{snapshot.job_dir}"
             )
         else:
@@ -1188,51 +946,23 @@ class CodexSelectionEditDocker(DockWidget):
         self,
         snapshot: _Snapshot,
         generated_path: Path,
+        expected_generated_sha256: str,
     ) -> tuple[str, dict[str, Any]]:
+        expected_generated_path = (snapshot.job_dir / "generated.png").resolve()
+        if generated_path.resolve() != expected_generated_path:
+            raise ValueError("기록된 생성 결과 경로가 현재 작업과 달라요")
+        if _sha256_file(generated_path) != expected_generated_sha256:
+            raise ValueError("기록 후 생성 결과 파일이 바뀌어 자동 적용하지 않았어요")
         document = snapshot.document
-        if not any(open_document == document for open_document in Krita.instance().documents()):
-            raise ValueError("생성 중 원래 Krita 문서가 닫혔어요")
-        if not _is_active_document(document):
-            raise ValueError("생성 중 다른 문서로 전환되어 원래 문서에 자동 적용하지 않았어요")
-        bounds = document.bounds()
-        if (
-            int(bounds.x()) != snapshot.canvas_x
-            or int(bounds.y()) != snapshot.canvas_y
-            or int(bounds.width()) != snapshot.canvas_width
-            or int(bounds.height()) != snapshot.canvas_height
-            or document.colorModel() != snapshot.color_model
-            or document.colorDepth() != snapshot.color_depth
-            or document.colorProfile() != snapshot.color_profile
-        ):
-            raise ValueError("생성 중 문서 경계 또는 색 공간이 바뀌었어요")
-
-        document.waitForDone()
-        document.refreshProjection()
-        document.waitForDone()
+        _validate_snapshot_context(snapshot)
         crop = snapshot.crop
-        current_source = bytes(document.pixelData(crop.x, crop.y, crop.width, crop.height))
-        if sha256_bytes(current_source) != snapshot.source_sha256:
-            raise ValueError("생성 중 문맥 픽셀이 바뀌어 오래된 결과를 자동 적용하지 않았어요")
-        selection = document.selection()
-        if selection is None:
-            raise ValueError("생성 중 선택 영역이 해제됐어요")
-        current_selection_bbox = CropRect(
-            int(selection.x()),
-            int(selection.y()),
-            int(selection.width()),
-            int(selection.height()),
-        )
-        if current_selection_bbox != snapshot.selection_bbox:
-            raise ValueError("생성 중 선택 영역 경계가 바뀌었어요")
-        current_mask = bytes(selection.pixelData(crop.x, crop.y, crop.width, crop.height))
-        if sha256_bytes(current_mask) != snapshot.mask_sha256:
-            raise ValueError("생성 중 선택 영역이 바뀌었어요")
-
         generated_bgra, generated_width, generated_height = _read_result_bgra(
             generated_path,
             snapshot.model_width,
             snapshot.model_height,
         )
+        if _sha256_file(generated_path) != expected_generated_sha256:
+            raise ValueError("생성 결과를 읽는 중 파일이 바뀌어 자동 적용하지 않았어요")
         if snapshot.deskew_rotation_deg:
             generated_bgra = _restore_deskewed_bgra(
                 generated_bgra,
@@ -1249,13 +979,14 @@ class CodexSelectionEditDocker(DockWidget):
             crop.height,
         )
         _preflight_composite(snapshot, layer_pixels)
-        if not _is_active_document(document):
-            raise ValueError("합성 검사 중 다른 문서로 전환되어 자동 적용하지 않았어요")
+        _validate_snapshot_context(snapshot)
+        if _sha256_file(generated_path) != expected_generated_sha256:
+            raise ValueError("합성 검사 중 생성 결과 파일이 바뀌어 자동 적용하지 않았어요")
 
         if snapshot.spt is not None:
             layer_name = (
-                f"[SPT 검증 전 미리보기] {snapshot.spt['target_id']} · "
-                f"{snapshot.spt['panel_id']}"
+                f"[SPT 자유 선택 AI 미리보기] {snapshot.spt['target_id']} · "
+                f"{snapshot.instruction[:42]}"
             )
         else:
             layer_name = f"[검증 전 AI 미리보기] {snapshot.instruction[:42]}"
@@ -1270,6 +1001,11 @@ class CodexSelectionEditDocker(DockWidget):
             crop.height,
         ):
             raise ValueError("미리보기 레이어 픽셀을 기록하지 못했어요")
+        written_layer_pixels = bytes(
+            layer.pixelData(crop.x, crop.y, crop.width, crop.height)
+        )
+        if sha256_bytes(written_layer_pixels) != sha256_bytes(layer_pixels):
+            raise ValueError("Krita 미리보기 레이어에 기록된 픽셀이 생성 패치와 달라요")
         layer.setColorLabel(3)
         layer.setVisible(False)
         root = document.rootNode()
@@ -1312,11 +1048,16 @@ class CodexSelectionEditDocker(DockWidget):
                     else "실패 레이어는 제거됐지만 원본 투영 복구를 확인하지 못했어요"
                 )
                 raise RuntimeError(
-                    f"{validation_error}; 자동 Undo 검증 실패 — {rollback_state}: "
+                    f"{validation_error}; 실패 레이어 자동 제거 검증 실패 — {rollback_state}: "
                     f"{rollback_error}"
                 ) from validation_error
             raise validation_error
         return layer_name, {
+            "generated_file_sha256": expected_generated_sha256,
+            "selection_mask_pixel_sha256": snapshot.mask_sha256,
+            "masked_layer_pixel_sha256": sha256_bytes(layer_pixels),
+            "projection_before_pixel_sha256": snapshot.source_sha256,
+            "projection_after_pixel_sha256": sha256_bytes(after),
             "generated_size": [generated_width, generated_height],
             "context_size": [crop.width, crop.height],
             "model_panel_size": [snapshot.model_width, snapshot.model_height],
@@ -1341,44 +1082,6 @@ class CodexSelectionEditDocker(DockWidget):
                 self._signals.status.emit("취소할 활성 이미지 편집이 없어요")
 
         threading.Thread(target=run, name="krita-codex-cancel", daemon=True).start()
-
-    def _record_spt_preview_choice(self, decision: str) -> None:
-        job_dir = self._last_spt_job_dir
-        if job_dir is None:
-            self._operation_failed("판정할 SPT 미리보기가 없어요")
-            return
-        request_path = job_dir / "request.json"
-        try:
-            request = json.loads(request_path.read_text(encoding="utf-8"))
-            spt = request.get("spt")
-            generation = request.get("generation")
-            if not isinstance(spt, dict) or not isinstance(generation, dict):
-                raise ValueError("SPT 생성 기록이 완전하지 않아요")
-            decided_spt = {**spt, "decision": decision}
-            _update_request(request_path, spt=decided_spt)
-            decision_record = build_preview_choice_record(
-                decided_spt,
-                generation,
-                status=decision,
-                created_at=datetime.now(timezone.utc).isoformat(),
-                request_sha256=_sha256_file(request_path),
-            )
-            _write_json(job_dir / "decision.json", decision_record)
-        except Exception as exc:
-            self._operation_failed(f"SPT 결과 선택을 기록하지 못했어요: {exc}")
-            return
-        self._spt_accept_button.setEnabled(False)
-        self._spt_reject_button.setEnabled(False)
-        if decision == "selected-for-validation":
-            self._set_status(
-                "이 결과를 후속 검증 대상으로 기록했어요. 아직 후보 승인은 아니며 "
-                f"프로젝트의 공식 합성·검증 단계가 남아 있어요.\n{job_dir}"
-            )
-        else:
-            self._set_status(
-                "이 결과를 제외 대상으로 기록했어요. 레이어는 비교를 위해 남겨 두었고 "
-                f"Ctrl+Z로 제거할 수 있어요.\n{job_dir}"
-            )
 
     def _session_for(self, executable: str) -> CodexAppServer:
         with self._session_lock:
@@ -1447,23 +1150,6 @@ def _save_mask_png(path: Path, pixels: bytes, width: int, height: int) -> None:
     image = QImage(pixels, width, height, width, _FORMAT_GRAYSCALE8).copy()
     if image.isNull() or not image.save(str(path), "PNG"):
         raise ValueError(f"선택 마스크 PNG를 저장하지 못했어요: {path}")
-
-
-def _read_mask_bytes(path: Path, width: int, height: int) -> bytes:
-    if not path.is_file() or path.stat().st_size > 32 * 1024 * 1024:
-        raise ValueError(f"SPT 마스크가 없거나 허용 파일 크기를 초과했어요: {path}")
-    reader = QImageReader(str(path))
-    reader.setAutoTransform(False)
-    declared = reader.size()
-    if not declared.isValid() or (declared.width(), declared.height()) != (width, height):
-        raise ValueError(f"SPT 마스크 선언 크기가 review.json과 달라요: {path}")
-    image = reader.read()
-    if image.isNull():
-        raise ValueError(f"SPT 마스크를 읽지 못했어요: {reader.errorString()}")
-    if image.format() not in {_FORMAT_GRAYSCALE8, _FORMAT_INDEXED8} or not image.isGrayscale():
-        raise ValueError(f"SPT 마스크는 lossless 단일 채널 grayscale PNG여야 해요: {path}")
-    image = image.convertToFormat(_FORMAT_GRAYSCALE8)
-    return _grayscale_image_bytes(image, width, height)
 
 
 def _read_pinned_spt_source(source: SptArtifact) -> bytes:
@@ -1594,7 +1280,7 @@ def _open_spt_working_view(
 ) -> Any:
     view_path = _ensure_spt_working_view(project_root, target_id, source)
     document = _open_or_activate_document(view_path)
-    _verify_spt_working_view(document, source)
+    _verify_spt_working_document(document, project_root, target_id, source)
     return document
 
 
@@ -1624,18 +1310,26 @@ def _open_or_activate_document(path: Path) -> Any:
     return document
 
 
-def _set_spt_selection(document: Any, pixels: bytes, width: int, height: int) -> None:
-    if len(pixels) != width * height:
-        raise ValueError("SPT 선택 마스크 픽셀 길이가 원본 크기와 달라요")
+def _clear_document_selection(document: Any) -> None:
     selection = Selection()
-    selection.setPixelData(QByteArray(pixels), 0, 0, width, height)
     document.setSelection(selection)
     document.waitForDone()
     document.refreshProjection()
     document.waitForDone()
 
 
-def _verify_spt_working_view(document: Any, source: SptArtifact) -> None:
+def _verify_spt_working_document(
+    document: Any,
+    project_root: Path,
+    target_id: str,
+    source: SptArtifact,
+) -> tuple[str, str]:
+    document.waitForDone()
+    document.refreshProjection()
+    document.waitForDone()
+    view_path = _ensure_spt_working_view(project_root, target_id, source)
+    if not document.fileName() or Path(document.fileName()).resolve() != view_path:
+        raise ValueError("현재 문서가 선택한 SPT RGB 작업 뷰가 아니에요")
     bounds = document.bounds()
     if int(bounds.x()) != 0 or int(bounds.y()) != 0:
         raise ValueError("SPT 작업 뷰의 캔버스 offset이 0이 아니에요")
@@ -1645,16 +1339,55 @@ def _verify_spt_working_view(document: Any, source: SptArtifact) -> None:
         raise ValueError("SPT 원본이 안전 픽셀 제한을 초과해 전체 불변성을 확인할 수 없어요")
     if (width, height) != (source.width, source.height):
         raise ValueError("SPT 원본 PNG 크기와 Krita 작업 뷰 크기가 달라요")
+    if (
+        document.colorModel() != "RGBA"
+        or document.colorDepth() != "U8"
+        or not is_supported_srgb_profile(document.colorProfile())
+    ):
+        raise ValueError("SPT 작업 뷰 문서의 색 공간이 지원 계약과 달라요")
     source_pixels = _read_pinned_spt_source(source)
-    document_pixels = bytes(document.pixelData(0, 0, width, height))
+    root = document.rootNode()
+    children = root.childNodes()
+    if not children:
+        raise ValueError("SPT RGB 작업 뷰의 불변 바닥 레이어를 찾지 못했어요")
+    base = children[0]
+    position = base.position()
+    channels = base.channels()
+    if (
+        base.type() != "paintlayer"
+        or base.colorModel() != document.colorModel()
+        or base.colorDepth() != document.colorDepth()
+        or base.colorProfile() != document.colorProfile()
+    ):
+        raise ValueError("SPT 작업 뷰의 바닥 원본 레이어 색 공간이 바뀌었어요")
+    if (
+        not base.visible()
+        or int(base.opacity()) != 255
+        or base.blendingMode() != "normal"
+        or base.inheritAlpha()
+        or base.animated()
+        or int(position.x()) != 0
+        or int(position.y()) != 0
+        or base.childNodes()
+        or len(channels) != 4
+        or any(not channel.visible() for channel in channels)
+        or bool(base.layerStyleToAsl().strip())
+    ):
+        raise ValueError(
+            "SPT 작업 뷰의 바닥 원본 레이어 효과·마스크·합성 상태가 바뀌었어요"
+        )
+    base_pixels = bytes(base.pixelData(0, 0, width, height))
+    base_projection = bytes(base.projectionPixelData(0, 0, width, height))
     try:
-        validate_opaque_bgra_view(source_pixels, document_pixels, width, height)
+        validate_opaque_bgra_view(source_pixels, base_pixels, width, height)
+        validate_opaque_bgra_view(source_pixels, base_projection, width, height)
     except ValueError as exc:
         raise ValueError(
-            "열린 SPT 작업 뷰가 불변 원본 RGB와 달라요. 기존 미리보기 레이어를 "
-            "Ctrl+Z로 제거하거나 저장하지 않고 문서를 다시 연 뒤 작업해 주세요. "
+            "SPT 작업 뷰의 바닥 원본 레이어 또는 적용된 투영이 불변 원본 RGB와 달라요. "
+            "바닥 레이어를 수정하지 않은 작업 뷰를 다시 열어 주세요. "
             f"({exc})"
         ) from exc
+    return _node_id(base), sha256_bytes(base_projection)
 
 
 def _deskew_panel(
@@ -1808,6 +1541,76 @@ def _is_active_document(document: Any) -> bool:
     return active is not None and active == document
 
 
+def _validate_snapshot_context(snapshot: _Snapshot) -> None:
+    document = snapshot.document
+    if not any(open_document == document for open_document in Krita.instance().documents()):
+        raise ValueError("생성 중 원래 Krita 문서가 닫혔어요")
+    if not _is_active_document(document):
+        raise ValueError("생성 중 다른 문서로 전환되어 원래 문서에 자동 적용하지 않았어요")
+    bounds = document.bounds()
+    if (
+        int(bounds.x()) != snapshot.canvas_x
+        or int(bounds.y()) != snapshot.canvas_y
+        or int(bounds.width()) != snapshot.canvas_width
+        or int(bounds.height()) != snapshot.canvas_height
+        or document.colorModel() != snapshot.color_model
+        or document.colorDepth() != snapshot.color_depth
+        or document.colorProfile() != snapshot.color_profile
+        or _node_id(document.rootNode()) != snapshot.root_id
+    ):
+        raise ValueError("생성 중 문서 identity, 경계 또는 색 공간이 바뀌었어요")
+
+    document.waitForDone()
+    document.refreshProjection()
+    document.waitForDone()
+    if snapshot.spt_target is not None:
+        current_base_node_id, current_base_sha256 = _verify_spt_working_document(
+            document,
+            snapshot.spt_target.project_root,
+            snapshot.spt_target.target_id,
+            snapshot.spt_target.source,
+        )
+        working_view_record = (
+            snapshot.spt.get("working_view") if snapshot.spt is not None else None
+        )
+        expected_base_node_id = (
+            working_view_record.get("base_layer_node_id")
+            if isinstance(working_view_record, dict)
+            else None
+        )
+        expected_base_sha256 = (
+            working_view_record.get("base_layer_pixel_sha256")
+            if isinstance(working_view_record, dict)
+            else None
+        )
+        if (
+            current_base_node_id != expected_base_node_id
+            or current_base_sha256 != expected_base_sha256
+        ):
+            raise ValueError(
+                "생성 중 SPT 작업 뷰의 바닥 원본 identity가 바뀌었어요"
+            )
+
+    crop = snapshot.crop
+    current_source = bytes(document.pixelData(crop.x, crop.y, crop.width, crop.height))
+    if sha256_bytes(current_source) != snapshot.source_sha256:
+        raise ValueError("생성 중 문맥 픽셀이 바뀌어 오래된 결과를 자동 적용하지 않았어요")
+    selection = document.selection()
+    if selection is None:
+        raise ValueError("생성 중 선택 영역이 해제됐어요")
+    current_selection_bbox = CropRect(
+        int(selection.x()),
+        int(selection.y()),
+        int(selection.width()),
+        int(selection.height()),
+    )
+    if current_selection_bbox != snapshot.selection_bbox:
+        raise ValueError("생성 중 선택 영역 경계가 바뀌었어요")
+    current_mask = bytes(selection.pixelData(crop.x, crop.y, crop.width, crop.height))
+    if sha256_bytes(current_mask) != snapshot.mask_sha256:
+        raise ValueError("생성 중 선택 영역이 바뀌었어요")
+
+
 def _preflight_composite(snapshot: _Snapshot, layer_pixels: bytes) -> None:
     crop = snapshot.crop
     temporary = Krita.instance().createDocument(
@@ -1863,22 +1666,19 @@ def _undo_failed_attach(document: Any, layer: Any, snapshot: _Snapshot) -> None:
     layer.setVisible(False)
     document.refreshProjection()
     document.waitForDone()
-    if not _is_active_document(document):
-        raise RuntimeError("원래 문서가 활성 상태가 아니라 전역 Undo를 실행하지 않았어요")
-    action = Krita.instance().action("edit_undo")
-    if action is None or not action.isEnabled():
-        raise RuntimeError("Krita edit_undo 액션을 실행할 수 없어요")
     layer_id = _node_id(layer)
-    action.trigger()
+    root = document.rootNode()
+    if not root.removeChildNode(layer):
+        raise RuntimeError("검증 실패 레이어를 문서에서 직접 제거하지 못했어요")
     document.waitForDone()
     document.refreshProjection()
     document.waitForDone()
-    if any(_node_id(child) == layer_id for child in document.rootNode().childNodes()):
-        raise RuntimeError("Undo 뒤에도 실패 레이어가 문서에 남아 있어요")
+    if any(_node_id(child) == layer_id for child in root.childNodes()):
+        raise RuntimeError("직접 제거 뒤에도 실패 레이어가 문서에 남아 있어요")
     crop = snapshot.crop
     restored = bytes(document.pixelData(crop.x, crop.y, crop.width, crop.height))
     if restored != snapshot.source_bgra:
-        raise RuntimeError("Undo 뒤 문서 투영이 적용 전 픽셀로 복구되지 않았어요")
+        raise RuntimeError("레이어 제거 뒤 문서 투영이 적용 전 픽셀로 복구되지 않았어요")
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:

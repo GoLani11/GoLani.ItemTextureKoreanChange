@@ -155,6 +155,7 @@ def test_prompt_forces_built_in_imagegen_and_repeats_invariants() -> None:
     )
 
     assert prompt.startswith("$imagegen\n")
+    assert "Use case: generative-fill" in prompt
     assert "선택한 제품명만 ‘타르콜라’로 바꿔줘" in prompt
     assert "/job/source.png" not in prompt and "/job/mask.png" not in prompt
     assert "referenced_image_paths" in prompt

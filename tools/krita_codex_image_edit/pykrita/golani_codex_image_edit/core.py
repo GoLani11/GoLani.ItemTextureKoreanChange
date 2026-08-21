@@ -348,7 +348,7 @@ def build_edit_prompt(
         raise ValueError("편집 이미지 크기가 올바르지 않아요")
 
     return f"""$imagegen
-Use case: precise-object-edit
+Use case: generative-fill
 Asset type: non-destructive Krita selection preview
 Primary request: {normalized}
 
