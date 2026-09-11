@@ -4,9 +4,9 @@ import unittest
 import unicodedata
 from pathlib import Path
 
-from tools.texture_ocr.cli import _source_path
-from tools.texture_ocr.config import resolve_project_path
-from tools.texture_ocr.scoring import safe_join, sanitize_component
+from diagnostics.texture_ocr.cli import _source_path
+from diagnostics.texture_ocr.config import resolve_project_path
+from diagnostics.texture_ocr.scoring import safe_join, sanitize_component
 
 
 FORBIDDEN = set('<>:"/\\|?*')

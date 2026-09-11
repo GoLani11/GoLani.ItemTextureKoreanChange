@@ -3,17 +3,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.texture_ocr.cache import ResultCache
-from tools.texture_ocr.config import ocr_profile_digest
-from tools.texture_ocr.engines import combined_signature
-from tools.texture_ocr.manifest import AssetSource, Discovery
-from tools.texture_ocr.pipeline import scan_one_image, scan_sources
-from tools.texture_ocr.preprocess import (
+from diagnostics.texture_ocr.cache import ResultCache
+from diagnostics.texture_ocr.config import ocr_profile_digest
+from diagnostics.texture_ocr.engines import combined_signature
+from diagnostics.texture_ocr.manifest import AssetSource, Discovery
+from diagnostics.texture_ocr.pipeline import scan_one_image, scan_sources
+from diagnostics.texture_ocr.preprocess import (
     ImageFingerprint,
     PreparedVariant,
     VariantLimitExceeded,
 )
-from tools.texture_ocr.scoring import (
+from diagnostics.texture_ocr.scoring import (
     Detection,
     classify_detections,
     make_cache_key,
@@ -91,7 +91,7 @@ class PartialFailureTests(unittest.TestCase):
     def test_successful_variant_followed_by_engine_failure_is_processing_error(self):
         engine = FailingSecondVariantEngine()
         with mock.patch(
-            "tools.texture_ocr.pipeline.iter_variants",
+            "diagnostics.texture_ocr.pipeline.iter_variants",
             return_value=iter(variants()),
         ):
             result = scan_one_image(Path("synthetic.png"), scan_config(), engine, None)
@@ -109,7 +109,7 @@ class PartialFailureTests(unittest.TestCase):
             raise VariantLimitExceeded("synthetic variant cap reached")
 
         with mock.patch(
-            "tools.texture_ocr.pipeline.iter_variants",
+            "diagnostics.texture_ocr.pipeline.iter_variants",
             side_effect=capped_variants,
         ):
             result = scan_one_image(
@@ -186,12 +186,12 @@ class CachedClassificationTests(unittest.TestCase):
                     stored,
                 )
                 with mock.patch(
-                    "tools.texture_ocr.pipeline.fingerprint_image",
+                    "diagnostics.texture_ocr.pipeline.fingerprint_image",
                     return_value=fingerprint,
                 ), mock.patch(
-                    "tools.texture_ocr.pipeline.make_preview"
+                    "diagnostics.texture_ocr.pipeline.make_preview"
                 ), mock.patch(
-                    "tools.texture_ocr.pipeline.scan_one_image"
+                    "diagnostics.texture_ocr.pipeline.scan_one_image"
                 ) as scan:
                     results = scan_sources(
                         discovery, config, engine, None, cache, root / "run"
@@ -243,10 +243,10 @@ class ScanLimitTests(unittest.TestCase):
             }
 
             with ResultCache(root / "cache.sqlite3") as cache, mock.patch(
-                "tools.texture_ocr.pipeline.fingerprint_image",
+                "diagnostics.texture_ocr.pipeline.fingerprint_image",
                 side_effect=lambda path: fingerprints[path],
             ) as fingerprint, mock.patch(
-                "tools.texture_ocr.pipeline.scan_one_image",
+                "diagnostics.texture_ocr.pipeline.scan_one_image",
                 return_value=raw_result,
             ) as scan:
                 results = scan_sources(

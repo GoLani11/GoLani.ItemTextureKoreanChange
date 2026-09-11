@@ -14,4 +14,4 @@ from golani_texture_localizer.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

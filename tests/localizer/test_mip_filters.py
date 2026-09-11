@@ -3,12 +3,30 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
-from golani_texture_localizer.bundles import (
+from golani_texture_localizer.mips import (
+    apply_mip_delta,
     _mip_chain,
     _next_mip,
     _pad_uv_outside,
     _roundtrip_limits,
 )
+
+
+def test_delta_mips_keep_authored_source_pixels_outside_edit():
+    original = Image.new("RGBA", (4, 4), (90, 90, 90, 155))
+    baseline = Image.new("RGBA", (4, 4), (120, 120, 120, 255))
+    edited = baseline.copy()
+    edited.putpixel((1, 1), (130, 130, 130, 255))
+    result = np.array(apply_mip_delta(original, baseline, edited, "diffuse"))
+    assert result[0, 0].tolist() == [90, 90, 90, 155]
+    assert 90 < result[1, 1, 0] < 130 and result[1, 1, 3] == 155
+
+
+def test_zero_delta_keeps_authored_mip_byte_exact():
+    original = Image.new("RGBA", (4, 4), (90, 80, 70, 65))
+    baseline = Image.new("RGBA", (4, 4), (120, 120, 120, 255))
+    for role in ("diffuse", "normal", "gloss"):
+        assert apply_mip_delta(original, baseline, baseline, role).tobytes() == original.tobytes()
 
 
 def test_diffuse_mip_uses_linear_light_not_gamma_average() -> None:

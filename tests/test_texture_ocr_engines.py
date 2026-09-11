@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.texture_ocr.engines import (
+from diagnostics.texture_ocr.engines import (
     EasyOcrEngine,
     PaddleOcrEngine,
     model_tree_digest,
@@ -44,7 +44,7 @@ class ModelSignatureTests(unittest.TestCase):
 
             first_digest = model_tree_digest(model_dir)
             with mock.patch(
-                "tools.texture_ocr.engines.package_version",
+                "diagnostics.texture_ocr.engines.package_version",
                 return_value="test-version",
             ):
                 first_signature = EasyOcrEngine(config, project_root=root).signature
@@ -54,7 +54,7 @@ class ModelSignatureTests(unittest.TestCase):
             recognizer.write_bytes(b"recognizer-v2")
             second_digest = model_tree_digest(model_dir)
             with mock.patch(
-                "tools.texture_ocr.engines.package_version",
+                "diagnostics.texture_ocr.engines.package_version",
                 return_value="test-version",
             ):
                 second_signature = EasyOcrEngine(config, project_root=root).signature
@@ -107,9 +107,9 @@ class ModelSignatureTests(unittest.TestCase):
 
             def prepared_signature():
                 with mock.patch.dict("sys.modules", {"paddleocr": fake_module}), mock.patch(
-                    "tools.texture_ocr.engines.Path.home", return_value=home
+                    "diagnostics.texture_ocr.engines.Path.home", return_value=home
                 ), mock.patch(
-                    "tools.texture_ocr.engines.package_version", return_value="test-version"
+                    "diagnostics.texture_ocr.engines.package_version", return_value="test-version"
                 ):
                     engine = PaddleOcrEngine(
                         config, allow_model_download=True, project_root=root

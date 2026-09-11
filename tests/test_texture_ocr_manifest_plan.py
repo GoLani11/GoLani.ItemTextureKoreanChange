@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.texture_ocr.manifest import (
+from diagnostics.texture_ocr.manifest import (
     AssetSource,
     Discovery,
     color_filter_reason,
@@ -11,7 +11,7 @@ from tools.texture_ocr.manifest import (
     infer_asset_type,
     infer_groups,
 )
-from tools.texture_ocr.pipeline import build_plan
+from diagnostics.texture_ocr.pipeline import build_plan
 
 
 FILTER = {

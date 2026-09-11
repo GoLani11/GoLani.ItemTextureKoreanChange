@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.texture_ocr.reporting import (
+from diagnostics.texture_ocr.reporting import (
     effective_tier,
     load_results,
     summary_counts,

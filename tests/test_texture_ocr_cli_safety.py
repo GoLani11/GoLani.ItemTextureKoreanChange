@@ -6,16 +6,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from tools.texture_ocr import cli
-from tools.texture_ocr.manifest import AssetSource, Discovery
-from tools.texture_ocr.scoring import file_sha256, sanitize_component
+from diagnostics.texture_ocr import cli
+from diagnostics.texture_ocr.manifest import AssetSource, Discovery
+from diagnostics.texture_ocr.scoring import file_sha256, sanitize_component
 
 
 class ExecutionGuardTests(unittest.TestCase):
     def test_scan_without_execute_creates_no_output(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "must-not-exist"
-            with mock.patch("tools.texture_ocr.cli.load_config") as load_config:
+            with mock.patch("diagnostics.texture_ocr.cli.load_config") as load_config:
                 with self.assertRaisesRegex(SystemExit, "--execute"):
                     cli.main(
                         [
@@ -64,10 +64,10 @@ class ExecutionGuardTests(unittest.TestCase):
             "torch": "2.8.0",
         }
         with mock.patch(
-            "tools.texture_ocr.cli.package_version",
+            "diagnostics.texture_ocr.cli.package_version",
             side_effect=lambda name: installed.get(name),
         ), mock.patch(
-            "tools.texture_ocr.cli.package_version_any", return_value="3.2.0"
+            "diagnostics.texture_ocr.cli.package_version_any", return_value="3.2.0"
         ):
             errors = cli._scan_preflight(config, allow_model_download=True)
 
@@ -79,7 +79,7 @@ class ExecutionGuardTests(unittest.TestCase):
             root = Path(temporary)
             output = root / "output-must-not-exist"
             destination = root / "catalog-must-not-exist"
-            with mock.patch("tools.texture_ocr.cli._read_run") as read_run:
+            with mock.patch("diagnostics.texture_ocr.cli._read_run") as read_run:
                 with self.assertRaisesRegex(SystemExit, "--execute"):
                     cli.main(
                         [
@@ -116,14 +116,14 @@ class ExecutionGuardTests(unittest.TestCase):
             config = {"filter": {"skip_non_color": False}}
 
             with mock.patch(
-                "tools.texture_ocr.cli.load_config", return_value=config
+                "diagnostics.texture_ocr.cli.load_config", return_value=config
             ), mock.patch(
-                "tools.texture_ocr.cli._resolved_sources",
+                "diagnostics.texture_ocr.cli._resolved_sources",
                 return_value=([root], None, discovery),
             ), mock.patch(
-                "tools.texture_ocr.cli._scan_preflight"
+                "diagnostics.texture_ocr.cli._scan_preflight"
             ) as preflight, mock.patch(
-                "tools.texture_ocr.cli.create_configured_engines"
+                "diagnostics.texture_ocr.cli.create_configured_engines"
             ) as create_engines:
                 with self.assertRaisesRegex(SystemExit, "--allow-missing"):
                     cli.main(
@@ -164,16 +164,16 @@ class ExecutionGuardTests(unittest.TestCase):
             config = {"filter": {"skip_non_color": False}}
 
             with mock.patch(
-                "tools.texture_ocr.cli.load_config", return_value=config
+                "diagnostics.texture_ocr.cli.load_config", return_value=config
             ), mock.patch(
-                "tools.texture_ocr.cli._resolved_sources",
+                "diagnostics.texture_ocr.cli._resolved_sources",
                 return_value=([root], None, discovery),
             ), mock.patch(
-                "tools.texture_ocr.cli._scan_preflight", return_value=[]
+                "diagnostics.texture_ocr.cli._scan_preflight", return_value=[]
             ), mock.patch(
-                "tools.texture_ocr.cli.create_configured_engines",
+                "diagnostics.texture_ocr.cli.create_configured_engines",
                 return_value=(object(), None),
-            ), mock.patch("tools.texture_ocr.cli.scan_sources") as scan:
+            ), mock.patch("diagnostics.texture_ocr.cli.scan_sources") as scan:
                 with self.assertRaisesRegex(SystemExit, "다른 --run-id"):
                     cli.main(
                         [
@@ -204,7 +204,7 @@ class MaterializeSafetyTests(unittest.TestCase):
         if overwrite:
             arguments.append("--overwrite")
         with mock.patch(
-            "tools.texture_ocr.cli._read_run",
+            "diagnostics.texture_ocr.cli._read_run",
             return_value=(
                 Path(output) / "run",
                 {},
@@ -341,7 +341,7 @@ class MaterializeSafetyTests(unittest.TestCase):
 
             self.assertEqual(self.materialize(root / "output", destination, row), 0)
             sidecar.unlink()
-            with mock.patch("tools.texture_ocr.cli.shutil.copy2") as copy:
+            with mock.patch("diagnostics.texture_ocr.cli.shutil.copy2") as copy:
                 self.assertEqual(self.materialize(root / "output", destination, row), 0)
             copy.assert_not_called()
             self.assertTrue(sidecar.is_file())

@@ -1,6 +1,7 @@
 work/
 workspace/
-tools/map.json
+*.egg-info/
+.claude/
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from tools.texture_ocr.scoring import (
+from diagnostics.texture_ocr.scoring import (
     Detection,
     classify_detections,
     detect_scripts,

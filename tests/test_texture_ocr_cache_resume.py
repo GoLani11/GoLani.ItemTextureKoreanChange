@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.texture_ocr.cache import ResultCache
-from tools.texture_ocr.manifest import AssetSource, Discovery
-from tools.texture_ocr.pipeline import scan_sources
-from tools.texture_ocr.preprocess import ImageFingerprint
+from diagnostics.texture_ocr.cache import ResultCache
+from diagnostics.texture_ocr.manifest import AssetSource, Discovery
+from diagnostics.texture_ocr.pipeline import scan_sources
+from diagnostics.texture_ocr.preprocess import ImageFingerprint
 
 
 CLASSIFICATION = {
@@ -177,12 +177,12 @@ class ResumeAndDedupeTests(unittest.TestCase):
             engine = FakeEngine()
 
             with ResultCache(root / "cache.sqlite3") as cache, mock.patch(
-                "tools.texture_ocr.pipeline.fingerprint_image",
+                "diagnostics.texture_ocr.pipeline.fingerprint_image",
                 side_effect=lambda path: fingerprints[path],
             ), mock.patch(
-                "tools.texture_ocr.pipeline.make_preview"
+                "diagnostics.texture_ocr.pipeline.make_preview"
             ), mock.patch(
-                "tools.texture_ocr.pipeline.scan_one_image",
+                "diagnostics.texture_ocr.pipeline.scan_one_image",
                 return_value=completed_result(),
             ) as recognize:
                 first_run = scan_sources(
@@ -241,9 +241,9 @@ class ResumeAndDedupeTests(unittest.TestCase):
             config = minimal_config()
 
             with ResultCache(root / "cache.sqlite3") as cache, mock.patch(
-                "tools.texture_ocr.pipeline.fingerprint_image", return_value=fingerprint
-            ), mock.patch("tools.texture_ocr.pipeline.make_preview"), mock.patch(
-                "tools.texture_ocr.pipeline.scan_one_image",
+                "diagnostics.texture_ocr.pipeline.fingerprint_image", return_value=fingerprint
+            ), mock.patch("diagnostics.texture_ocr.pipeline.make_preview"), mock.patch(
+                "diagnostics.texture_ocr.pipeline.scan_one_image",
                 return_value=completed_result(),
             ) as recognize:
                 scan_sources(discovery, config, engine, None, cache, root / "one")
@@ -281,9 +281,9 @@ class ResumeAndDedupeTests(unittest.TestCase):
             }
 
             with ResultCache(root / "cache.sqlite3") as cache, mock.patch(
-                "tools.texture_ocr.pipeline.fingerprint_image", return_value=fingerprint
-            ), mock.patch("tools.texture_ocr.pipeline.make_preview"), mock.patch(
-                "tools.texture_ocr.pipeline.scan_one_image", return_value=failure
+                "diagnostics.texture_ocr.pipeline.fingerprint_image", return_value=fingerprint
+            ), mock.patch("diagnostics.texture_ocr.pipeline.make_preview"), mock.patch(
+                "diagnostics.texture_ocr.pipeline.scan_one_image", return_value=failure
             ) as recognize:
                 first = scan_sources(
                     discovery, minimal_config(), FakeEngine(), None, cache, root / "one"
