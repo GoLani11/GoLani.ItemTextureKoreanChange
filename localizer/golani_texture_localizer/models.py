@@ -54,8 +54,8 @@ class TargetSpec:
         category = str(value.get("category", ""))
         if not target_id or not texture or not name_ko:
             raise ProfileError(f"대상 필수 필드 누락: {value!r}")
-        if category not in {"food", "drink"}:
-            raise ProfileError(f"지원하지 않는 음식 분류: {category!r}")
+        if category not in {"food", "drink", "barter"}:
+            raise ProfileError(f"지원하지 않는 품목 분류: {category!r}")
         action = str(value.get("action", "localize"))
         if action not in {"localize", "preserve"}:
             raise ProfileError(f"지원하지 않는 대상 action: {action!r}")

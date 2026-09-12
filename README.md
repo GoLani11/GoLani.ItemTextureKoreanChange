@@ -73,6 +73,6 @@ workspace/    원본·편집본·패키지·검사 결과 (Git 제외)
 실제 자산 검사는 마요네즈와 소시지의 무편집 왕복 및 합성 시험 패치를 확인하며 게임 폴더를 변경하지 않습니다.
 산출물은 `workspace/checks/`에 남습니다. `--dotnet`으로 .NET 10 실행 파일을 지정할 수 있습니다.
 
-[재구축 내역](docs/rebuild.md) · [선택적 진단 도구](diagnostics/README.md)
+[음식·음료 원본 수집 범위](docs/food-inventory.md) · [재구축 내역](docs/rebuild.md) · [선택적 진단 도구](diagnostics/README.md)
 
 소스 코드는 출처와 주소를 남기면 자유롭게 활용할 수 있습니다.

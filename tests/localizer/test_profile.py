@@ -14,12 +14,14 @@ ROOT = Path(__file__).resolve().parents[2]
 def test_food_profile_covers_full_inventory() -> None:
     profile = load_profile(ROOT / "profiles" / "food" / "collection.json")
 
-    assert len(profile.bundles) == 41
-    assert len(profile.targets) == 42
+    assert len(profile.bundles) == 50
+    assert len(profile.targets) == 53
     assert {target.id for target in profile.targets if target.action == "preserve"} == {
         "moonshine",
         "purewater",
         "snacks-generic",
+        "sprats-fishpiece",
+        "galette-cracker",
     }
     assert len({target.id for target in profile.targets}) == len(profile.targets)
 
