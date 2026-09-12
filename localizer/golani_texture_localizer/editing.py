@@ -9,6 +9,7 @@ from PIL import Image
 
 from .auxiliary import derive_linear_gloss, derive_packed_normal, project_binary_mask, project_master_alpha
 from .bindings import check_projection
+from .drafts import diffuse_entry, diffuse_mode, verify_adoption
 from .files import atomic_bytes, descriptor, local_path, read_json, verified_file, write_json
 from .jobs import load_job
 from .validation import compare_pixels, mask, rgba
@@ -33,7 +34,9 @@ def seam_for(root: Path, snapshot: dict, size: tuple[int, int]) -> np.ndarray:
 
 
 def compose(job_path: Path, recipe_path: Path) -> dict:
-    root, _, snapshot = load_job(job_path)
+    root, job, snapshot = load_job(job_path)
+    if diffuse_mode(job) != "masked":
+        raise ValueError("전체 D 작업에는 compose를 섞지 않습니다. 문자 합성은 새 작업에서 진행하세요")
     recipe = read_json(recipe_path)
     entry = map_entry(snapshot, recipe["map_id"])
     if entry["role"] != "diffuse":
@@ -62,23 +65,43 @@ def compose(job_path: Path, recipe_path: Path) -> dict:
 
 
 def derive(job_path: Path, recipe_path: Path) -> dict:
-    root, _, snapshot = load_job(job_path)
+    root, job, snapshot = load_job(job_path)
     recipe = read_json(recipe_path)
-    lettering = read_json(root / "reports" / "lettering.json")
-    diffuse = map_entry(snapshot, lettering["map_id"])
-    verified_file(root, lettering["candidate"])
-    if lettering["source"] != diffuse["source"]:
-        raise ValueError("글자 기준 원본이 현재 작업과 달라요")
-    alpha = rgba(verified_file(root, lettering["lettering"]))[..., 3]
+    mode = diffuse_mode(job)
+    if mode == "generated-full":
+        adoption = verify_adoption(root, job, snapshot)
+        diffuse = diffuse_entry(snapshot)
+        if recipe.get("diffuse_sha256") != adoption["candidate"]["sha256"]:
+            raise ValueError("글자 레시피의 D 해시가 현재 시안과 달라요")
+        lettering_path = local_path(root, recipe["lettering"])
+        alpha = rgba(lettering_path, (diffuse["width"], diffuse["height"]))[..., 3]
+        basis = {"diffuse_mode": mode, "adoption": job["generated_diffuse"],
+                 "diffuse": adoption["candidate"], "lettering": descriptor(root, lettering_path)}
+    else:
+        lettering = read_json(root / "reports" / "lettering.json")
+        diffuse = map_entry(snapshot, lettering["map_id"])
+        verified_file(root, lettering["candidate"])
+        if lettering["source"] != diffuse["source"]:
+            raise ValueError("글자 기준 원본이 현재 작업과 달라요")
+        alpha = rgba(verified_file(root, lettering["lettering"]))[..., 3]
     selection = recipe.get("selection")
     if selection:
         selected = mask(local_path(root, selection), (alpha.shape[1], alpha.shape[0]))
         alpha = np.where(selected, alpha, 0).astype(np.uint8)
+    selection_descriptor = descriptor(root, local_path(root, selection)) if selection else None
+    if mode == "generated-full":
+        basis["selection"] = selection_descriptor
     if not alpha.any():
         raise ValueError("재질 효과를 만들 글자가 없어요")
     maps = recipe.get("maps", [])
     if not maps or len({e["map_id"] for e in maps}) != len(maps):
         raise ValueError("중복 없이 파생할 보조맵을 지정하세요")
+    previous = []
+    if mode == "generated-full":
+        previous_path = root / "reports" / "derivation.json"
+        previous = read_json(previous_path).get("maps", []) if previous_path.is_file() else []
+        if not isinstance(previous, list) or any(not isinstance(r, dict) or "map_id" not in r for r in previous):
+            raise ValueError("기존 N/G 파생 기록 형식이 잘못됐어요")
     prepared, reports = [], []
     for spec in maps:
         entry = map_entry(snapshot, spec["map_id"])
@@ -110,11 +133,19 @@ def derive(job_path: Path, recipe_path: Path) -> dict:
         prepared.append((entry, output, editable))
         reports.append({"map_id": entry["id"], "neutral": descriptor(root, neutral_path),
                         "old_effect": descriptor(root, old_path), "parameters": spec, **info, "validation": result})
-    for entry, output, editable in prepared:
+    for (entry, output, editable), record in zip(prepared, reports, strict=True):
         save_image(local_path(root, entry["candidate"]), output)
         save_image(local_path(root, entry["editable"]), editable.astype(np.uint8) * 255)
-    report = {"lettering": descriptor(root, root / "reports" / "lettering.json"),
-              "selection": descriptor(root, local_path(root, selection)) if selection else None,
-              "maps": reports}
+        if mode == "generated-full":
+            record.update(inputs=basis, candidate=descriptor(root, local_path(root, entry["candidate"])),
+                          editable=descriptor(root, local_path(root, entry["editable"])))
+    if mode == "generated-full":
+        # N and G may be derived in separate requests. Keep each map's own basis;
+        # stale entries will fail validation instead of inheriting a new D hash.
+        replaced = {r["map_id"] for r in reports}
+        report = {"diffuse_mode": mode, "maps": [r for r in previous if r["map_id"] not in replaced] + reports}
+    else:
+        report = {"lettering": descriptor(root, root / "reports" / "lettering.json"),
+                  "selection": selection_descriptor, "maps": reports}
     write_json(root / "reports" / "derivation.json", report)
     return report

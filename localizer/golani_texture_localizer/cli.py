@@ -21,6 +21,9 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("target")
     prepare.add_argument("--spt-root", default=os.environ.get("SPT_DIR", "D:/SPT"))
     prepare.add_argument("--output", type=Path)
+    adopt = commands.add_parser("adopt-draft", help="선택한 전체 D 시안을 원본 크기·알파로 맞춰요")
+    adopt.add_argument("job", type=Path)
+    adopt.add_argument("image", type=Path)
     for name, help_text in [("compose", "컬러 글자 레이어를 원본 위에 합성해요"),
                             ("derive", "같은 글자 알파에서 보조맵 효과를 만들어요")]:
         command = commands.add_parser(name, help=help_text)
@@ -62,6 +65,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command in {"compose", "derive"}:
             from .editing import compose, derive
             result = (compose if args.command == "compose" else derive)(args.job, args.recipe)
+        elif args.command == "adopt-draft":
+            from .drafts import adopt_draft
+            result = adopt_draft(args.job, args.image)
         elif args.command == "validate":
             from .validation import validate
             result = validate(args.job)

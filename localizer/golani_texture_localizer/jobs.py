@@ -105,6 +105,8 @@ def prepare(profile, target_id: str, bundle_root: Path, output: Path) -> dict:
     write_json(output / "job.json", job)
     (output / "EDITING.md").write_text(
         f"# {target.name_ko} 작업\n\n원본·source.json은 수정하지 않습니다.\n"
+        "전체 D 시안을 선택했다면 adopt-draft로 크기·알파를 복원하고 generated-full 검사 방식을 기록합니다.\n"
+        "이 방식은 비문자 RGB 보존을 보증하지 않으며, 아래 문자 마스크 합성 방식과 구분합니다.\n"
         "maps/*/candidate.png를 원본 크기로 편집하고, editable.png에 허용한 문자 영역을 흰색으로 표시합니다.\n"
         "이미지 편집 도구에는 원본과 정확한 한글 문구를 주고 글꼴 인상·비율·색·배치를 지정합니다.\n"
         "생성 결과에서 승인한 글자만 원본 좌표로 옮깁니다. compose 명령으로 원본 알파와 나머지 픽셀을 보존할 수 있습니다.\n"

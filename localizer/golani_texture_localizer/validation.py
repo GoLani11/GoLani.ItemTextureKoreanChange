@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw
 
 from .auxiliary import project_binary_mask
 from .bindings import check_projection
+from .drafts import diffuse_mode, verify_adoption, verify_generated_derivation
 from .files import descriptor, local_path, verified_file, write_json
 from .jobs import load_job
 
@@ -46,6 +47,9 @@ def compare_pixels(source: np.ndarray, candidate: np.ndarray, editable: np.ndarr
 
 def validate(job_path: Path, *, write: bool = True) -> dict:
     root, job, snapshot = load_job(job_path)
+    mode = diffuse_mode(job)
+    if mode == "generated-full":
+        verify_adoption(root, job, snapshot)
     verified_file(root, snapshot["inventory"])
     for value in snapshot["bundles"].values():
         verified_file(root, value)
@@ -55,6 +59,8 @@ def validate(job_path: Path, *, write: bool = True) -> dict:
         seam_source = np.array(image.convert("L")) != 0
     checks = []
     inputs = {"job": descriptor(root, job_path), "source": job["source"]}
+    if mode == "generated-full":
+        inputs["generated_diffuse"] = job["generated_diffuse"]
     for entry in snapshot["maps"]:
         size = (entry["width"], entry["height"])
         source = rgba(verified_file(root, entry["source"]), size)
@@ -66,8 +72,18 @@ def validate(job_path: Path, *, write: bool = True) -> dict:
             check_projection(entry)
         seam = project_binary_mask(seam_source, size) if changed.any() else np.zeros(source.shape[:2], bool)
         result = compare_pixels(source, candidate, editable, entry["preserved_channels"], seam, entry["shared"])
+        if mode == "generated-full" and entry["role"] == "diffuse":
+            # Measure all differences honestly; a whole-image draft does not promise
+            # equality outside lettering or along UV seams. Alpha remains mandatory.
+            alpha_changes = int(np.count_nonzero(source[..., 3] != candidate[..., 3]))
+            result.update(rgb_changed_pixels=int(np.count_nonzero(np.any(source[..., :3] != candidate[..., :3], axis=2))),
+                          alpha_changed_pixels=alpha_changes, nontext_pixel_preservation_verified=False,
+                          passed=not alpha_changes and not any(result["preserved_channel_changes"].values())
+                                 and not result["shared_map_changed"])
         checks.append({"id": entry["id"], "texture": entry["texture"], "role": entry["role"], **result})
         inputs[entry["id"]] = {"candidate": descriptor(root, candidate_path), "editable": descriptor(root, editable_path)}
+        if mode == "generated-full" and entry["role"] != "diffuse" and changed.any():
+            inputs[entry["id"]]["derivation"] = verify_generated_derivation(root, job, snapshot, entry)
         if write:
             changed = np.any(candidate != source, axis=2)
             highlight = source.copy()
@@ -81,6 +97,8 @@ def validate(job_path: Path, *, write: bool = True) -> dict:
             path.parent.mkdir(parents=True, exist_ok=True)
             sheet.save(path)
     report = {"schema_version": 1, "target_id": snapshot["target_id"], "inputs": inputs,
+              "diffuse_mode": mode,
+              "diffuse_preservation": "unverified-nontext" if mode == "generated-full" else "outside-mask",
               "passed": all(c["passed"] for c in checks),
               "changed_pixels": sum(c["changed_pixels"] for c in checks), "maps": checks,
               "visual_reviewed": False, "runtime_tested": False}

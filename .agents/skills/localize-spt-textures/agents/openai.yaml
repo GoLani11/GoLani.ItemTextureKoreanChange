@@ -1,0 +1,4 @@
+interface:
+  display_name: "SPT 텍스처 한글화"
+  short_description: "이 프로젝트의 음식·음료 원본으로 한글 D 시안과 N/G를 제작합니다"
+  default_prompt: "$localize-spt-textures 요청한 품목의 원본 D를 확인하고 판독 가능한 문구를 한글화한 시안을 만들어 주세요."

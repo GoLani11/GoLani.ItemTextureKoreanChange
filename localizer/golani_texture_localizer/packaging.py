@@ -88,12 +88,16 @@ def package(job_path: Path, project_root: Path, *, dotnet: str = "dotnet") -> di
         write_json(mod / "bundles.json", {"manifest": manifests})
         (mod / "TEST-ONLY.txt").write_text(
             "게임 확인용 테스트 패키지입니다. 파일 검증만 완료했으며 시각·게임 검증은 미완료입니다.\n"
+            f"D 제작 방식: {validation['diffuse_mode']} / 보존 검사: {validation['diffuse_preservation']}\n"
+            + ("전체 생성 D를 채택했으며 비문자 RGB와 UV 경계 픽셀 보존을 보증하지 않습니다.\n"
+               if validation["diffuse_mode"] == "generated-full" else "") +
             "설치 위치: SPT/SPT_Runtime/user/mods/GoLani-ItemTextureKoreanChange\n"
             "기존 설치를 별도 보관한 뒤 사용하고, SPT 런처의 임시 파일을 삭제하세요.\n"
             "원복: SPT 종료 후 테스트 모드 폴더를 mods 밖으로 옮기고 기존 설치를 복원합니다.\n", encoding="utf-8")
         if validate(job_path, write=False)["inputs"] != validation["inputs"] or producer_signature() != producer:
             raise ValueError("패키징 도중 편집 입력이 변경됐어요")
         report = {"schema_version": 1, "kind": "test", "target_id": snapshot["target_id"],
+                  "diffuse_mode": validation["diffuse_mode"], "diffuse_preservation": validation["diffuse_preservation"],
                   "inputs": validation["inputs"], "producer": producer, "file_validation_passed": True,
                   "visual_reviewed": False, "runtime_tested": False,
                   "changed_pixels": validation["changed_pixels"], "bundles": bundles,
@@ -141,6 +145,8 @@ def release(package_root: Path, review_path: Path, output: Path) -> dict:
                 raise ValueError("복사 도중 검증 증거가 변경됐어요")
         verify_package(package_root)
         report = {"schema_version": 1, "kind": "release", "target_id": package_report["target_id"],
+                  "diffuse_mode": package_report.get("diffuse_mode", "masked"),
+                  "diffuse_preservation": package_report.get("diffuse_preservation", "outside-mask"),
                   "package_sha256": review["package_sha256"], "visual_reviewed": True, "runtime_tested": True,
                   "files": {p.relative_to(temporary).as_posix(): sha256(p) for p in temporary.rglob("*") if p.is_file()}}
         write_json(temporary / "release.json", report)

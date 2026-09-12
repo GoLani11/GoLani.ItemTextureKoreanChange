@@ -5,7 +5,28 @@
 `job.json`의 `exact_text`와 `notes`는 이번 품목에 확정할 문구를 기록하는 곳입니다.
 현재 파일 검사는 OCR을 실행하거나 그 문구의 정확성을 자동 승인하지 않습니다.
 
-## 이미지 생성과 합성
+## 생성한 전체 D 채택
+
+프로젝트 스킬의 기본 시안은 원본 전체 D를 참고해 생성한 이미지입니다.
+시안을 선택한 뒤 다음 명령으로 원본 크기에 맞추고 원본 D 알파를 복원합니다.
+
+```bat
+.venv\Scripts\python.exe localize.py adopt-draft workspace/items/mayo/job.json workspace/items/mayo/drafts/selected.png
+```
+
+입력은 RGB/RGBA PNG이며, 같은 종횡비에서 크기가 다를 때만 Lanczos 보간을 적용합니다.
+종횡비가 다르면 임의로 자르거나 늘리지 않습니다. 입력 PNG는 해시별 `drafts/` 폴더에도 보관하며,
+원본과 입력 시안은 유지하고 D 후보만 갱신합니다. N/G 후보와 마스크는 변경하지 않습니다.
+
+`job.json`의 선택적 `diffuse_mode`는 `masked`(기본값) 또는 `generated-full`입니다.
+`adopt-draft`는 `generated-full`과 채택 기록의 경로·해시를 담은 `generated_diffuse`를 기록합니다.
+정책을 손으로 바꾸거나 전체 흰색 마스크로 기존 검사를 통과시키지 않습니다.
+전체 D는 비문자 RGB·UV 경계 픽셀 동일성을 보증하지 않으며 포장 배치는 시각적으로 확인합니다.
+원본 해상도·D 알파와 N/G 보존 조건은 계속 검사합니다.
+
+전체 D와 문자 합성은 별도 작업으로 관리합니다. 전체 D 작업에는 `compose`를 실행하지 않습니다.
+
+## 문자 영역만 합성하는 편집
 
 원본 라벨을 이미지 편집 도구에 참고 이미지로 제공하고, 번역할 문구를 정확히 지정합니다.
 모양·글꼴 인상·비율·색·배치를 원본에 맞추되, 생성 도구가 비문자 픽셀까지 보존했다고 가정하지 않습니다.
@@ -78,5 +99,31 @@ Normal·Gloss에 원래 글자 효과가 없는 평면 인쇄는 원본을 유�
 같은 양수 UV scale·offset, U/V Repeat, 동일 크기 또는 2의 거듭제곱 축소에서만 파생합니다.
 다른 컬러와 공유하는 보조맵은 변경하지 않습니다. 현재 Normal producer는 DXT5nm의 G/A 방향 채널을 계산하고 R/B를 보존합니다.
 Gloss는 지정한 선형 RGB 채널 변화만 적용하며 알파를 보존합니다. 지원하지 않는 채널 구성은 자동 처리하지 않습니다.
+
+### 전체 D에서 파생할 때
+
+`generated-full` 작업의 레시피에는 `lettering`과 `diffuse_sha256`을 추가합니다.
+`lettering`은 선택한 D에서 추출한 글자 윤곽 RGBA 파일의 작업 폴더 기준 경로이며 D와 같은 크기입니다.
+`diffuse_sha256`은 `adopt-draft` 결과의 `candidate.sha256`입니다. `maps`와 선택적인 `selection`은 위와 같습니다.
+
+```json
+{
+  "lettering": "layers/lettering.png",
+  "diffuse_sha256": "선택한-D-후보의-SHA256",
+  "maps": [
+    {
+      "map_id": "gloss-실제ID",
+      "neutral": "layers/gloss-neutral.png",
+      "old_effect": "layers/gloss-old-effect.png",
+      "channel_deltas": {"R": 12, "G": 12, "B": 12}
+    }
+  ]
+}
+```
+
+전체 불투명 D를 글자 윤곽으로 사용하지 않습니다. 글자 밖 알파는 0이며 효과 강도는 원본을 기준으로 정합니다.
+`derive`는 각 N/G의 D·글자 윤곽·선택 마스크·원문 제거 입력·출력 해시를 기록합니다.
+N과 G를 따로 처리해도 각 맵의 기록을 유지합니다. D를 다시 선택하거나 윤곽 파일을 변경하면
+이전 N/G 기록의 검사에 실패하므로 새 기준으로 다시 파생합니다. 원본 그대로인 N/G에는 파생 기록이 필요하지 않습니다.
 
 한글 문구·배치·원문 잔상·효과의 자연스러움은 비교 이미지와 게임에서 확인합니다.
